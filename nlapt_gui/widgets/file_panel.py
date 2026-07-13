@@ -1,0 +1,603 @@
+"""Left column 文件列表: dataset header, search, view modes, folder groups.
+
+Faithful to the CaptionForge design: header (folder icon, dataset name,
+mono path, refresh/open buttons), search input, view segmented control,
+全选/已选/清除 row, collapsible folder groups with a reflowing thumbnail
+grid or list rows, empty state and the footer stat line. All state flows
+through :class:`AppController`; the only outward signal is
+``open_folder_requested`` (the main window opens the directory dialog).
+"""
+
+from __future__ import annotations
+
+import math
+
+from PySide6.QtCore import (
+    Property,
+    QEasingCurve,
+    QPropertyAnimation,
+    QRectF,
+    Qt,
+    Signal,
+)
+from PySide6.QtGui import QColor, QFont, QPainter, QPaintEvent, QResizeEvent
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QScrollArea,
+    QVBoxLayout,
+    QWidget,
+)
+
+from nlapt.diagnostics import get_logger
+
+from nlapt_gui.controller import AppController
+from nlapt_gui.theme.tokens import ThemeTokens
+from nlapt_gui.widgets.thumb_cells import (
+    ListRow,
+    ThumbCell,
+    WarnDot,
+    make_icon,
+    mono_font,
+    tokens_for_settings,
+    ui_font,
+)
+from nlapt_gui.widgets.thumbnails import ThumbnailLoader
+
+_LOGGER = get_logger(__name__)
+
+PANEL_WIDTH = 300
+HEADER_ICON_PX = 17
+TOOL_BUTTON_PX = 26
+TOOL_ICON_PX = 13
+SEARCH_HEIGHT = 29
+SEG_BUTTON_W = 27
+SEG_BUTTON_H = 22
+GRID_GAP = 10
+LIST_GAP = 6
+GROUP_HEADER_H = 27
+BIG_THUMB_MIN = 150  # design: minmax(150px,1fr) in big mode
+ARROW_OPEN_DEG = 0.0
+ARROW_CLOSED_DEG = -90.0
+COLLAPSE_MS = 240
+LEGEND_DOT_PX = 7
+FOOTER_DOT_GAP = 4
+_MAX_WIDGET_H = 16_777_215  # Qt QWIDGETSIZE_MAX
+
+# Exact strings from the design.
+SEARCH_PLACEHOLDER = "搜索文件名 / 标签…"
+TEXT_SELECT_ALL = "全选"
+TEXT_SELECTED_FMT = "已选 {n}"
+TEXT_CLEAR = "清除"
+TEXT_NO_MATCH = "没有匹配的文件"
+TEXT_UNSAVED = "未保存"
+TIP_REFRESH = "刷新"
+TIP_OPEN_FOLDER = "打开文件夹"
+COUNT_FMT = "{n} 张"
+COUNT_FILTERED_FMT = "{k}/{n} 张"
+VIEW_TIPS = {"list": "详细列表", "mid": "中图网格", "big": "大图网格"}
+_VIEW_ICONS = {"list": "view_list", "mid": "view_mid", "big": "view_big"}
+
+
+class _Arrow(QWidget):
+    """Rotating ▾ disclosure arrow (0deg open / -90deg closed, animated)."""
+
+    def __init__(self, open_: bool, panel: "FilePanel", parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._panel = panel
+        self._angle = ARROW_OPEN_DEG if open_ else ARROW_CLOSED_DEG
+        self.setFixedSize(12, 12)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
+    def _get_angle(self) -> float:
+        return self._angle
+
+    def _set_angle(self, value: float) -> None:
+        self._angle = value
+        self.update()
+
+    angle = Property(float, _get_angle, _set_angle)
+
+    def animate_to(self, open_: bool) -> None:
+        anim = QPropertyAnimation(self, b"angle", self)
+        anim.setDuration(COLLAPSE_MS)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.setEndValue(ARROW_OPEN_DEG if open_ else ARROW_CLOSED_DEG)
+        anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
+
+    def paintEvent(self, event: QPaintEvent) -> None:  # noqa: N802 - Qt override
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.translate(self.rect().center())
+        painter.rotate(self._angle)
+        painter.setFont(ui_font(9))
+        painter.setPen(QColor(self._panel.current_tokens().text3))
+        painter.drawText(QRectF(-6, -6, 12, 12), Qt.AlignmentFlag.AlignCenter, "▾")
+        painter.end()
+
+
+class _ThumbGrid(QWidget):
+    """Reflowing grid: auto-fill minmax(min_w, 1fr) columns like the design."""
+
+    def __init__(self, cells: list[ThumbCell], min_w: int, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._cells = cells
+        self._min_w = max(1, min_w)
+        for cell in cells:
+            cell.setParent(self)
+
+    def resizeEvent(self, event: QResizeEvent) -> None:  # noqa: N802 - Qt override
+        super().resizeEvent(event)
+        self._relayout()
+
+    def _relayout(self) -> None:
+        width = self.width()
+        if not self._cells or width < self._min_w // 2:
+            return
+        cols = max(1, (width + GRID_GAP) // (self._min_w + GRID_GAP))
+        cell_w = (width - GRID_GAP * (cols - 1)) / cols
+        cell_h = round(cell_w * 4 / 3)  # design aspect-ratio 3/4
+        for index, cell in enumerate(self._cells):
+            row, col = divmod(index, cols)
+            x = round(col * (cell_w + GRID_GAP))
+            right = round((col + 1) * (cell_w + GRID_GAP)) - GRID_GAP
+            cell.setGeometry(x, row * (cell_h + GRID_GAP), right - x, cell_h)
+        rows = math.ceil(len(self._cells) / cols)
+        height = rows * cell_h + (rows - 1) * GRID_GAP if rows else 0
+        if self.height() != height:
+            self.setFixedHeight(height)
+
+
+class _FolderGroup(QWidget):
+    """One collapsible folder section: header row + animated content."""
+
+    def __init__(
+        self,
+        panel: "FilePanel",
+        folder: str,
+        count_text: str,
+        content: QWidget,
+        open_: bool,
+    ) -> None:
+        super().__init__(panel)
+        self._panel = panel
+        self.folder = folder
+        self._open = open_
+        self._anim: QPropertyAnimation | None = None
+
+        box = QVBoxLayout(self)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(0)
+
+        self.header = QPushButton(self)
+        self.header.setFixedHeight(GROUP_HEADER_H)
+        self.header.setCursor(Qt.CursorShape.PointingHandCursor)
+        header_lay = QHBoxLayout(self.header)
+        header_lay.setContentsMargins(6, 0, 6, 0)
+        header_lay.setSpacing(7)
+        self.arrow = _Arrow(open_, panel, self.header)
+        header_lay.addWidget(self.arrow)
+        self._icon = QLabel(self.header)
+        self._icon.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        header_lay.addWidget(self._icon)
+        self.name_label = QLabel(folder, self.header)
+        self.name_label.setFont(ui_font(12, QFont.Weight.DemiBold))
+        self.name_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        header_lay.addWidget(self.name_label, 1)
+        self.count_label = QLabel(count_text, self.header)
+        self.count_label.setFont(mono_font(10))
+        self.count_label.setProperty("muted", True)
+        self.count_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        header_lay.addWidget(self.count_label)
+        box.addWidget(self.header)
+
+        self._content = QWidget(self)
+        content_lay = QVBoxLayout(self._content)
+        content_lay.setContentsMargins(2, 6, 2, 6)
+        content_lay.setSpacing(0)
+        content_lay.addWidget(content)
+        box.addWidget(self._content)
+        if not open_:
+            self._content.setMaximumHeight(0)
+
+        self.header.clicked.connect(self._on_header_clicked)
+        self.refresh_icon()
+
+    @property
+    def is_open(self) -> bool:
+        return self._open
+
+    def refresh_icon(self) -> None:
+        tokens = self._panel.current_tokens()
+        self._icon.setPixmap(make_icon("folder", tokens.text2, 13).pixmap(13, 13))
+
+    def _on_header_clicked(self) -> None:
+        self._panel._toggle_folder(self)
+
+    def set_open(self, open_: bool, animate: bool) -> None:
+        if open_ == self._open:
+            return
+        self._open = open_
+        if not animate:
+            self._content.setMaximumHeight(_MAX_WIDGET_H if open_ else 0)
+            self.arrow._set_angle(ARROW_OPEN_DEG if open_ else ARROW_CLOSED_DEG)
+            return
+        self.arrow.animate_to(open_)
+        if self._anim is not None:
+            self._anim.stop()
+        anim = QPropertyAnimation(self._content, b"maximumHeight", self)
+        anim.setDuration(COLLAPSE_MS)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.setStartValue(self._content.height())
+        anim.setEndValue(self._content.sizeHint().height() if open_ else 0)
+        if open_:
+            anim.finished.connect(lambda: self._content.setMaximumHeight(_MAX_WIDGET_H))
+        anim.start()
+        self._anim = anim
+
+
+class FilePanel(QFrame):
+    """The design's 文件列表 column, 300px wide, driven by AppController."""
+
+    open_folder_requested = Signal()
+
+    def __init__(
+        self,
+        controller: AppController,
+        *,
+        loader: ThumbnailLoader | None = None,
+        tokens: ThemeTokens | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._controller = controller
+        self._loader = loader if loader is not None else ThumbnailLoader(parent=self)
+        self._tokens = tokens if tokens is not None else tokens_for_settings(controller.settings)
+        self._cells: dict[str, QWidget] = {}
+        self._groups: list[_FolderGroup] = []
+        self.setProperty("panel", True)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setFixedWidth(PANEL_WIDTH)
+        self._build_ui()
+        self._connect_controller()
+        self._refresh_header()
+        self._rebuild_groups()
+        self._refresh_counts()
+        self._refresh_view_buttons()
+        self._apply_icon_colors()
+
+    # -- construction ---------------------------------------------------------------
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # header: folder icon, dataset name + mono path, refresh / open buttons
+        header = QWidget(self)
+        header_lay = QHBoxLayout(header)
+        header_lay.setContentsMargins(12, 12, 12, 10)
+        header_lay.setSpacing(9)
+        self._header_icon = QLabel(header)
+        header_lay.addWidget(self._header_icon)
+        names = QVBoxLayout()
+        names.setContentsMargins(0, 0, 0, 0)
+        names.setSpacing(0)
+        self.name_label = QLabel(header)
+        self.name_label.setFont(ui_font(12.5, QFont.Weight.DemiBold))
+        names.addWidget(self.name_label)
+        self.path_label = QLabel(header)
+        self.path_label.setFont(mono_font(10))
+        self.path_label.setProperty("muted", True)
+        names.addWidget(self.path_label)
+        header_lay.addLayout(names, 1)
+        self.refresh_button = QPushButton(header)
+        self.refresh_button.setFixedSize(TOOL_BUTTON_PX, TOOL_BUTTON_PX)
+        self.refresh_button.setToolTip(TIP_REFRESH)
+        self.refresh_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.refresh_button.clicked.connect(self._controller.refresh)
+        header_lay.addWidget(self.refresh_button)
+        self.open_button = QPushButton(header)
+        self.open_button.setFixedSize(TOOL_BUTTON_PX, TOOL_BUTTON_PX)
+        self.open_button.setToolTip(TIP_OPEN_FOLDER)
+        self.open_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.open_button.clicked.connect(self.open_folder_requested.emit)
+        header_lay.addWidget(self.open_button)
+        root.addWidget(header)
+
+        # search input with magnifier icon
+        search_row = QWidget(self)
+        search_lay = QHBoxLayout(search_row)
+        search_lay.setContentsMargins(12, 0, 12, 8)
+        self.search_edit = QLineEdit(search_row)
+        self.search_edit.setFixedHeight(SEARCH_HEIGHT)
+        self.search_edit.setPlaceholderText(SEARCH_PLACEHOLDER)
+        self.search_edit.setFont(ui_font(12))
+        self.search_edit.setClearButtonEnabled(True)
+        self._search_action = self.search_edit.addAction(
+            make_icon("search", self._tokens.text3, TOOL_ICON_PX),
+            QLineEdit.ActionPosition.LeadingPosition,
+        )
+        self.search_edit.textChanged.connect(self._controller.set_filter)
+        search_lay.addWidget(self.search_edit)
+        root.addWidget(search_row)
+
+        # view segmented | 全选 / 已选 n / 清除
+        view_row = QWidget(self)
+        view_lay = QHBoxLayout(view_row)
+        view_lay.setContentsMargins(12, 0, 12, 8)
+        view_lay.setSpacing(8)
+        seg_bar = QFrame(view_row)
+        seg_bar.setProperty("segBar", True)
+        seg_lay = QHBoxLayout(seg_bar)
+        seg_lay.setContentsMargins(2, 2, 2, 2)
+        seg_lay.setSpacing(2)
+        self.view_buttons: dict[str, QPushButton] = {}
+        for mode in ("list", "mid", "big"):
+            btn = QPushButton(seg_bar)
+            btn.setProperty("seg", True)
+            btn.setFixedSize(SEG_BUTTON_W, SEG_BUTTON_H)
+            btn.setToolTip(VIEW_TIPS[mode])
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(lambda _=False, m=mode: self._controller.set_view_mode(m))
+            seg_lay.addWidget(btn)
+            self.view_buttons[mode] = btn
+        view_lay.addWidget(seg_bar)
+        view_lay.addStretch(1)
+        self.select_all_box = QCheckBox(TEXT_SELECT_ALL, view_row)
+        self.select_all_box.setFont(ui_font(11.5))
+        self.select_all_box.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.select_all_box.clicked.connect(self._on_select_all_clicked)
+        view_lay.addWidget(self.select_all_box)
+        self.selected_label = QLabel(TEXT_SELECTED_FMT.format(n=0), view_row)
+        self.selected_label.setFont(ui_font(11.5))
+        self.selected_label.setProperty("muted", True)
+        view_lay.addWidget(self.selected_label)
+        self.clear_button = QPushButton(TEXT_CLEAR, view_row)
+        self.clear_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.clear_button.clicked.connect(self._controller.clear_selection)
+        view_lay.addWidget(self.clear_button)
+        root.addWidget(view_row)
+
+        # scrollable folder groups
+        self._scroll = QScrollArea(self)
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._groups_host = QWidget(self._scroll)
+        self._groups_lay = QVBoxLayout(self._groups_host)
+        self._groups_lay.setContentsMargins(12, 0, 12, 10)
+        self._groups_lay.setSpacing(4)
+        self.empty_label = QLabel(TEXT_NO_MATCH, self._groups_host)
+        self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_label.setFont(ui_font(12))
+        self.empty_label.setProperty("muted", True)
+        self.empty_label.setContentsMargins(10, 26, 10, 26)
+        self.empty_label.hide()
+        self._groups_lay.addWidget(self.empty_label)
+        self._groups_lay.addStretch(1)
+        self._scroll.setWidget(self._groups_host)
+        root.addWidget(self._scroll, 1)
+
+        # footer: stat line + warn legend
+        divider = QFrame(self)
+        divider.setProperty("divider", True)
+        divider.setFixedHeight(1)
+        root.addWidget(divider)
+        footer = QWidget(self)
+        footer_lay = QHBoxLayout(footer)
+        footer_lay.setContentsMargins(14, 9, 14, 9)
+        footer_lay.setSpacing(10)
+        self.stat_label = QLabel(footer)
+        self.stat_label.setFont(ui_font(11))
+        self.stat_label.setProperty("secondary", True)
+        footer_lay.addWidget(self.stat_label)
+        footer_lay.addStretch(1)
+        # Live unsaved indicator (was a static legend in the prototype): shows
+        # the real dirty count and hides entirely when everything is saved.
+        legend = QHBoxLayout()
+        legend.setContentsMargins(0, 0, 0, 0)
+        legend.setSpacing(FOOTER_DOT_GAP)
+        self._unsaved_dot = WarnDot(LEGEND_DOT_PX, self.current_tokens, footer)
+        legend.addWidget(self._unsaved_dot)
+        self.unsaved_label = QLabel(TEXT_UNSAVED, footer)
+        self.unsaved_label.setFont(ui_font(11))
+        self.unsaved_label.setProperty("muted", True)
+        legend.addWidget(self.unsaved_label)
+        footer_lay.addLayout(legend)
+        root.addWidget(footer)
+        self._refresh_unsaved_indicator()
+
+    def _connect_controller(self) -> None:
+        c = self._controller
+        c.dataset_opened.connect(self._on_dataset_opened)
+        c.filter_changed.connect(self._on_filter_changed)
+        c.view_mode_changed.connect(self._on_view_mode_changed)
+        c.selection_changed.connect(self._on_selection_changed)
+        c.current_changed.connect(self._on_current_changed)
+        c.caption_changed.connect(self._on_caption_changed)
+
+    # -- tokens ----------------------------------------------------------------------
+    def current_tokens(self) -> ThemeTokens:
+        """Tokens provider for custom-painted children."""
+        return self._tokens
+
+    def apply_tokens(self, tokens: ThemeTokens) -> None:
+        """React to a theme change: re-tint icons and repaint painted parts."""
+        self._tokens = tokens
+        self._apply_icon_colors()
+        for group in self._groups:
+            group.refresh_icon()
+        self.update()
+        for cell in self._cells.values():
+            cell.update()
+
+    def _apply_icon_colors(self) -> None:
+        t = self._tokens
+        self._header_icon.setPixmap(
+            make_icon("folder", t.accent, HEADER_ICON_PX).pixmap(HEADER_ICON_PX, HEADER_ICON_PX)
+        )
+        self.refresh_button.setIcon(make_icon("refresh", t.text3, TOOL_ICON_PX))
+        self.open_button.setIcon(make_icon("folder_open", t.text3, TOOL_ICON_PX))
+        self._search_action.setIcon(make_icon("search", t.text3, TOOL_ICON_PX))
+        self.clear_button.setStyleSheet(
+            f"QPushButton {{ color: {t.accent}; background: transparent;"
+            f" border: none; padding: 0; font-size: 11.5px; }}"
+            f"QPushButton:hover {{ color: {t.accent2}; }}"
+        )
+        self._refresh_view_buttons()
+
+    # -- controller reactions ----------------------------------------------------------
+    def _on_dataset_opened(self, _result: object) -> None:
+        self._loader.clear()
+        self._refresh_header()
+        self._rebuild_groups()
+        self._refresh_counts()
+
+    def _on_filter_changed(self, text: str) -> None:
+        if self.search_edit.text() != text:
+            self.search_edit.blockSignals(True)
+            self.search_edit.setText(text)
+            self.search_edit.blockSignals(False)
+        self._rebuild_groups()
+        self._refresh_counts()
+
+    def _on_view_mode_changed(self, _mode: str) -> None:
+        self._refresh_view_buttons()
+        self._rebuild_groups()
+
+    def _on_selection_changed(self) -> None:
+        self._refresh_counts()
+        self._repaint_cells()
+
+    def _on_current_changed(self, _key: str) -> None:
+        self._repaint_cells()
+
+    def _on_caption_changed(self, key: str) -> None:
+        cell = self._cells.get(key)
+        if cell is not None:
+            cell.update()
+        self._refresh_counts()
+
+    # -- interactions -----------------------------------------------------------------
+    def _on_select_all_clicked(self, checked: bool) -> None:
+        if checked:
+            self._controller.select_all()
+        else:
+            self._controller.clear_selection()
+
+    def _toggle_folder(self, group: _FolderGroup) -> None:
+        open_ = not group.is_open
+        group.set_open(open_, animate=True)
+        folder_open = dict(self._controller.settings.folder_open)
+        folder_open[group.folder] = open_
+        self._controller.update_settings(folder_open=folder_open)
+
+    # -- refreshers --------------------------------------------------------------------
+    def _refresh_header(self) -> None:
+        name, path = self._controller.dataset_label()
+        self.name_label.setText(name)
+        metrics = self.path_label.fontMetrics()
+        available = PANEL_WIDTH - 2 * 12 - HEADER_ICON_PX - 2 * TOOL_BUTTON_PX - 4 * 9
+        self.path_label.setText(
+            metrics.elidedText(path, Qt.TextElideMode.ElideRight, max(40, available))
+        )
+        self.path_label.setToolTip(path)
+
+    def _refresh_counts(self) -> None:
+        controller = self._controller
+        selected = len(controller.selected_keys())
+        total = len(controller.keys())
+        self.selected_label.setText(TEXT_SELECTED_FMT.format(n=selected))
+        self.select_all_box.blockSignals(True)
+        self.select_all_box.setChecked(total > 0 and selected == total)
+        self.select_all_box.blockSignals(False)
+        self.stat_label.setText(controller.stat_line())
+        self._refresh_unsaved_indicator()
+
+    def _refresh_unsaved_indicator(self) -> None:
+        """Live footer indicator: '未保存 n' while dirty, hidden when clean."""
+        dirty = self._controller.dirty_count()
+        visible = dirty > 0
+        self._unsaved_dot.setVisible(visible)
+        self.unsaved_label.setVisible(visible)
+        if visible:
+            self.unsaved_label.setText(f"{TEXT_UNSAVED} {dirty}")
+
+    def _refresh_view_buttons(self) -> None:
+        active = self._controller.view_mode
+        for mode, btn in self.view_buttons.items():
+            is_active = mode == active
+            btn.setProperty("segActive", is_active)
+            color = self._tokens.accent if is_active else self._tokens.text2
+            btn.setIcon(make_icon(_VIEW_ICONS[mode], color, TOOL_ICON_PX))
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+
+    def _repaint_cells(self) -> None:
+        for cell in self._cells.values():
+            cell.update()
+
+    # -- group building ------------------------------------------------------------------
+    def _rebuild_groups(self) -> None:
+        for group in self._groups:
+            group.hide()
+            group.deleteLater()
+        self._groups = []
+        self._cells = {}
+        controller = self._controller
+        filtering = bool(controller.filter_text.strip())
+        visible_set = set(controller.filtered_keys())
+        view_mode = controller.view_mode
+        insert_at = 0
+        total_visible = 0
+        for folder in controller.folders():
+            folder_keys = [k for k in controller.keys() if controller.folder_of(k) == folder]
+            visible = [k for k in folder_keys if k in visible_set]
+            if filtering and not visible:
+                continue
+            total_visible += len(visible)
+            if filtering:
+                count_text = COUNT_FILTERED_FMT.format(k=len(visible), n=len(folder_keys))
+            else:
+                count_text = COUNT_FMT.format(n=len(folder_keys))
+            content = self._build_group_content(visible, view_mode)
+            open_ = bool(self._controller.settings.folder_open.get(folder, True))
+            group = _FolderGroup(self, folder, count_text, content, open_)
+            self._groups_lay.insertWidget(insert_at, group)
+            self._groups.append(group)
+            insert_at += 1
+        self.empty_label.setVisible(total_visible == 0 and bool(controller.keys()))
+
+    def _build_group_content(self, keys: list[str], view_mode: str) -> QWidget:
+        if view_mode == "list":
+            host = QWidget()
+            lay = QVBoxLayout(host)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setSpacing(LIST_GAP)
+            for key in keys:
+                row = ListRow(key, self._controller, self._loader, self.current_tokens)
+                self._cells[key] = row
+                lay.addWidget(row)
+            return host
+        min_w = BIG_THUMB_MIN if view_mode == "big" else self._controller.settings.thumb_min
+        cells = []
+        for key in keys:
+            cell = ThumbCell(key, self._controller, self._loader, self.current_tokens)
+            self._cells[key] = cell
+            cells.append(cell)
+        return _ThumbGrid(cells, min_w)
+
+    # -- test/integration helpers ---------------------------------------------------------
+    def cell(self, key: str) -> QWidget | None:
+        """The grid cell / list row currently showing ``key`` (None if hidden)."""
+        return self._cells.get(key)
+
+    def folder_group(self, folder: str) -> _FolderGroup | None:
+        for group in self._groups:
+            if group.folder == folder:
+                return group
+        return None

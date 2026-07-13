@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Tests / tooling
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local secrets / API configs (defence in depth — the real config with API
+# keys lives in %APPDATA%/NLapt (Windows) or ~/.config/nlapt, never in-repo)
+.env
+.env.*
+*.secret
+config.json
+config.local.json
+
+# Virtual environments
+.venv/
+venv/
+
+# Dataset runtime artifacts (never commit user data)
+.backups/
+.nlapt/
+
+# OS / editor
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/
+
+# Design prototype (kept local, not published)
+NLapt-head/

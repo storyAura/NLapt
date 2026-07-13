@@ -1,0 +1,11 @@
+# Normalize text files to LF in the repository (checkout as-is on all platforms).
+* text=auto eol=lf
+
+# Windows batch files require CRLF to run reliably under cmd.exe.
+*.bat text eol=crlf
+
+# Binary assets — never normalized or diffed as text.
+*.png binary
+*.ico binary
+*.jpg binary
+*.webp binary

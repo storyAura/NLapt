@@ -181,7 +181,7 @@ def test_export_bundle_contents_and_masking(manager: DebugManager, tmp_path: Pat
         errors = json.loads(bundle.read("errors.json"))
         assert any("worker died" in e for e in errors)
         env = json.loads(bundle.read("environment.json"))
-        assert env["nlapt_version"] == "0.1.0"
+        assert env["nlapt_version"] == "0.2.0"
 
 
 def test_export_bundle_minimal_without_optionals(manager: DebugManager, tmp_path: Path) -> None:

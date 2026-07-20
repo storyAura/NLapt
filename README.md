@@ -38,6 +38,13 @@ NLapt is a desktop editor for natural-language image captions — for training-s
 - **翻译对照**:右栏逐段显示原文与译文,一键"中文全部转为英文"。
 - 全部网络与磁盘操作异步执行,界面零阻塞;并发数可在设置中调整。
 
+### 本地推理
+
+- **内置模型目录**:Gemma 4 全系列(E2B / E4B / 12B / 26B-A4B MoE / 31B)、Heretic 无审查衍生版、动漫标注特化 **ToriiGate 0.5** 与写实标注 **JoyCaption Beta One**——均选自 HuggingFace 下载量最高的公开 GGUF 仓库(目录快照 2026-07-20),按「大系列 ▸ 小系列 ▸ 量化档」分层展示,标注体积与热度。
+- **兼容性预测**:自动检测 CPU / 内存 / NVIDIA 显存,对每个量化档按所选上下文长度给出「✓ 显存流畅 / ◐ 显存+内存 / ▢ 仅内存(慢)/ ✗ 配置不足」预测,附占用明细(权重 / 视觉组件 / 上下文 / 开销)与显存内存预算。
+- **应用内下载**:断点续传、实时进度、可取消;完成后按 HuggingFace 官方 SHA256 指纹校验完整性;视觉模型自动附带 mmproj 组件,按模型分目录存放,不会互相覆盖。
+- **一键本地服务**:基于 llama.cpp 的 llama-server(需自行下载,设置中选择路径),上下文长度 / GPU 层数 / 线程 / **并发请求数** / 端口均可配置;「设为当前模型」把翻译 / 重译 / 批量 AI 操作立即切到本地模型,完全离线、无需 API Key。
+
 ### 批量与数据安全
 
 - **查找替换 / 前缀后缀**:实时命中统计,作用域 当前 / 选中 / 全部;"独立标签"模式自动防触发词重复。
@@ -100,6 +107,7 @@ Build-NLapt.bat        # 或: python -m PyInstaller packaging/nlapt.spec --nocon
 nlapt/        核心库(无 UI 依赖):storage 原子写/扫描/快照 · captions 标注仓库
               · ops 文本操作 · llm 客户端/翻译/重写/视觉 · batch 批量引擎
               · history 撤销/操作日志 · workflow diff/审核 · app.py NLaptApp 门面
+              · local 本地推理(模型目录/硬件检测/兼容性预测/下载/llama-server)
 nlapt_gui/    PySide6 界面:controller.py 为 UI 与核心的唯一桥梁,
               widgets/ 各面板 · theme/ 主题令牌与 QSS(无硬编码颜色)
 tests/        与源码镜像的 pytest 套件(离屏运行,不联网、不真实等待)

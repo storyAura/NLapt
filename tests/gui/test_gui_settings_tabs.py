@@ -60,9 +60,26 @@ class TestTabs:
         dialog = _make_dialog(qtbot, dlg_controller)
         assert isinstance(dialog, CenteredDialog)
 
-    def test_local_tab_is_placeholder(self, qtbot, dlg_controller) -> None:
+    def test_local_tab_is_real(self, qtbot, dlg_controller) -> None:
+        from nlapt.local.catalog import all_series
+
+        from nlapt_gui.widgets.local_tab import LocalTab
+
         dialog = _make_dialog(qtbot, dlg_controller)
-        assert not dialog.local_download_button.isEnabled()
+        assert isinstance(dialog.local_tab, LocalTab)
+        assert dialog.local_tab.tree.topLevelItemCount() == len(all_series())
+
+    def test_save_persists_local_tab_settings(self, qtbot, dlg_controller) -> None:
+        from nlapt.local.settings import load_local_settings
+
+        from nlapt_gui.resources import app_data_dir
+
+        dialog = _make_dialog(qtbot, dlg_controller)
+        dialog.api_type.setCurrentIndex(0)
+        dialog.local_tab.parallel_spin.setValue(9)
+        with qtbot.waitSignal(dialog.saved, timeout=1000):
+            dialog.save_button.click()
+        assert load_local_settings(app_data_dir() / "local_llm.json").parallel == 9
 
 
 class TestUnifiedModel:

@@ -861,3 +861,66 @@ All confirmed review findings (`docs/REVIEW_FINDINGS.json`, decisions in
     checkpoint mark (crash-safe resume), and logs the batch with `kind="ai_batch"`.
   - `rollback_operation` on an `ai_batch` record clears the produced pending suggestions
     (returns `SuggestionRollbackResult`); snapshot-backed records keep the restore path.
+
+---
+
+## v1.6 addendum — local inference module (additive)
+
+New stdlib-only package `nlapt/local` (no UI, no hard deps) plus additive
+error types in `nlapt.core.errors`: `LocalInferenceError(NLaptError)`,
+`DownloadError`, `DownloadCancelledError`, `LocalServerError`.
+
+- `catalog.py` — hand-curated GGUF catalog, snapshot-dated
+  (`CATALOG_SNAPSHOT_DATE`): `ModelSeries` (大系列) → `ModelFamily` (小系列)
+  → `QuantFile` (量化档). File sizes AND SHA256 digests (LFS oids) are exact
+  values from the HuggingFace API; download counts are display-only
+  snapshots. Repo ids are pattern-validated (`REPO_ID_PATTERN`) and family
+  ids are directory-safe (`SAFE_ID_PATTERN`, checked in `family_dir` —
+  defense in depth against a future non-hardcoded catalog source). Series:
+  **Gemma 4**
+  (unsloth conversions — top downloads AND ship the vision mmproj),
+  **Gemma 4 Heretic** (highest-download uncensored derivatives; the 26B MoE
+  conversion has no mmproj → `vision=False`), **ToriiGate 0.5**
+  (Qwen3.5-4B based, MIT), **JoyCaption Beta One** (Llama-3.1-8B LLaVA).
+  Helpers: `find_family` / `find_quant` / `recommended_quant` /
+  `download_url` (segment-quoted) / `repo_page_url`; local layout is
+  namespaced per family (`family_dir` / `quant_path` / `mmproj_path`) so
+  identical basenames across repos (e.g. `mmproj-F16.gguf`) cannot collide.
+  `kv_bytes_per_token` is a documented coarse heuristic per family.
+- `hardware.py` — `detect_hardware()` NEVER raises: RAM via
+  `GlobalMemoryStatusEx` (Windows) / sysconf + `/proc/meminfo` (POSIX),
+  NVIDIA VRAM via `nvidia-smi` CSV (missing binary → no GPU), CPU cores.
+  On Windows `nvidia-smi` is resolved ONLY from the driver's fixed install
+  paths (System32 / NVSMI) — never PATH or the CWD (binary-planting
+  hardening); POSIX uses `shutil.which`. All probes injectable.
+  `HardwareInfo.best_gpu()`, `format_bytes()`.
+- `advisor.py` — documented heuristic, not a llama.cpp simulation:
+  `estimate_memory` = weights + mmproj + `kv_bytes_per_token`·ctx +
+  (`OVERHEAD_BASE_BYTES` + 5% weights); `assess` compares against
+  `VRAM_USABLE_SHARE`·free-VRAM and `RAM_USABLE_SHARE`·total-RAM →
+  `RunVerdict` `GPU_FULL / GPU_PARTIAL / CPU_ONLY / NOT_RUNNABLE / UNKNOWN`
+  (+ shortfall bytes for the UI).
+- `settings.py` — frozen `LocalSettings` (models_dir, server_path, port,
+  context_length, gpu_layers `-1`=auto, threads `0`=auto, **parallel**, last
+  family/quant selection); `load_local_settings` clamps every numeric field
+  into its range and falls back to defaults on corrupt files;
+  `save_local_settings` is atomic. The GUI persists
+  `app_data_dir()/local_llm.json`.
+- `download.py` — stdlib resumable downloader: streams to `<dest>.part`,
+  resumes via `Range` (server ignoring the range → clean restart; HTTP 416 →
+  drop part and restart), cancel via `threading.Event` →
+  `DownloadCancelledError` (part kept), an in-stream overrun cap (a server
+  sending more than promised is aborted immediately, part discarded),
+  exact-size verification (short → keep part for resume) and SHA256
+  verification against the catalog digest BEFORE the atomic `os.replace`
+  (mismatch → discard). Scheme allow-list: https only.
+- `server.py` — `ServerSpec` + `build_server_args` (validated argument
+  vector, never a shell string) and `LocalServerManager` (injectable
+  popen / health / sleep / clock): spawns llama-server, polls `/health`
+  until ready (early process exit and ready-timeout raise
+  `LocalServerError`, the process is stopped), `stop()` terminate → kill,
+  `base_url(port)` = `http://127.0.0.1:{port}/v1` so the existing
+  OpenAI-compatible client stack drives local models unchanged.
+
+Tests mirror the package under `tests/local/` (fake openers, fake
+processes, injected clocks — no network, no real waits).

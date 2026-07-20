@@ -90,3 +90,19 @@ class LLMOutputError(LLMError):
 
 class BatchCancelledError(NLaptError):
     """A batch run was cancelled by the user."""
+
+
+class LocalInferenceError(NLaptError):
+    """Base class for local-inference (模型下载 / 本地服务) failures."""
+
+
+class DownloadError(LocalInferenceError):
+    """A model file download failed or produced a wrong-sized file."""
+
+
+class DownloadCancelledError(LocalInferenceError):
+    """A model download was cancelled by the user (partial file is kept)."""
+
+
+class LocalServerError(LocalInferenceError):
+    """The local inference server could not start, respond, or stop."""

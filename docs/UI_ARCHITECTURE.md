@@ -652,6 +652,41 @@ _selection_toolbar`, `test_llm_translate_to / _model_list`; full suite 1664 gree
    (`theme/logo.load_app_icon` falls back to the painted mark) and a Windows
    `AppUserModelID` for correct taskbar identity.
 
+## v1.6 — 本地推理 tab becomes real (local inference module)
+
+The v1.5 本地推理 placeholder was replaced by a working module (core side:
+`nlapt/local`, see ARCHITECTURE v1.6; tests `tests/local/*`,
+`test_gui_local_bridge.py`, `test_gui_local_tab.py`):
+
+- `nlapt_gui/local_bridge.py` — `LocalBridge(QObject)`: owns the persisted
+  `LocalSettings`, hardware detection, downloads and server lifecycle on the
+  worker pool; signals `hardware_ready` / `download_progress` (throttled to
+  8 MB steps) / `download_finished` / `server_changed`. Every async reply is
+  guarded with a shiboken validity check. The `LocalServerManager` is a
+  process-wide singleton (`get_server_manager()`, stopped via `atexit`): a
+  started llama-server survives dialog re-opens and dies with the app.
+- `nlapt_gui/widgets/local_tab.py` — `LocalTab`: hardware summary line
+  (lazy first-show detection + 重新检测), catalog `QTreeWidget`
+  大系列 → 小系列 → 量化档 with 体积 / 热度 / 兼容性 columns — verdicts are
+  text markers (✓ ◐ ▢ ✗ ?) with explanation tooltips, deliberately
+  colorless (theme-safe, keeps the no-hex rule trivial); a detail line with
+  the memory breakdown + budgets + verdict sentence; the action row
+  下载(断点续传 / 取消 + progress bar)/ 打开模型页 / 启动本地服务(停止)/
+  设为当前模型; and the runtime form 模型目录 / llama-server 路径 /
+  上下文长度 / GPU 层数(-1=自动)/ 线程(0=自动)/ 并发请求数 / 端口
+  (ranges come from `nlapt.local.settings`). Downloads write into
+  per-family subdirectories of the models dir.
+- **设为当前模型** registers/updates the `local` profile (api_type
+  `openai`, base_url `http://127.0.0.1:{port}/v1`, model = family id,
+  `vision_model` only for mmproj-carrying families), sets it active, wires
+  `request.concurrency = parallel` and calls `controller.reload_config` —
+  the settings dialog's sanctioned config-IO exception explicitly extends
+  to this tab.
+- `SettingsDialog.save()` additionally calls `local_tab.persist()`
+  (self-toasting on failure); the placeholder constants and
+  `test_local_tab_is_placeholder` were removed
+  (`test_local_tab_is_real` + a local-settings save round-trip replace it).
+
 ## Testing rules
 
 - `tests/gui/conftest.py`: offscreen env; `qapp` from pytest-qt; fixture

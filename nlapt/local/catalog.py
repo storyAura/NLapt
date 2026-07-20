@@ -1,0 +1,605 @@
+"""Curated catalog of local GGUF models (设置 ▸ 本地推理).
+
+A static, hand-picked snapshot of HuggingFace repositories: for every family
+the highest-download public GGUF conversion at snapshot time, the "heretic"
+(abliteration / uncensored) derivatives, and the two caption-specialist
+vision models this app is built around (ToriiGate / JoyCaption).
+
+Hierarchy: :class:`ModelSeries` (大系列) -> :class:`ModelFamily` (小系列)
+-> :class:`QuantFile` (量化档). File sizes and SHA256 digests are exact
+values read from the HuggingFace API (LFS oids), so
+:mod:`nlapt.local.advisor` can predict memory needs and
+:mod:`nlapt.local.download` can verify integrity without any extra network
+round-trip. Download counts are a display-only snapshot taken on
+:data:`CATALOG_SNAPSHOT_DATE`.
+
+``kv_bytes_per_token`` is a deliberately coarse fp16 K+V-cache heuristic per
+family (hybrid/sliding-window attention makes exact numbers configuration
+dependent); the weights dominate the estimate, so coarse is fine here.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+from urllib.parse import quote
+
+from nlapt.core.errors import ValidationError
+
+# Date the download counts / file listings were captured from huggingface.co.
+CATALOG_SNAPSHOT_DATE = "2026-07-20"
+# Base pattern for direct file downloads from a public HuggingFace repo.
+HF_RESOLVE_BASE = "https://huggingface.co/{repo_id}/resolve/main/{path}"
+# Base pattern for a repo's human-readable page.
+HF_REPO_PAGE_BASE = "https://huggingface.co/{repo_id}"
+# "owner/name" with the character set HuggingFace actually allows.
+REPO_ID_PATTERN = re.compile(r"^[\w.-]+/[\w.-]+$")
+# Directory-safe id: no separators, no drive letters, cannot be "." / "..".
+SAFE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+SERIES_GEMMA4 = "gemma4"
+SERIES_GEMMA4_HERETIC = "gemma4-heretic"
+SERIES_TORIIGATE = "toriigate"
+SERIES_JOYCAPTION = "joycaption"
+
+
+@dataclass(frozen=True)
+class QuantFile:
+    """One downloadable quantization of a model family."""
+
+    label: str  # e.g. "Q4_K_M"
+    filename: str  # repo-relative path of the .gguf file
+    size_bytes: int
+    # LFS oid from the HuggingFace API; verified after download. Empty only
+    # for synthetic test entries — the catalog integrity test enforces it.
+    sha256: str = ""
+    recommended: bool = False
+
+
+@dataclass(frozen=True)
+class ModelFamily:
+    """One model (小系列) inside a series, with its downloadable files."""
+
+    family_id: str
+    series_id: str
+    name: str
+    repo_id: str
+    downloads: int  # snapshot count, display only
+    params_label: str  # e.g. "12B"
+    vision: bool
+    kv_bytes_per_token: int  # coarse fp16 K+V heuristic (see module docstring)
+    quants: tuple[QuantFile, ...]
+    mmproj_filename: str = ""  # repo-relative; required when vision is True
+    mmproj_bytes: int = 0
+    mmproj_sha256: str = ""
+    license: str = ""
+    notes: str = ""
+
+
+@dataclass(frozen=True)
+class ModelSeries:
+    """A major family group (大系列) shown as a top-level catalog node."""
+
+    series_id: str
+    name: str
+    description: str
+
+
+ALL_SERIES: tuple[ModelSeries, ...] = (
+    ModelSeries(
+        series_id=SERIES_GEMMA4,
+        name="Gemma 4",
+        description=(
+            "Google 2026-04 发布的开源多模态系列(Apache 2.0),"
+            "从手机级 E2B 到工作站级 31B 共五档,均支持图片输入。"
+        ),
+    ),
+    ModelSeries(
+        series_id=SERIES_GEMMA4_HERETIC,
+        name="Gemma 4 · Heretic 无审查",
+        description=(
+            "社区用 Heretic 消融工具削除拒答倾向的 Gemma 4 衍生版,"
+            "适合处理常规模型会拒绝标注的数据集。"
+        ),
+    ),
+    ModelSeries(
+        series_id=SERIES_TORIIGATE,
+        name="ToriiGate",
+        description="Minthy 训练的动漫 / 插画专用标注视觉模型,支持 booru 标签与自然语言输出。",
+    ),
+    ModelSeries(
+        series_id=SERIES_JOYCAPTION,
+        name="JoyCaption",
+        description="fancyfeast 的自由图片标注视觉模型,写实照片类描述效果好。",
+    ),
+)
+
+
+def _q(
+    label: str,
+    filename: str,
+    size_bytes: int,
+    sha256: str,
+    *,
+    recommended: bool = False,
+) -> QuantFile:
+    """Compact QuantFile constructor for the catalog literals below."""
+    return QuantFile(
+        label=label,
+        filename=filename,
+        size_bytes=size_bytes,
+        sha256=sha256,
+        recommended=recommended,
+    )
+
+
+ALL_FAMILIES: tuple[ModelFamily, ...] = (
+    # -- Gemma 4 (unsloth conversions: top downloads AND ship mmproj) --------------
+    ModelFamily(
+        family_id="gemma4-e2b",
+        series_id=SERIES_GEMMA4,
+        name="Gemma 4 E2B",
+        repo_id="unsloth/gemma-4-E2B-it-GGUF",
+        downloads=439_210,
+        params_label="E2B",
+        vision=True,
+        kv_bytes_per_token=48_000,
+        quants=(
+            _q(
+                "UD-Q2_K_XL",
+                "gemma-4-E2B-it-UD-Q2_K_XL.gguf",
+                2_403_614_816,
+                "2bfeb49803da8db274b3fbac3c1d471903be64d382c237c6f509ccaa9cc141a2",
+            ),
+            _q(
+                "Q4_K_M",
+                "gemma-4-E2B-it-Q4_K_M.gguf",
+                3_106_738_272,
+                "740185b21d22ceb83a11c3aa62ad5842ef32c70f6096d756bbee85a1e4ec34b8",
+                recommended=True,
+            ),
+            _q(
+                "Q8_0",
+                "gemma-4-E2B-it-Q8_0.gguf",
+                5_048_352_864,
+                "605d3c2647d7c58c1e4b5375ccb5702acf94c2611b4c8d4877812f8fdd32d053",
+            ),
+        ),
+        mmproj_filename="mmproj-F16.gguf",
+        mmproj_bytes=985_654_080,
+        mmproj_sha256="140be8d7849741f88c50757d529b84373ee8e27052cc2236855b537f4a8215fa",
+        license="Apache 2.0",
+        notes="手机 / 核显级,约 2.3B 有效参数",
+    ),
+    ModelFamily(
+        family_id="gemma4-e4b",
+        series_id=SERIES_GEMMA4,
+        name="Gemma 4 E4B",
+        repo_id="unsloth/gemma-4-E4B-it-GGUF",
+        downloads=504_402,
+        params_label="E4B",
+        vision=True,
+        kv_bytes_per_token=64_000,
+        quants=(
+            _q(
+                "UD-Q2_K_XL",
+                "gemma-4-E4B-it-UD-Q2_K_XL.gguf",
+                3_757_419_648,
+                "cc92186419be169e992a1df01978828a0d4cf3a5962379ff403c8d55f6faff78",
+            ),
+            _q(
+                "Q4_K_M",
+                "gemma-4-E4B-it-Q4_K_M.gguf",
+                4_977_171_584,
+                "85a896a047553e842f25297ee5b031d64ff30147d9c4af17b1e4b394cd1fab87",
+                recommended=True,
+            ),
+            _q(
+                "Q8_0",
+                "gemma-4-E4B-it-Q8_0.gguf",
+                8_192_953_472,
+                "f8854aa4480df62585a279e7ca0a881554fc18a41c59c4f62642d16a2ae47012",
+            ),
+        ),
+        mmproj_filename="mmproj-F16.gguf",
+        mmproj_bytes=990_372_672,
+        mmproj_sha256="ddf46c21d7078e95338cfc22306b19b276a29a5ad089023449dd54d4b6170a51",
+        license="Apache 2.0",
+        notes="轻薄本级,约 4.5B 有效参数",
+    ),
+    ModelFamily(
+        family_id="gemma4-12b",
+        series_id=SERIES_GEMMA4,
+        name="Gemma 4 12B",
+        repo_id="unsloth/gemma-4-12b-it-GGUF",
+        downloads=640_422,
+        params_label="12B",
+        vision=True,
+        kv_bytes_per_token=96_000,
+        quants=(
+            _q(
+                "UD-Q2_K_XL",
+                "gemma-4-12b-it-UD-Q2_K_XL.gguf",
+                4_661_419_840,
+                "aa6e1ccf5cd1c5340c4786f0bda2478181327f14aba2359e51e455d02c90bff3",
+            ),
+            _q(
+                "Q4_K_M",
+                "gemma-4-12b-it-Q4_K_M.gguf",
+                7_121_861_440,
+                "0a270ec9fe6b34f4a0d33992b6135117b484ebc4766ab76b51d4ae8c457e4c42",
+                recommended=True,
+            ),
+            _q(
+                "Q8_0",
+                "gemma-4-12b-it-Q8_0.gguf",
+                12_669_647_680,
+                "f20e7ff1be28c283eeeb18fc895733791c56a5851d5cd3fe9691b7f7d12afa72",
+            ),
+        ),
+        mmproj_filename="mmproj-F16.gguf",
+        mmproj_bytes=175_115_840,
+        mmproj_sha256="91f086971e56d7a7d8d39e271873fccdb49541bd259d6e02c401a4f1cb7a219e",
+        license="Apache 2.0",
+        notes="统一多模态架构(图像 / 音频免编码器)",
+    ),
+    ModelFamily(
+        family_id="gemma4-26b-a4b",
+        series_id=SERIES_GEMMA4,
+        name="Gemma 4 26B A4B",
+        repo_id="unsloth/gemma-4-26B-A4B-it-GGUF",
+        downloads=1_491_605,
+        params_label="26B MoE",
+        vision=True,
+        kv_bytes_per_token=128_000,
+        quants=(
+            _q(
+                "UD-Q2_K_XL",
+                "gemma-4-26B-A4B-it-UD-Q2_K_XL.gguf",
+                10_546_934_240,
+                "2a1d26dfe6ea00a467940a5728316af6edb366bbdba950d65b85d232392fb658",
+            ),
+            _q(
+                "UD-Q4_K_M",
+                "gemma-4-26B-A4B-it-UD-Q4_K_M.gguf",
+                16_947_541_728,
+                "f2c28b3dc4776931ac6f879e11f203dec637ea0f14267a86ec8f6165f63f293f",
+                recommended=True,
+            ),
+            _q(
+                "Q8_0",
+                "gemma-4-26B-A4B-it-Q8_0.gguf",
+                26_859_861_728,
+                "5f7cbd0f4564e84342fc34321a09acb54b1a3da9215124e5bf444baa6dda152c",
+            ),
+        ),
+        mmproj_filename="mmproj-F16.gguf",
+        mmproj_bytes=1_193_058_784,
+        mmproj_sha256="418a6d8723067cd712235facbbc5cba6c8fbbd413fc1292d2aace5a027d5a42f",
+        license="Apache 2.0",
+        notes="MoE:26B 总参 · 每 token 仅 3.8B 激活,内存换速度,CPU / 混合推理性价比高",
+    ),
+    ModelFamily(
+        family_id="gemma4-31b",
+        series_id=SERIES_GEMMA4,
+        name="Gemma 4 31B",
+        repo_id="unsloth/gemma-4-31B-it-GGUF",
+        downloads=493_405,
+        params_label="31B",
+        vision=True,
+        kv_bytes_per_token=192_000,
+        quants=(
+            _q(
+                "UD-Q2_K_XL",
+                "gemma-4-31B-it-UD-Q2_K_XL.gguf",
+                11_774_991_296,
+                "3c0f374d3bc5d3d8c26adf27535354404f144922cecb8c57d7967647d56f17f3",
+            ),
+            _q(
+                "Q4_K_M",
+                "gemma-4-31B-it-Q4_K_M.gguf",
+                18_323_733_440,
+                "38bd64c852c4b460434cc7162fa9bdcf242faf86502581a754cb72956bb17f84",
+                recommended=True,
+            ),
+            _q(
+                "Q8_0",
+                "gemma-4-31B-it-Q8_0.gguf",
+                32_635_677_632,
+                "d5808e5874e660a85ab45b2da00c9e3b4a003621249a333772232d1a703e4d67",
+            ),
+        ),
+        mmproj_filename="mmproj-F16.gguf",
+        mmproj_bytes=1_198_957_024,
+        mmproj_sha256="6edcca228213c28d3567a35d22f849eea52d8360875093851959adf5d2f270eb",
+        license="Apache 2.0",
+        notes="稠密旗舰,质量最高,需要大显存 / 大内存",
+    ),
+    # -- Gemma 4 Heretic (uncensored derivatives, highest-download conversions) ----
+    ModelFamily(
+        family_id="gemma4-e4b-heretic",
+        series_id=SERIES_GEMMA4_HERETIC,
+        name="Gemma 4 E4B Heretic",
+        repo_id="llmfan46/gemma-4-E4B-it-ultra-uncensored-heretic-GGUF",
+        downloads=90_999,
+        params_label="E4B",
+        vision=True,
+        kv_bytes_per_token=64_000,
+        quants=(
+            _q(
+                "Q4_K_M",
+                "gemma-4-E4B-it-ultra-uncensored-heretic-Q4_K_M.gguf",
+                5_335_289_696,
+                "f9dbbe3bdf396f65aec4e801516a1b868a510d96225417a8aa06763e3c5b97dc",
+                recommended=True,
+            ),
+            _q(
+                "Q8_0",
+                "gemma-4-E4B-it-ultra-uncensored-heretic-Q8_0.gguf",
+                8_031_240_032,
+                "c1543610bcceeba8f51bd7cf38f373d2a002265f8873149aecae8a200b8fe4ba",
+            ),
+        ),
+        mmproj_filename="gemma-4-E4B-it-mmproj-BF16.gguf",
+        mmproj_bytes=991_552_000,
+        mmproj_sha256="ffa64aebf7144bbadd5a1e143b77794d88e76a81cc0168d91de0770eb49e88e0",
+        license="Apache 2.0",
+        notes="Heretic 去审查版 · 轻薄本级",
+    ),
+    ModelFamily(
+        family_id="gemma4-12b-heretic",
+        series_id=SERIES_GEMMA4_HERETIC,
+        name="Gemma 4 12B Heretic",
+        repo_id="culturerevolt/gemma-4-12b-heretic-abliterated-GGUF",
+        downloads=123_468,
+        params_label="12B",
+        vision=True,
+        kv_bytes_per_token=96_000,
+        quants=(
+            _q(
+                "IQ3_XS",
+                "gemma-4-12b-heretic-IQ3_XS.gguf",
+                5_272_393_056,
+                "e3b989172aeca98f32200c8031c603cd7191d8d487acd3cfde59c26ba4d4f4b7",
+            ),
+            _q(
+                "Q4_K_M",
+                "gemma-4-12b-heretic-Q4_K_M.gguf",
+                7_381_382_496,
+                "6c4067ea0210d2367b2dbdd460d2dd86032a9b6e8dcbe03b83a3ea0a0a16dbee",
+                recommended=True,
+            ),
+            _q(
+                "Q8_0",
+                "gemma-4-12b-heretic-abliterated-Q8_0.gguf",
+                12_669_645_440,
+                "e4734aeb71209e9595eaac1b46b6370f4329cad4515ab449a788cb3b04745dec",
+            ),
+        ),
+        mmproj_filename="gemma-4-12b-heretic-mmproj-f16.gguf",
+        mmproj_bytes=175_115_840,
+        mmproj_sha256="2e269f906eb15169ee9ce880ea649bd6d42d4964c21f8ede10d0d0efc738bcbb",
+        license="Apache 2.0",
+        notes="Heretic 去审查 + abliterated 版",
+    ),
+    ModelFamily(
+        family_id="gemma4-26b-a4b-heretic",
+        series_id=SERIES_GEMMA4_HERETIC,
+        name="Gemma 4 26B A4B Heretic",
+        repo_id="mradermacher/gemma-4-26B-A4B-it-ultra-uncensored-heretic-i1-GGUF",
+        downloads=166_027,
+        params_label="26B MoE",
+        vision=False,
+        kv_bytes_per_token=128_000,
+        quants=(
+            _q(
+                "i1-IQ2_M",
+                "gemma-4-26B-A4B-it-ultra-uncensored-heretic.i1-IQ2_M.gguf",
+                10_377_711_648,
+                "200ebc94ea16a77680a95fddc706bb49bd55bd677cc0a9cf61c933c6912d4261",
+            ),
+            _q(
+                "i1-Q4_K_M",
+                "gemma-4-26B-A4B-it-ultra-uncensored-heretic.i1-Q4_K_M.gguf",
+                16_796_012_064,
+                "4f73afa4aafc5a984e337ff4a878ae43696d92f011633a13bf69361e7fab83bb",
+                recommended=True,
+            ),
+            _q(
+                "i1-Q6_K",
+                "gemma-4-26B-A4B-it-ultra-uncensored-heretic.i1-Q6_K.gguf",
+                22_638_395_424,
+                "e365decf35a07f78a078378b51d290c8e053a9e120fbb63825f3c4f8ff448b36",
+            ),
+        ),
+        license="Apache 2.0",
+        notes="Heretic 去审查版 MoE · 该仓库未提供视觉 mmproj,仅文本",
+    ),
+    ModelFamily(
+        family_id="gemma4-31b-heretic",
+        series_id=SERIES_GEMMA4_HERETIC,
+        name="Gemma 4 31B Heretic",
+        repo_id="llmfan46/gemma-4-31B-it-uncensored-heretic-GGUF",
+        downloads=84_391,
+        params_label="31B",
+        vision=True,
+        kv_bytes_per_token=192_000,
+        quants=(
+            _q(
+                "Q3_K_M",
+                "gemma-4-31B-it-uncensored-heretic-Q3_K_M.gguf",
+                15_287_108_736,
+                "c0e2810df3603c8bcd103f9b7bbe0fa76c1422df8724c2989d6091641f5a4a10",
+            ),
+            _q(
+                "Q4_K_M",
+                "gemma-4-31B-it-uncensored-heretic-Q4_K_M.gguf",
+                18_687_063_168,
+                "7c65a35e7c4e53cba6c5e02cc9eeb850eb4251f4d9ad120c2caa6de23c5a6395",
+                recommended=True,
+            ),
+            _q(
+                "Q8_0",
+                "gemma-4-31B-it-uncensored-heretic-Q8_0.gguf",
+                32_635_675_776,
+                "fc1096ef2a43023469beecaa5a7fa3ba804d3f1684ade80f8f083e7e27a1028e",
+            ),
+        ),
+        mmproj_filename="gemma-4-31B-it-mmproj-BF16.gguf",
+        mmproj_bytes=1_200_726_208,
+        mmproj_sha256="21487ff26d08f7ddd1d654d3bbfc1ae1020aab3119f5bf654742ce4697732e4e",
+        license="Apache 2.0",
+        notes="Heretic 去审查版稠密旗舰",
+    ),
+    # -- Caption specialists -------------------------------------------------------
+    ModelFamily(
+        family_id="toriigate-0.5",
+        series_id=SERIES_TORIIGATE,
+        name="ToriiGate 0.5",
+        repo_id="DraconicDragon/ToriiGate-0.5-GGUF",
+        downloads=8_574,
+        params_label="4B",
+        vision=True,
+        kv_bytes_per_token=147_456,
+        quants=(
+            _q(
+                "Q4_K_M",
+                "ToriiGate-0.5-Q4_K_M.gguf",
+                3_066_382_176,
+                "1dd18497b1a1ee19e5ca63a58efb4614bfd24abf80ee7fd796bbbe3bc1e20cef",
+                recommended=True,
+            ),
+            _q(
+                "Q6_K",
+                "ToriiGate-0.5-Q6_K.gguf",
+                3_985_524_576,
+                "2452c180427a127fe536e03c00cf5249f38c1378ae4d17a29e1a9f2371b5a852",
+            ),
+            _q(
+                "Q8_0",
+                "ToriiGate-0.5-Q8_0.gguf",
+                5_157_830_496,
+                "2b21dce659e9ba92ebf481468b7cea131e614f162fc43ddb8c834ffaf4364020",
+            ),
+        ),
+        mmproj_filename="ToriiGate-0.5-fp16.mmproj.gguf",
+        mmproj_bytes=672_423_360,
+        mmproj_sha256="e0470d4bff4e932ecf3c7bf3b937d51301722c5d17c43f7ad9dfc73b65808b9c",
+        license="MIT",
+        notes="基于 Qwen3.5-4B · 动漫 / 插画标注特化(原仓库 Minthy/ToriiGate-0.5)",
+    ),
+    ModelFamily(
+        family_id="joycaption-beta-one",
+        series_id=SERIES_JOYCAPTION,
+        name="JoyCaption Beta One",
+        repo_id="concedo/llama-joycaption-beta-one-hf-llava-mmproj-gguf",
+        downloads=7_977,
+        params_label="8B",
+        vision=True,
+        kv_bytes_per_token=131_072,
+        quants=(
+            _q(
+                "Q4_K",
+                "Llama-Joycaption-Beta-One-Hf-Llava-Q4_K.gguf",
+                4_920_735_936,
+                "e8ae55dd07e61d541ab741d6ed63e7810192cea65d7ef8cda69b2a99fb06dc15",
+                recommended=True,
+            ),
+            _q(
+                "Q8_0",
+                "Llama-Joycaption-Beta-One-Hf-Llava-Q8_0.gguf",
+                8_540_772_544,
+                "914fccbc28d0bdf87bab2937f58707bbc33556021664cd16a9666607d4058b99",
+            ),
+        ),
+        mmproj_filename="llama-joycaption-beta-one-llava-mmproj-model-f16.gguf",
+        mmproj_bytes=877_771_808,
+        mmproj_sha256="94002cb5c354c7c9e538e64f37d593db9eceeca2e94573bae6cd3b2bd8bb1952",
+        license="Llama 3.1",
+        notes="基于 Llama-3.1-8B LLaVA · 写实图片描述",
+    ),
+)
+
+_FAMILIES_BY_ID: dict[str, ModelFamily] = {f.family_id: f for f in ALL_FAMILIES}
+
+
+def all_series() -> tuple[ModelSeries, ...]:
+    """Every catalog series (大系列), in display order."""
+    return ALL_SERIES
+
+
+def families_for(series_id: str) -> tuple[ModelFamily, ...]:
+    """The families (小系列) of one series, in catalog order."""
+    return tuple(f for f in ALL_FAMILIES if f.series_id == series_id)
+
+
+def all_families() -> tuple[ModelFamily, ...]:
+    """Every family across all series, in catalog order."""
+    return ALL_FAMILIES
+
+
+def find_family(family_id: str) -> ModelFamily:
+    """Look up a family by id. Raises ValidationError for unknown ids."""
+    family = _FAMILIES_BY_ID.get(family_id)
+    if family is None:
+        raise ValidationError(f"未知的本地模型: {family_id!r}")
+    return family
+
+
+def find_quant(family: ModelFamily, label: str) -> QuantFile:
+    """Look up a quant by label inside a family. Raises ValidationError."""
+    for quant in family.quants:
+        if quant.label == label:
+            return quant
+    raise ValidationError(f"模型 {family.family_id} 没有量化档 {label!r}")
+
+
+def recommended_quant(family: ModelFamily) -> QuantFile:
+    """The family's recommended quant (first flagged, else first listed)."""
+    for quant in family.quants:
+        if quant.recommended:
+            return quant
+    return family.quants[0]
+
+
+def download_url(repo_id: str, filename: str) -> str:
+    """Direct HuggingFace download URL for a repo-relative file path."""
+    if not repo_id or not filename:
+        raise ValidationError("repo_id 与 filename 不能为空")
+    if not REPO_ID_PATTERN.fullmatch(repo_id):
+        raise ValidationError(f"非法的仓库 ID: {repo_id!r}")
+    encoded = "/".join(quote(part) for part in PurePosixPath(filename).parts)
+    return HF_RESOLVE_BASE.format(repo_id=repo_id, path=encoded)
+
+
+def repo_page_url(repo_id: str) -> str:
+    """Human-readable HuggingFace page URL for a repo."""
+    if not REPO_ID_PATTERN.fullmatch(repo_id):
+        raise ValidationError(f"非法的仓库 ID: {repo_id!r}")
+    return HF_REPO_PAGE_BASE.format(repo_id=repo_id)
+
+
+def family_dir(models_dir: Path, family: ModelFamily) -> Path:
+    """Local directory holding one family's files (namespaced by family id).
+
+    The id is validated against :data:`SAFE_ID_PATTERN` so a malformed
+    family can never escape ``models_dir`` (defense in depth — catalog ids
+    are hardcoded today, but this function must stay safe if the catalog
+    ever gains an external source).
+    """
+    if not SAFE_ID_PATTERN.fullmatch(family.family_id):
+        raise ValidationError(f"非法的模型目录名: {family.family_id!r}")
+    return models_dir / family.family_id
+
+
+def quant_path(models_dir: Path, family: ModelFamily, quant: QuantFile) -> Path:
+    """Local path of a quant file (basename of the repo path, per-family dir)."""
+    return family_dir(models_dir, family) / PurePosixPath(quant.filename).name
+
+
+def mmproj_path(models_dir: Path, family: ModelFamily) -> Path | None:
+    """Local path of the family's mmproj file, or None for text-only families."""
+    if not family.vision or not family.mmproj_filename:
+        return None
+    return family_dir(models_dir, family) / PurePosixPath(family.mmproj_filename).name

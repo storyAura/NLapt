@@ -19,7 +19,6 @@ test through the core config/client APIs directly.
 from __future__ import annotations
 
 from dataclasses import replace as _dc_replace
-from pathlib import Path
 from typing import Callable, Sequence
 
 from PySide6.QtCore import Qt, QThreadPool, Signal
@@ -54,7 +53,7 @@ from nlapt.llm.web_translate import (
 
 from nlapt_gui.controller import AppController, TOAST_ERR, TOAST_OK, TOAST_WARN
 from nlapt_gui.prompt_store import load_vision_prompts, save_vision_prompts
-from nlapt_gui.resources import app_data_dir
+from nlapt_gui.resources import config_path
 from nlapt_gui.translate_config import (
     KNOWN_PROVIDERS,
     TranslationConfig,
@@ -62,13 +61,13 @@ from nlapt_gui.translate_config import (
     save_translation_config,
 )
 from nlapt_gui.widgets.dialogs import CenteredDialog
+from nlapt_gui.widgets.local_tab import LocalTab
 from nlapt_gui.widgets.model_picker import ModelPickerDialog
 from nlapt_gui.widgets.prompt_editor import PromptsTab
 from nlapt_gui.workers import run_async
 
 _LOGGER = get_logger(__name__)
 
-CONFIG_FILE_NAME = "config.json"
 DEFAULT_PROFILE_NAME = "default"
 DEFAULT_API_TYPES: tuple[str, ...] = ("openai", "anthropic", "ollama")
 DIALOG_WIDTH = 480
@@ -118,15 +117,6 @@ TOAST_TR_TEST_OK = "翻译测试成功: {result}"
 TOAST_TR_TEST_FAIL = "翻译测试失败: {message}"
 TOAST_TR_NEED_KEY = "请先填写所选翻译服务所需的密钥"
 
-# 本地推理 placeholder tab.
-LOCAL_TITLE = "本地推理模型"
-LOCAL_BADGE = "规划中"
-LOCAL_DESC = (
-    "该模块用于在软件内下载并管理本地推理模型,离线为图片生成标注"
-    "(无需配置在线 API)。当前版本为占位界面,模型下载与推理将在后续版本开放。"
-)
-LOCAL_BUTTON = "下载模型(即将推出)"
-
 # Human-readable dropdown labels per provider id (UI stays Chinese).
 PROVIDER_LABELS: dict[str, str] = {
     "llm": "大模型 (LLM)",
@@ -134,11 +124,6 @@ PROVIDER_LABELS: dict[str, str] = {
     "baidu": "百度翻译",
     "deepl": "DeepL",
 }
-
-
-def config_path() -> Path:
-    """Location of the persisted core config."""
-    return app_data_dir() / CONFIG_FILE_NAME
 
 
 class SettingsDialog(CenteredDialog):
@@ -182,7 +167,8 @@ class SettingsDialog(CenteredDialog):
         self.prompts_tab = PromptsTab(load_vision_prompts(), self)
         self.prompts_tab.toast_requested.connect(self._controller.toast_requested.emit)
         self.tabs.addTab(self.prompts_tab, TAB_PROMPTS)
-        self.tabs.addTab(self._build_local_tab(), TAB_LOCAL)
+        self.local_tab = LocalTab(controller, pool=self._pool, parent=self)
+        self.tabs.addTab(self.local_tab, TAB_LOCAL)
 
         self.cancel_button = QPushButton(BUTTON_CANCEL, self)
         self.cancel_button.setProperty("variant", "outline")
@@ -318,30 +304,6 @@ class SettingsDialog(CenteredDialog):
         column.addStretch(1)
         return tab
 
-    def _build_local_tab(self) -> QWidget:
-        tab = QWidget(self)
-        title_row = QHBoxLayout()
-        title = QLabel(LOCAL_TITLE, tab)
-        title.setStyleSheet("font-weight: 700; font-size: 13.5px;")
-        title_row.addWidget(title)
-        badge = QLabel(LOCAL_BADGE, tab)
-        badge.setProperty("pill", "accentSoft")
-        title_row.addWidget(badge)
-        title_row.addStretch(1)
-        description = QLabel(LOCAL_DESC, tab)
-        description.setProperty("muted", True)
-        description.setWordWrap(True)
-        self.local_download_button = QPushButton(LOCAL_BUTTON, tab)
-        self.local_download_button.setProperty("variant", "outline")
-        self.local_download_button.setEnabled(False)
-        column = QVBoxLayout(tab)
-        column.setSpacing(SECTION_GAP)
-        column.addLayout(title_row)
-        column.addWidget(description)
-        column.addWidget(self.local_download_button, 0, Qt.AlignmentFlag.AlignLeft)
-        column.addStretch(1)
-        return tab
-
     # -- public accessors ---------------------------------------------------------------
     def selected_provider(self) -> str:
         """Provider id chosen in the 翻译服务 dropdown."""
@@ -471,6 +433,8 @@ class SettingsDialog(CenteredDialog):
         except NLaptError as exc:  # prompts must not block the LLM/provider save
             _LOGGER.exception("could not persist vision prompts")
             self._toast(str(exc), TOAST_ERR)
+        # Local-inference tab persists its own file (errors toast internally).
+        self.local_tab.persist()
         saved_config: AppConfig | None = None
         if write_llm:
             profile = self.current_profile()

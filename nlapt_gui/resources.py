@@ -21,6 +21,8 @@ ENV_DATA_DIR = "NLAPT_DATA_DIR"
 WINDOWS_DIR_NAME = "NLapt"
 # Directory name under ~/.config on other platforms.
 UNIX_DIR_NAME = "nlapt"
+# File name of the persisted core AppConfig inside the data directory.
+CONFIG_FILE_NAME = "config.json"
 
 
 def resource_path(rel: str) -> Path:
@@ -33,6 +35,11 @@ def resource_path(rel: str) -> Path:
     bundle_root = getattr(sys, "_MEIPASS", None)
     base = Path(bundle_root) if bundle_root else Path(__file__).resolve().parent.parent
     return base / rel
+
+
+def config_path() -> Path:
+    """Location of the persisted core config (neutral home — no widget deps)."""
+    return app_data_dir() / CONFIG_FILE_NAME
 
 
 def app_data_dir() -> Path:

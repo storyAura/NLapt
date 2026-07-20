@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nlapt"
-version = "0.1.0"
+version = "0.2.0"
 description = "Natural Language Annotation Processing Tools - edit, batch-modify and translate natural-language image captions"
 readme = "README.md"
 requires-python = ">=3.11"

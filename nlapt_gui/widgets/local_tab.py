@@ -1,0 +1,711 @@
+"""设置 ▸ 本地推理 tab: catalog tree, runnability badges, downloads, server.
+
+Layout, top to bottom: a hardware summary line (lazy-detected on first
+show), the model tree (大系列 → 小系列 → 量化档 with a per-quant
+compatibility verdict), a detail line for the selected quant, the action
+row (下载 / 打开模型页 / 启动服务 / 设为当前模型 + progress bar) and the
+runtime settings form (目录 / llama-server / 上下文 / GPU 层 / 线程 /
+并发 / 端口).
+
+All slow work goes through :class:`nlapt_gui.local_bridge.LocalBridge`.
+Like the settings dialog that hosts it, this tab is part of the sanctioned
+exception that may write the core config directly (设为当前模型 registers a
+``local`` OpenAI-compatible profile pointing at the llama-server).
+"""
+
+from __future__ import annotations
+
+from dataclasses import replace as _dc_replace
+
+from PySide6.QtCore import Qt, QThreadPool, QUrl
+from PySide6.QtGui import QDesktopServices, QShowEvent
+from PySide6.QtWidgets import (
+    QFileDialog,
+    QFormLayout,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QProgressBar,
+    QPushButton,
+    QSpinBox,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
+
+from nlapt.core.config import LLMProfile, load_config, save_config
+from nlapt.core.errors import NLaptError, StorageError, ValidationError
+from nlapt.diagnostics import get_logger
+from nlapt.local.advisor import RunAssessment, RunVerdict, assess, estimate_memory
+from nlapt.local.catalog import (
+    CATALOG_SNAPSHOT_DATE,
+    ModelFamily,
+    QuantFile,
+    all_series,
+    families_for,
+    find_family,
+    find_quant,
+    repo_page_url,
+)
+from nlapt.local.hardware import HardwareInfo, format_bytes
+from nlapt.local.server import base_url as local_base_url
+from nlapt.local.settings import (
+    CONTEXT_RANGE,
+    GPU_LAYERS_RANGE,
+    PARALLEL_RANGE,
+    PORT_RANGE,
+    THREADS_RANGE,
+)
+
+from nlapt_gui.controller import AppController, TOAST_ERR, TOAST_OK, TOAST_WARN
+from nlapt_gui.local_bridge import (
+    DOWNLOAD_CANCELLED,
+    DOWNLOAD_OK,
+    SERVER_ERROR,
+    SERVER_RUNNING,
+    SERVER_STARTING,
+    LocalBridge,
+)
+from nlapt_gui.resources import config_path
+
+_LOGGER = get_logger(__name__)
+
+LOCAL_PROFILE_NAME = "local"
+LOCAL_API_TYPE = "openai"
+
+ROLE_FAMILY = Qt.ItemDataRole.UserRole
+ROLE_QUANT = Qt.ItemDataRole.UserRole + 1
+
+TREE_MIN_HEIGHT = 220
+CONTEXT_STEP = 512
+PROGRESS_BAR_MAX = 1000
+
+# UI strings.
+HW_PREFIX = "本机硬件:"
+HW_DETECTING = "正在检测本机硬件…"
+HW_UNKNOWN = "硬件检测失败 — 兼容性列将显示「?」"
+HW_NO_GPU = "未检测到 NVIDIA 独显(将以 CPU 推理)"
+BTN_DETECT = "重新检测"
+COL_MODEL = "模型"
+COL_SIZE = "体积"
+COL_DOWNLOADS = "热度"
+COL_VERDICT = "兼容性"
+TAG_VISION = "视觉"
+TAG_RECOMMENDED = "★ 推荐"
+CATALOG_HINT = (
+    f"目录快照 {CATALOG_SNAPSHOT_DATE} · 热度为 HuggingFace 月下载量 · "
+    "兼容性依据本机硬件与下方上下文长度估算"
+)
+DETAIL_EMPTY = "在上方选择一个量化档查看预计占用与操作"
+DETAIL_LINE = (
+    "预计占用 {total}(权重 {weights}{mmproj} + 上下文 {kv} + 开销 {overhead})"
+    " · 显存预算 {gpu} · 内存预算 {ram}"
+)
+DETAIL_MMPROJ = " + 视觉 {size}"
+VERDICT_TEXT: dict[RunVerdict, str] = {
+    RunVerdict.GPU_FULL: "✓ 显存流畅",
+    RunVerdict.GPU_PARTIAL: "◐ 显存+内存",
+    RunVerdict.CPU_ONLY: "▢ 仅内存(慢)",
+    RunVerdict.NOT_RUNNABLE: "✗ 配置不足",
+    RunVerdict.UNKNOWN: "?",
+}
+VERDICT_SENTENCE: dict[RunVerdict, str] = {
+    RunVerdict.GPU_FULL: "可完全载入显存,预计流畅运行",
+    RunVerdict.GPU_PARTIAL: "显存不够整模型,部分层将落到内存,速度中等",
+    RunVerdict.CPU_ONLY: "无可用独显,将以内存 + CPU 运行,速度较慢",
+    RunVerdict.NOT_RUNNABLE: "超出本机显存 + 内存预算,不建议运行(还差 {shortfall})",
+    RunVerdict.UNKNOWN: "硬件信息未知,无法预测",
+}
+BTN_DOWNLOAD = "下载模型"
+BTN_DOWNLOAD_AGAIN = "已下载 ✓(重新校验)"
+BTN_CANCEL_DOWNLOAD = "取消下载"
+BTN_PAGE = "打开模型页"
+BTN_SERVER_START = "启动本地服务"
+BTN_SERVER_STOP = "停止服务"
+BTN_APPLY = "设为当前模型"
+SERVER_STATUS_STOPPED = "服务未启动"
+SERVER_STATUS_STARTING = "正在启动服务(首次加载较慢)…"
+SERVER_STATUS_RUNNING = "服务运行中:{url}"
+LABEL_MODELS_DIR = "模型目录"
+LABEL_SERVER_PATH = "llama-server"
+BTN_BROWSE = "浏览…"
+LABEL_CONTEXT = "上下文长度"
+LABEL_GPU_LAYERS = "GPU 层数"
+LABEL_THREADS = "线程数"
+LABEL_PARALLEL = "并发请求数"
+LABEL_PORT = "端口"
+SPECIAL_GPU_AUTO = "自动(全部)"
+SPECIAL_THREADS_AUTO = "自动"
+SERVER_HINT = (
+    "本地服务基于 llama.cpp 的 llama-server:请从其 GitHub Releases 下载对应"
+    "平台的压缩包,解压后在上方选择 llama-server 可执行文件。"
+    "启动后「设为当前模型」会把翻译 / 重译切到本地模型。"
+)
+TOAST_SELECT_QUANT = "请先在列表中选择一个量化档"
+TOAST_DOWNLOAD_BUSY = "已有下载任务正在进行"
+TOAST_DOWNLOAD_OK = "已下载 {name} · {quant}"
+TOAST_DOWNLOAD_CANCELLED = "已取消下载(已下载部分保留,可续传)"
+TOAST_DOWNLOAD_FAIL = "下载失败: {message}"
+TOAST_NEED_SERVER_PATH = "请先选择 llama-server 可执行文件"
+TOAST_NEED_DOWNLOAD = "该量化档尚未下载完成"
+TOAST_SERVER_RUNNING = "本地服务已就绪: {url}"
+TOAST_SERVER_FAIL = "本地服务启动失败: {message}"
+TOAST_SERVER_STOPPED = "本地服务已停止"
+TOAST_APPLIED = "已切换到本地模型 {name}(并发 {parallel})"
+TOAST_CONFIG_UNREADABLE = "无法读取现有配置,已取消写入以避免覆盖其它设置"
+TOAST_SETTINGS_FAILED = "本地推理设置保存失败: {message}"
+DOWNLOAD_FORMAT = "{done} / {total}"
+
+FILTER_EXECUTABLE = "可执行文件 (*.exe);;所有文件 (*)"
+
+
+def _format_downloads(count: int) -> str:
+    """Compact Chinese download count: 1_491_605 -> '149.2 万'."""
+    if count >= 10_000:
+        return f"{count / 10_000:.1f} 万"
+    return str(count)
+
+
+class LocalTab(QWidget):
+    """The real 本地推理 tab (replaces the v1.5 placeholder)."""
+
+    def __init__(
+        self,
+        controller: AppController,
+        *,
+        bridge: LocalBridge | None = None,
+        pool: QThreadPool | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._controller = controller
+        self.bridge = (
+            bridge if bridge is not None else LocalBridge(pool=pool, parent=self)
+        )
+        # Last HardwareInfo received via hardware_ready (single UI-side source).
+        self._hardware: HardwareInfo | None = self.bridge.hardware
+        self._detect_started = False
+        self._build_ui()
+        self._populate_tree()
+        self._prefill_from_settings()
+        self._connect()
+        self._refresh_selection_ui()
+
+    # -- construction ------------------------------------------------------------------
+    def _build_ui(self) -> None:
+        self.hw_label = QLabel(HW_DETECTING, self)
+        self.hw_label.setProperty("muted", True)
+        self.hw_label.setWordWrap(True)
+        self.detect_button = QPushButton(BTN_DETECT, self)
+        self.detect_button.setProperty("variant", "outline")
+        hw_row = QHBoxLayout()
+        hw_row.addWidget(self.hw_label, 1)
+        hw_row.addWidget(self.detect_button, 0, Qt.AlignmentFlag.AlignTop)
+
+        self.tree = QTreeWidget(self)
+        self.tree.setColumnCount(4)
+        self.tree.setHeaderLabels([COL_MODEL, COL_SIZE, COL_DOWNLOADS, COL_VERDICT])
+        self.tree.setMinimumHeight(TREE_MIN_HEIGHT)
+        self.tree.setRootIsDecorated(True)
+        header = self.tree.header()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for column in (1, 2, 3):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+
+        self.catalog_hint = QLabel(CATALOG_HINT, self)
+        self.catalog_hint.setProperty("muted", True)
+        self.catalog_hint.setWordWrap(True)
+
+        self.detail_label = QLabel(DETAIL_EMPTY, self)
+        self.detail_label.setProperty("muted", True)
+        self.detail_label.setWordWrap(True)
+
+        self.download_button = QPushButton(BTN_DOWNLOAD, self)
+        self.download_button.setProperty("variant", "accent")
+        self.page_button = QPushButton(BTN_PAGE, self)
+        self.page_button.setProperty("variant", "ghost")
+        self.server_button = QPushButton(BTN_SERVER_START, self)
+        self.server_button.setProperty("variant", "outline")
+        self.apply_button = QPushButton(BTN_APPLY, self)
+        self.apply_button.setProperty("variant", "outline")
+        action_row = QHBoxLayout()
+        for button in (
+            self.download_button,
+            self.page_button,
+            self.server_button,
+            self.apply_button,
+        ):
+            action_row.addWidget(button)
+        action_row.addStretch(1)
+
+        self.progress = QProgressBar(self)
+        self.progress.setVisible(False)
+        self.server_status = QLabel(SERVER_STATUS_STOPPED, self)
+        self.server_status.setProperty("muted", True)
+        self.server_status.setWordWrap(True)
+
+        self.models_dir_edit = QLineEdit(self)
+        self.models_dir_browse = QPushButton(BTN_BROWSE, self)
+        self.models_dir_browse.setProperty("variant", "ghost")
+        models_dir_row = QHBoxLayout()
+        models_dir_row.addWidget(self.models_dir_edit, 1)
+        models_dir_row.addWidget(self.models_dir_browse)
+        self.server_path_edit = QLineEdit(self)
+        self.server_path_browse = QPushButton(BTN_BROWSE, self)
+        self.server_path_browse.setProperty("variant", "ghost")
+        server_path_row = QHBoxLayout()
+        server_path_row.addWidget(self.server_path_edit, 1)
+        server_path_row.addWidget(self.server_path_browse)
+
+        self.context_spin = QSpinBox(self)
+        self.context_spin.setRange(*CONTEXT_RANGE)
+        self.context_spin.setSingleStep(CONTEXT_STEP)
+        self.gpu_layers_spin = QSpinBox(self)
+        self.gpu_layers_spin.setRange(*GPU_LAYERS_RANGE)
+        self.gpu_layers_spin.setSpecialValueText(SPECIAL_GPU_AUTO)
+        self.threads_spin = QSpinBox(self)
+        self.threads_spin.setRange(*THREADS_RANGE)
+        self.threads_spin.setSpecialValueText(SPECIAL_THREADS_AUTO)
+        self.parallel_spin = QSpinBox(self)
+        self.parallel_spin.setRange(*PARALLEL_RANGE)
+        self.port_spin = QSpinBox(self)
+        self.port_spin.setRange(*PORT_RANGE)
+
+        form = QFormLayout()
+        form.addRow(LABEL_MODELS_DIR, models_dir_row)
+        form.addRow(LABEL_SERVER_PATH, server_path_row)
+        form.addRow(LABEL_CONTEXT, self.context_spin)
+        form.addRow(LABEL_GPU_LAYERS, self.gpu_layers_spin)
+        form.addRow(LABEL_THREADS, self.threads_spin)
+        form.addRow(LABEL_PARALLEL, self.parallel_spin)
+        form.addRow(LABEL_PORT, self.port_spin)
+
+        self.server_hint = QLabel(SERVER_HINT, self)
+        self.server_hint.setProperty("muted", True)
+        self.server_hint.setWordWrap(True)
+
+        column = QVBoxLayout(self)
+        column.addLayout(hw_row)
+        column.addWidget(self.tree, 1)
+        column.addWidget(self.catalog_hint)
+        column.addWidget(self.detail_label)
+        column.addLayout(action_row)
+        column.addWidget(self.progress)
+        column.addWidget(self.server_status)
+        column.addLayout(form)
+        column.addWidget(self.server_hint)
+
+    def _populate_tree(self) -> None:
+        self.tree.clear()
+        for series in all_series():
+            series_item = QTreeWidgetItem([series.name, "", "", ""])
+            series_item.setToolTip(0, series.description)
+            series_item.setFlags(series_item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+            self.tree.addTopLevelItem(series_item)
+            for family in families_for(series.series_id):
+                name = f"{family.name} · {family.params_label}"
+                if family.vision:
+                    name = f"{name} · {TAG_VISION}"
+                family_item = QTreeWidgetItem(
+                    [name, "", _format_downloads(family.downloads), ""]
+                )
+                tooltip = family.notes or family.name
+                family_item.setToolTip(0, f"{tooltip}\n{family.repo_id} · {family.license}")
+                family_item.setFlags(
+                    family_item.flags() & ~Qt.ItemFlag.ItemIsSelectable
+                )
+                family_item.setData(0, ROLE_FAMILY, family.family_id)
+                series_item.addChild(family_item)
+                for quant in family.quants:
+                    label = quant.label
+                    if quant.recommended:
+                        label = f"{label}  {TAG_RECOMMENDED}"
+                    quant_item = QTreeWidgetItem(
+                        [
+                            label,
+                            format_bytes(quant.size_bytes),
+                            "",
+                            VERDICT_TEXT[RunVerdict.UNKNOWN],
+                        ]
+                    )
+                    quant_item.setData(0, ROLE_FAMILY, family.family_id)
+                    quant_item.setData(0, ROLE_QUANT, quant.label)
+                    family_item.addChild(quant_item)
+            series_item.setExpanded(True)
+
+    def _connect(self) -> None:
+        self.detect_button.clicked.connect(self.refresh_hardware)
+        self.tree.currentItemChanged.connect(self._on_selection_changed)
+        self.context_spin.valueChanged.connect(self._refresh_verdicts)
+        self.download_button.clicked.connect(self._on_download_clicked)
+        self.page_button.clicked.connect(self._on_page_clicked)
+        self.server_button.clicked.connect(self._on_server_clicked)
+        self.apply_button.clicked.connect(self._on_apply_clicked)
+        self.models_dir_browse.clicked.connect(self._browse_models_dir)
+        self.server_path_browse.clicked.connect(self._browse_server_path)
+        bridge = self.bridge
+        bridge.hardware_ready.connect(self._on_hardware_ready)
+        bridge.download_progress.connect(self._on_download_progress)
+        bridge.download_finished.connect(self._on_download_finished)
+        bridge.server_changed.connect(self._on_server_changed)
+
+    def _prefill_from_settings(self) -> None:
+        settings = self.bridge.settings
+        self.models_dir_edit.setText(settings.models_dir)
+        self.models_dir_edit.setPlaceholderText(str(self.bridge.models_dir()))
+        self.server_path_edit.setText(settings.server_path)
+        self.context_spin.setValue(settings.context_length)
+        self.gpu_layers_spin.setValue(settings.gpu_layers)
+        self.threads_spin.setValue(settings.threads)
+        self.parallel_spin.setValue(settings.parallel)
+        self.port_spin.setValue(settings.port)
+        if settings.family_id and settings.quant_label:
+            self._select_quant_item(settings.family_id, settings.quant_label)
+        if self.bridge.server_running():
+            # Reflect an already-running server WITHOUT the "just started" toast.
+            self.server_button.setText(BTN_SERVER_STOP)
+            self.server_status.setText(
+                SERVER_STATUS_RUNNING.format(url=self.bridge.server_base_url())
+            )
+
+    def _select_quant_item(self, family_id: str, quant_label: str) -> None:
+        for item in self._quant_items():
+            if (
+                item.data(0, ROLE_FAMILY) == family_id
+                and item.data(0, ROLE_QUANT) == quant_label
+            ):
+                parent = item.parent()
+                while parent is not None:
+                    parent.setExpanded(True)
+                    parent = parent.parent()
+                self.tree.setCurrentItem(item)
+                self.tree.scrollToItem(item)
+                return
+
+    # -- lazy hardware detection -------------------------------------------------------
+    def showEvent(self, event: QShowEvent) -> None:  # noqa: N802 - Qt override
+        super().showEvent(event)
+        if not self._detect_started:
+            self.refresh_hardware()
+
+    def refresh_hardware(self) -> None:
+        """(Re-)probe the machine asynchronously."""
+        self._detect_started = True
+        self.hw_label.setText(HW_DETECTING)
+        self.bridge.detect()
+
+    # -- persistence -------------------------------------------------------------------
+    def persist(self) -> None:
+        """Write the form + selection into the local settings file."""
+        selection = self.current_selection()
+        try:
+            self.bridge.update_settings(
+                models_dir=self.models_dir_edit.text().strip(),
+                server_path=self.server_path_edit.text().strip(),
+                context_length=self.context_spin.value(),
+                gpu_layers=self.gpu_layers_spin.value(),
+                threads=self.threads_spin.value(),
+                parallel=self.parallel_spin.value(),
+                port=self.port_spin.value(),
+                family_id=selection[0].family_id if selection else "",
+                quant_label=selection[1].label if selection else "",
+            )
+        except NLaptError as exc:
+            _LOGGER.exception("could not persist local settings")
+            self._toast(TOAST_SETTINGS_FAILED.format(message=exc.message), TOAST_ERR)
+
+    # -- selection ---------------------------------------------------------------------
+    def current_selection(self) -> tuple[ModelFamily, QuantFile] | None:
+        """The selected (family, quant), or None when no quant row is current."""
+        item = self.tree.currentItem()
+        if item is None:
+            return None
+        family_id = item.data(0, ROLE_FAMILY)
+        quant_label = item.data(0, ROLE_QUANT)
+        if not family_id or not quant_label:
+            return None
+        family = find_family(str(family_id))
+        return family, find_quant(family, str(quant_label))
+
+    def _quant_items(self) -> tuple[QTreeWidgetItem, ...]:
+        items: list[QTreeWidgetItem] = []
+        for series_index in range(self.tree.topLevelItemCount()):
+            series_item = self.tree.topLevelItem(series_index)
+            for family_index in range(series_item.childCount()):
+                family_item = series_item.child(family_index)
+                items.extend(
+                    family_item.child(i) for i in range(family_item.childCount())
+                )
+        return tuple(items)
+
+    # -- verdicts ----------------------------------------------------------------------
+    def _refresh_verdicts(self) -> None:
+        hardware = self._hardware
+        context = self.context_spin.value()
+        for item in self._quant_items():
+            family = find_family(str(item.data(0, ROLE_FAMILY)))
+            quant = find_quant(family, str(item.data(0, ROLE_QUANT)))
+            if hardware is None:
+                item.setText(3, VERDICT_TEXT[RunVerdict.UNKNOWN])
+                continue
+            result = assess(family, quant, hardware, context_length=context)
+            item.setText(3, VERDICT_TEXT[result.verdict])
+            item.setToolTip(3, self._verdict_sentence(result))
+        self._refresh_selection_ui()
+
+    @staticmethod
+    def _verdict_sentence(result: RunAssessment) -> str:
+        sentence = VERDICT_SENTENCE[result.verdict]
+        if result.verdict is RunVerdict.NOT_RUNNABLE:
+            sentence = sentence.format(shortfall=format_bytes(result.shortfall_bytes))
+        return sentence
+
+    def _on_hardware_ready(self, info: object) -> None:
+        if not isinstance(info, HardwareInfo):
+            return
+        self._hardware = info
+        if info.ram_total_bytes <= 0:
+            self.hw_label.setText(HW_UNKNOWN)
+        else:
+            gpu = info.best_gpu()
+            gpu_text = (
+                HW_NO_GPU
+                if gpu is None
+                else f"{gpu.name} · 显存 {format_bytes(gpu.vram_total_bytes)}"
+                f"(空闲 {format_bytes(gpu.vram_free_bytes)})"
+            )
+            self.hw_label.setText(
+                f"{HW_PREFIX}CPU {info.cpu_cores} 核 · "
+                f"内存 {format_bytes(info.ram_total_bytes)}"
+                f"(可用 {format_bytes(info.ram_available_bytes)})· {gpu_text}"
+            )
+        self._refresh_verdicts()
+
+    # -- selection-driven UI -----------------------------------------------------------
+    def _on_selection_changed(self, *_args: object) -> None:
+        self._refresh_selection_ui()
+
+    def _refresh_selection_ui(self) -> None:
+        selection = self.current_selection()
+        downloading = self.bridge.is_downloading()
+        if selection is None:
+            self.detail_label.setText(DETAIL_EMPTY)
+            self.download_button.setText(
+                BTN_CANCEL_DOWNLOAD if downloading else BTN_DOWNLOAD
+            )
+            self.download_button.setEnabled(downloading)
+            self.page_button.setEnabled(False)
+            self.server_button.setEnabled(self.bridge.server_running())
+            self.apply_button.setEnabled(False)
+            return
+        family, quant = selection
+        hardware = self._hardware
+        context = self.context_spin.value()
+        estimate = estimate_memory(family, quant, context_length=context)
+        mmproj_part = (
+            DETAIL_MMPROJ.format(size=format_bytes(estimate.mmproj_bytes))
+            if estimate.mmproj_bytes
+            else ""
+        )
+        if hardware is not None:
+            result = assess(family, quant, hardware, context_length=context)
+            budgets = (
+                format_bytes(result.gpu_budget_bytes),
+                format_bytes(result.ram_budget_bytes),
+            )
+            sentence = self._verdict_sentence(result)
+        else:
+            budgets = ("?", "?")
+            sentence = VERDICT_SENTENCE[RunVerdict.UNKNOWN]
+        self.detail_label.setText(
+            DETAIL_LINE.format(
+                total=format_bytes(estimate.total_bytes),
+                weights=format_bytes(estimate.weights_bytes),
+                mmproj=mmproj_part,
+                kv=format_bytes(estimate.kv_cache_bytes),
+                overhead=format_bytes(estimate.overhead_bytes),
+                gpu=budgets[0],
+                ram=budgets[1],
+            )
+            + f" — {sentence}"
+        )
+        downloaded = self.bridge.is_downloaded(family, quant)
+        if downloading:
+            self.download_button.setText(BTN_CANCEL_DOWNLOAD)
+            self.download_button.setEnabled(True)
+        else:
+            self.download_button.setText(
+                BTN_DOWNLOAD_AGAIN if downloaded else BTN_DOWNLOAD
+            )
+            self.download_button.setEnabled(True)
+        self.page_button.setEnabled(True)
+        self.server_button.setEnabled(True)
+        self.apply_button.setEnabled(downloaded)
+
+    # -- downloads ---------------------------------------------------------------------
+    def _on_download_clicked(self) -> None:
+        if self.bridge.is_downloading():
+            self.bridge.cancel_download()
+            return
+        selection = self.current_selection()
+        if selection is None:
+            self._toast(TOAST_SELECT_QUANT, TOAST_WARN)
+            return
+        family, quant = selection
+        self.persist()
+        if not self.bridge.start_download(family.family_id, quant.label):
+            self._toast(TOAST_DOWNLOAD_BUSY, TOAST_WARN)
+            return
+        self.progress.setVisible(True)
+        self.progress.setRange(0, PROGRESS_BAR_MAX)
+        self.progress.setValue(0)
+        self._refresh_selection_ui()
+
+    def _on_download_progress(
+        self, _family_id: str, _quant_label: str, done: object, total: object
+    ) -> None:
+        if not isinstance(done, int):
+            return
+        if isinstance(total, int) and total > 0:
+            self.progress.setRange(0, PROGRESS_BAR_MAX)
+            self.progress.setValue(
+                min(PROGRESS_BAR_MAX, round(done / total * PROGRESS_BAR_MAX))
+            )
+            self.progress.setFormat(
+                DOWNLOAD_FORMAT.format(
+                    done=format_bytes(done), total=format_bytes(total)
+                )
+            )
+        else:
+            self.progress.setRange(0, 0)
+
+    def _on_download_finished(
+        self, family_id: str, quant_label: str, status: str, message: str
+    ) -> None:
+        self.progress.setVisible(False)
+        if status == DOWNLOAD_OK:
+            try:
+                family = find_family(family_id)
+                name = family.name
+            except NLaptError:
+                name = family_id
+            self._toast(
+                TOAST_DOWNLOAD_OK.format(name=name, quant=quant_label), TOAST_OK
+            )
+        elif status == DOWNLOAD_CANCELLED:
+            self._toast(TOAST_DOWNLOAD_CANCELLED, TOAST_WARN)
+        else:
+            self._toast(TOAST_DOWNLOAD_FAIL.format(message=message), TOAST_ERR)
+        self._refresh_selection_ui()
+
+    def _on_page_clicked(self) -> None:
+        selection = self.current_selection()
+        if selection is None:
+            return
+        QDesktopServices.openUrl(QUrl(repo_page_url(selection[0].repo_id)))
+
+    # -- server ------------------------------------------------------------------------
+    def _on_server_clicked(self) -> None:
+        if self.bridge.server_running():
+            self.server_button.setEnabled(False)
+            self.bridge.stop_server()
+            return
+        selection = self.current_selection()
+        if selection is None:
+            self._toast(TOAST_SELECT_QUANT, TOAST_WARN)
+            return
+        family, quant = selection
+        self.persist()
+        if not self.bridge.settings.server_path.strip():
+            self._toast(TOAST_NEED_SERVER_PATH, TOAST_WARN)
+            return
+        if not self.bridge.is_downloaded(family, quant):
+            self._toast(TOAST_NEED_DOWNLOAD, TOAST_WARN)
+            return
+        self.bridge.start_server(family.family_id, quant.label)
+
+    def _on_server_changed(self, state: str, detail: str) -> None:
+        if state == SERVER_STARTING:
+            self.server_button.setEnabled(False)
+            self.server_status.setText(SERVER_STATUS_STARTING)
+            return
+        self.server_button.setEnabled(True)
+        if state == SERVER_RUNNING:
+            self.server_button.setText(BTN_SERVER_STOP)
+            self.server_status.setText(SERVER_STATUS_RUNNING.format(url=detail))
+            self._toast(TOAST_SERVER_RUNNING.format(url=detail), TOAST_OK)
+        elif state == SERVER_ERROR:
+            self.server_button.setText(BTN_SERVER_START)
+            self.server_status.setText(SERVER_STATUS_STOPPED)
+            self._toast(TOAST_SERVER_FAIL.format(message=detail), TOAST_ERR)
+        else:  # stopped
+            self.server_button.setText(BTN_SERVER_START)
+            self.server_status.setText(SERVER_STATUS_STOPPED)
+            self._toast(TOAST_SERVER_STOPPED, TOAST_OK)
+
+    # -- apply as active profile -------------------------------------------------------
+    def _on_apply_clicked(self) -> None:
+        selection = self.current_selection()
+        if selection is None:
+            self._toast(TOAST_SELECT_QUANT, TOAST_WARN)
+            return
+        family, _quant = selection
+        self.persist()
+        self._apply_profile(family)
+
+    def _apply_profile(self, family: ModelFamily) -> None:
+        """Register/refresh the ``local`` profile and make it active."""
+        try:
+            existing = load_config(config_path())
+        except (ValidationError, StorageError):
+            _LOGGER.exception("could not read config before applying local profile")
+            self._toast(TOAST_CONFIG_UNREADABLE, TOAST_ERR)
+            return
+        settings = self.bridge.settings
+        profile = LLMProfile(
+            name=LOCAL_PROFILE_NAME,
+            api_type=LOCAL_API_TYPE,
+            base_url=local_base_url(settings.port),
+            api_key="",
+            text_model=family.family_id,
+            vision_model=family.family_id if family.vision else "",
+        )
+        others = tuple(p for p in existing.profiles if p.name != LOCAL_PROFILE_NAME)
+        config = _dc_replace(
+            existing,
+            profiles=(profile, *others),
+            active_profile=LOCAL_PROFILE_NAME,
+            request=_dc_replace(existing.request, concurrency=settings.parallel),
+        )
+        try:
+            save_config(config_path(), config)
+        except NLaptError as exc:
+            _LOGGER.exception("could not save config while applying local profile")
+            self._toast(TOAST_SETTINGS_FAILED.format(message=exc.message), TOAST_ERR)
+            return
+        self._controller.reload_config(config)
+        self._toast(
+            TOAST_APPLIED.format(name=family.name, parallel=settings.parallel),
+            TOAST_OK,
+        )
+
+    # -- browse ------------------------------------------------------------------------
+    def _browse_models_dir(self) -> None:
+        chosen = QFileDialog.getExistingDirectory(
+            self, LABEL_MODELS_DIR, self.models_dir_edit.text().strip()
+        )
+        if chosen:
+            self.models_dir_edit.setText(chosen)
+
+    def _browse_server_path(self) -> None:
+        chosen, _selected_filter = QFileDialog.getOpenFileName(
+            self, LABEL_SERVER_PATH, "", FILTER_EXECUTABLE
+        )
+        if chosen:
+            self.server_path_edit.setText(chosen)
+
+    # -- misc --------------------------------------------------------------------------
+    def _toast(self, text: str, kind: str) -> None:
+        self._controller.toast_requested.emit(text, kind)

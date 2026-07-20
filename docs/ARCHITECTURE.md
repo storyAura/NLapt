@@ -899,13 +899,17 @@ error types in `nlapt.core.errors`: `LocalInferenceError(NLaptError)`,
   (`OVERHEAD_BASE_BYTES` + 5% weights); `assess` compares against
   `VRAM_USABLE_SHARE`·free-VRAM and `RAM_USABLE_SHARE`·total-RAM →
   `RunVerdict` `GPU_FULL / GPU_PARTIAL / CPU_ONLY / NOT_RUNNABLE / UNKNOWN`
-  (+ shortfall bytes for the UI).
-- `settings.py` — frozen `LocalSettings` (models_dir, server_path, port,
+  (+ shortfall bytes for the UI) and a five-level `RunGrade`
+  (`PERFECT/SMOOTH/OK/BARELY/NO/UNKNOWN` — `HEADROOM_FACTOR` 1.3 splits
+  the comfortable vs tight cases) rendered as plain Chinese in the GUI.
+- `settings.py` — frozen `LocalSettings` (models_dir = primary/download
+  dir, `extra_dirs` = additional reuse search dirs, server_path, port,
   context_length, gpu_layers `-1`=auto, threads `0`=auto, **parallel**, last
   family/quant selection); `load_local_settings` clamps every numeric field
-  into its range and falls back to defaults on corrupt files;
-  `save_local_settings` is atomic. The GUI persists
-  `app_data_dir()/local_llm.json`.
+  into its range, sanitizes `extra_dirs`, and falls back to defaults on
+  corrupt files; `save_local_settings` is atomic. The GUI persists
+  `app_data_dir()/local_llm.json`; the default primary dir lives INSIDE
+  the app (`models/`, git-ignored).
 - `download.py` — stdlib resumable downloader: streams to `<dest>.part`,
   resumes via `Range` (server ignoring the range → clean restart; HTTP 416 →
   drop part and restart), cancel via `threading.Event` →

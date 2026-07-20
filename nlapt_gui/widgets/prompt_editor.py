@@ -42,6 +42,10 @@ from nlapt_gui.prompt_store import (
 _LOGGER = get_logger(__name__)
 
 # -- exact UI strings --------------------------------------------------------------
+NOTE_SHARED = (
+    "提示词全局共用:无论使用在线 API 还是本地模型,"
+    "图片推理(重译)都会使用这里的系统 / 用户提示词。"
+)
 LABEL_TEMPLATE = "推理提示词模板"
 LABEL_SYSTEM = "系统提示词(推理图片前发送,默认留空)"
 LABEL_USER = "用户提示词(留空使用内置指令)"
@@ -86,6 +90,11 @@ class PromptsTab(QWidget):
 
         column = QVBoxLayout(self)
         column.setSpacing(8)
+
+        # One shared prompt set for every LLM (在线 + 本地) — spec issue 3.
+        self.shared_note = self._muted_label(NOTE_SHARED)
+        self.shared_note.setWordWrap(True)
+        column.addWidget(self.shared_note)
 
         column.addWidget(self._muted_label(LABEL_TEMPLATE))
         top = QHBoxLayout()

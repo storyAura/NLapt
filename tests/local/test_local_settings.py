@@ -48,6 +48,7 @@ class TestRoundtrip:
         target = settings_file(tmp_path)
         original = LocalSettings(
             models_dir=str(tmp_path / "models"),
+            extra_dirs=(str(tmp_path / "shared-a"), str(tmp_path / "shared-b")),
             server_path=str(tmp_path / "llama-server.exe"),
             port=8080,
             context_length=8192,
@@ -59,6 +60,18 @@ class TestRoundtrip:
         )
         save_local_settings(target, original)
         assert load_local_settings(target) == original
+
+    def test_extra_dirs_sanitized_on_load(self, tmp_path: Path) -> None:
+        target = settings_file(tmp_path)
+        target.write_text(
+            '{"extra_dirs": ["D:/ok", "", "   ", 5, null]}', encoding="utf-8"
+        )
+        assert load_local_settings(target).extra_dirs == ("D:/ok",)
+
+    def test_extra_dirs_non_list_ignored(self, tmp_path: Path) -> None:
+        target = settings_file(tmp_path)
+        target.write_text('{"extra_dirs": "not-a-list"}', encoding="utf-8")
+        assert load_local_settings(target).extra_dirs == ()
 
     def test_save_rejects_wrong_type(self, tmp_path: Path) -> None:
         with pytest.raises(StorageError):

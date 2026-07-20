@@ -90,6 +90,17 @@ SPLITTER_SIZES_FILE = "body_splitter.json"
 FADE_IN_MS = 240
 FADE_OUT_MS = 140
 
+# Maximize/restore transition: a quick windowOpacity dip masks the abrupt
+# native geometry jump (frameless windows get no OS zoom animation).
+STATE_FADE_OUT_MS = 90
+STATE_FADE_IN_MS = 130
+STATE_FADE_LOW = 0.55
+# Restored window size as a share of the available screen when the saved
+# normal geometry would still cover the whole screen (small displays).
+RESTORE_SCREEN_SHARE = 0.86
+# States treated as "zoomed" by the toggle (维持全屏也能退出).
+_ZOOMED_STATES = Qt.WindowState.WindowMaximized | Qt.WindowState.WindowFullScreen
+
 # Text-input widget types whose own undo wins over the global Ctrl+Z.
 _TEXT_INPUT_TYPES = (QLineEdit, QPlainTextEdit, QTextEdit)
 
@@ -227,6 +238,7 @@ class MainWindow(QWidget):
         # Fade-in / fade-out state (skip-safe for tests).
         self._did_fade_in = False
         self._fade_anim: QPropertyAnimation | None = None
+        self._state_anim: QPropertyAnimation | None = None
         self._close_fade_done = False
 
         app = QApplication.instance()
@@ -388,6 +400,73 @@ class MainWindow(QWidget):
     def _clear_fade_effect(self) -> None:
         self._fade_anim = None
         self.setWindowOpacity(1.0)
+
+    # -- maximize / restore with a transition ------------------------------------------
+    def toggle_max_restore(self) -> None:
+        """Maximize ⇄ restore with a short fade transition.
+
+        Checks the raw window state so a window stuck in FULLSCREEN is also
+        brought back to normal (``isMaximized()`` alone misses that state and
+        made restore impossible).
+        """
+        if self.windowState() & _ZOOMED_STATES:
+            self._animate_state_switch(self._restore_small)
+        else:
+            self._animate_state_switch(self.showMaximized)
+
+    def _restore_small(self) -> None:
+        self.showNormal()
+        self._ensure_normal_fits_screen()
+
+    def _ensure_normal_fits_screen(self) -> None:
+        """Guarantee the restored window is visibly smaller than the screen.
+
+        On small logical resolutions the fixed minimum size can equal the
+        available screen, making 还原 look like a no-op; lower the minimum
+        and center a RESTORE_SCREEN_SHARE-sized window instead.
+        """
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return
+        avail = screen.availableGeometry()
+        frame = self.frameGeometry()
+        if frame.width() < avail.width() - 4 or frame.height() < avail.height() - 4:
+            return  # already visibly smaller
+        width = int(avail.width() * RESTORE_SCREEN_SHARE)
+        height = int(avail.height() * RESTORE_SCREEN_SHARE)
+        self.setMinimumSize(
+            min(MIN_WINDOW[0], width), min(MIN_WINDOW[1], height)
+        )
+        self.resize(width, height)
+        self.move(
+            avail.x() + (avail.width() - width) // 2,
+            avail.y() + (avail.height() - height) // 2,
+        )
+
+    def _animate_state_switch(self, apply_state) -> None:
+        """Dip windowOpacity, switch the window state, fade back in."""
+        if not anim.animations_enabled() or not self.isVisible():
+            apply_state()
+            return
+        fade_out = QPropertyAnimation(self, b"windowOpacity", self)
+        fade_out.setDuration(STATE_FADE_OUT_MS)
+        fade_out.setStartValue(self.windowOpacity())
+        fade_out.setEndValue(STATE_FADE_LOW)
+        fade_out.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+        def switch() -> None:
+            apply_state()
+            fade_in = QPropertyAnimation(self, b"windowOpacity", self)
+            fade_in.setDuration(STATE_FADE_IN_MS)
+            fade_in.setStartValue(STATE_FADE_LOW)
+            fade_in.setEndValue(1.0)
+            fade_in.setEasingCurve(QEasingCurve.Type.OutCubic)
+            self._state_anim = fade_in
+            fade_in.start()
+
+        fade_out.finished.connect(switch)
+        self._state_anim = fade_out
+        fade_out.start()
 
     # -- frameless edge resize (cross-platform, click-safe) ----------------------------
     # Deliberately NOT implemented via WM_NCHITTEST: a native hit-test that returns

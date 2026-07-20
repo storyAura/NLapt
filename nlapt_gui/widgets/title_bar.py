@@ -26,6 +26,7 @@ from PySide6.QtGui import (
     QPen,
 )
 from PySide6.QtWidgets import (
+    QApplication,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -69,6 +70,7 @@ MENU_FILE = "文件"
 MENU_EDIT = "编辑"
 MENU_VIEW = "视图"
 MENU_TOOLS = "工具"
+MENU_SETTINGS = "设置"
 MENU_HELP = "帮助"
 ACTION_OPEN_FOLDER = "打开文件夹…"
 ACTION_REFRESH = "刷新"
@@ -81,6 +83,9 @@ SUBMENU_VIEW_MODE = "视图模式"
 SUBMENU_THEME = "主题"
 ACTION_COLORS = "色彩设置…"
 ACTION_SETTINGS = "设置…"
+# 工具 menu is kept as a home for future tools (设置 moved to its own
+# top-level entry); the placeholder is disabled until real tools land.
+ACTION_TOOLS_PLACEHOLDER = "更多工具(规划中)"
 # 快捷键 was removed from 帮助 (spec module 3.5): the status bar at the bottom
 # of the window already lists the live shortcut hints.
 ACTION_GUIDE = "使用说明"
@@ -392,6 +397,7 @@ class TitleBar(QFrame):
         self._controller = controller
         self._manager = theme_manager
         self._popup: ThemePopup | None = None
+        self._press_pos: QPoint | None = None
         self.setFixedHeight(TITLE_BAR_HEIGHT)
         self._build()
         self._build_menus()
@@ -535,10 +541,15 @@ class TitleBar(QFrame):
         self.action_colors.triggered.connect(self.colors_requested.emit)
         view_menu.addAction(self.action_colors)
 
-        tools_menu = QMenu(MENU_TOOLS, self)
+        # 设置 stands alone as a top-level entry (see settings_button below);
+        # the action object stays for programmatic/open-settings callers.
         self.action_settings = QAction(ACTION_SETTINGS, self)
         self.action_settings.triggered.connect(self.settings_requested.emit)
-        tools_menu.addAction(self.action_settings)
+
+        tools_menu = QMenu(MENU_TOOLS, self)
+        self.action_tools_placeholder = QAction(ACTION_TOOLS_PLACEHOLDER, self)
+        self.action_tools_placeholder.setEnabled(False)
+        tools_menu.addAction(self.action_tools_placeholder)
 
         help_menu = QMenu(MENU_HELP, self)
         # 快捷键 deliberately absent (module 3.5) — the status bar shows them live.
@@ -555,10 +566,17 @@ class TitleBar(QFrame):
             (MENU_EDIT, edit_menu),
             (MENU_VIEW, view_menu),
             (MENU_TOOLS, tools_menu),
-            (MENU_HELP, help_menu),
         ):
             self.menus[label] = menu
             self.menu_buttons[label] = self._menu_button(label, menu)
+        # Top-level 设置: a direct button (no dropdown) that opens the dialog.
+        self.settings_button = QPushButton(MENU_SETTINGS, self)
+        self.settings_button.setProperty("titleMenu", True)
+        self.settings_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.settings_button.clicked.connect(self.settings_requested.emit)
+        self._menu_row.addWidget(self.settings_button)
+        self.menus[MENU_HELP] = help_menu
+        self.menu_buttons[MENU_HELP] = self._menu_button(MENU_HELP, help_menu)
 
     # -- theme ----------------------------------------------------------------------
     def apply_tokens(self, tokens: ThemeTokens) -> None:
@@ -642,8 +660,18 @@ class TitleBar(QFrame):
         self.window().showMinimized()
 
     def toggle_max_restore(self) -> None:
+        """Delegate to the main window's animated toggle (fullscreen-safe)."""
         window = self.window()
-        if window.isMaximized():
+        toggle = getattr(window, "toggle_max_restore", None)
+        if window is not self and callable(toggle):
+            toggle()
+            return
+        # Fallback (bar hosted standalone, e.g. in tests): raw state check
+        # that also recovers from a stuck FULLSCREEN state.
+        zoomed = window.windowState() & (
+            Qt.WindowState.WindowMaximized | Qt.WindowState.WindowFullScreen
+        )
+        if zoomed:
             window.showNormal()
         else:
             window.showMaximized()
@@ -660,18 +688,43 @@ class TitleBar(QFrame):
         return self.childAt(event.position().toPoint()) is None
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt override
-        # Only start a window move from empty bar space; presses on the menus,
-        # theme button or window controls must reach those widgets.
+        # Record the press; the system move starts only after a real drag.
+        # Starting it on the bare press entered the OS modal move loop and
+        # swallowed the double-click's second press, making 双击还原 flaky.
         if event.button() == Qt.MouseButton.LeftButton and self._on_empty_bar(event):
-            handle = self.window().windowHandle()
+            self._press_pos = event.globalPosition().toPoint()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt override
+        if (
+            self._press_pos is not None
+            and event.buttons() & Qt.MouseButton.LeftButton
+            and (event.globalPosition().toPoint() - self._press_pos).manhattanLength()
+            >= QApplication.startDragDistance()
+        ):
+            self._press_pos = None
+            window = self.window()
+            if window.windowState() & (
+                Qt.WindowState.WindowMaximized | Qt.WindowState.WindowFullScreen
+            ):
+                # Dragging a zoomed window un-zooms it first (Windows behavior).
+                window.showNormal()
+            handle = window.windowHandle()
             if handle is not None:
                 handle.startSystemMove()
-                event.accept()
-                return
-        super().mousePressEvent(event)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt override
+        self._press_pos = None
+        super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt override
         if event.button() == Qt.MouseButton.LeftButton and self._on_empty_bar(event):
+            self._press_pos = None
             self.toggle_max_restore()
             event.accept()
             return

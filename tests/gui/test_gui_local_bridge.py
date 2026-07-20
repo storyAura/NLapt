@@ -83,8 +83,11 @@ def family(monkeypatch: pytest.MonkeyPatch) -> ModelFamily:
 
 
 @pytest.fixture()
-def bridge(qtbot) -> LocalBridge:
-    return LocalBridge(manager=FakeManager())
+def bridge(qtbot, tmp_path: Path) -> LocalBridge:
+    """Bridge with the primary models dir pinned inside tmp_path."""
+    instance = LocalBridge(manager=FakeManager())
+    instance.update_settings(models_dir=str(tmp_path / "models"))
+    return instance
 
 
 def write_downloaded(bridge: LocalBridge, fam: ModelFamily) -> None:
@@ -105,12 +108,25 @@ class TestSettings:
         assert stored.parallel == 8
         assert stored.server_path == "srv.exe"
 
-    def test_models_dir_default_under_app_data(self, bridge: LocalBridge) -> None:
-        assert bridge.models_dir() == app_data_dir() / "models"
+    def test_models_dir_defaults_inside_the_app(self, qtbot) -> None:
+        from nlapt_gui.local_bridge import default_models_dir
+
+        fresh = LocalBridge(manager=FakeManager())
+        assert fresh.models_dir() == default_models_dir()
+        assert fresh.models_dir().name == "models"
 
     def test_models_dir_override(self, bridge: LocalBridge, tmp_path: Path) -> None:
         bridge.update_settings(models_dir=str(tmp_path / "elsewhere"))
         assert bridge.models_dir() == tmp_path / "elsewhere"
+
+    def test_models_dirs_include_extras_deduplicated(
+        self, bridge: LocalBridge, tmp_path: Path
+    ) -> None:
+        primary = bridge.models_dir()
+        bridge.update_settings(
+            extra_dirs=(str(tmp_path / "shared"), str(primary), "  ")
+        )
+        assert bridge.models_dirs() == (primary, tmp_path / "shared")
 
 
 class TestDownloadState:
@@ -144,6 +160,47 @@ class TestDownloadState:
         model.parent.mkdir(parents=True, exist_ok=True)
         model.write_bytes(b"x" * quant.size_bytes)
         assert bridge.is_downloaded(fam, quant)
+
+
+class TestReuseDirs:
+    def write_into(self, base: Path, fam: ModelFamily) -> tuple[Path, Path]:
+        from nlapt.local.catalog import mmproj_path, quant_path
+
+        model = quant_path(base, fam, fam.quants[0])
+        model.parent.mkdir(parents=True, exist_ok=True)
+        model.write_bytes(b"x" * fam.quants[0].size_bytes)
+        mmproj = mmproj_path(base, fam)
+        assert mmproj is not None
+        mmproj.write_bytes(b"y" * fam.mmproj_bytes)
+        return model, mmproj
+
+    def test_model_found_in_extra_dir(
+        self, bridge: LocalBridge, family: ModelFamily, tmp_path: Path
+    ) -> None:
+        shared = tmp_path / "shared"
+        bridge.update_settings(extra_dirs=(str(shared),))
+        model, mmproj = self.write_into(shared, family)
+        assert bridge.is_downloaded(family, family.quants[0])
+        assert bridge.find_model_file(family, family.quants[0]) == model
+        spec = bridge.build_server_spec(family, family.quants[0])
+        assert spec.model_path == str(model)
+        assert spec.mmproj_path == str(mmproj)
+
+    def test_download_skipped_when_files_reused(
+        self, qtbot, bridge: LocalBridge, family: ModelFamily, tmp_path: Path, monkeypatch
+    ) -> None:
+        shared = tmp_path / "shared"
+        bridge.update_settings(extra_dirs=(str(shared),))
+        self.write_into(shared, family)
+
+        def must_not_download(*args, **kwargs):  # noqa: ANN002, ANN003
+            raise AssertionError("download_file must not be called for reused files")
+
+        monkeypatch.setattr("nlapt_gui.local_bridge.download_file", must_not_download)
+        with qtbot.waitSignal(bridge.download_finished, timeout=2000) as blocker:
+            assert bridge.start_download(FAMILY_ID, QUANT_LABEL)
+        assert blocker.args[2] == DOWNLOAD_OK
+        assert not bridge.is_downloading()
 
 
 class TestStartDownload:

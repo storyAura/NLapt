@@ -77,6 +77,18 @@ class TestSignals:
         with qtbot.waitSignal(title_bar.settings_requested, timeout=1000):
             title_bar.action_settings.trigger()
 
+    def test_settings_button_is_top_level(self, qtbot, title_bar: TitleBar) -> None:
+        # 设置 stands alone in the menu row and opens the dialog directly.
+        with qtbot.waitSignal(title_bar.settings_requested, timeout=1000):
+            title_bar.settings_button.click()
+
+    def test_tools_menu_keeps_a_disabled_placeholder(self, title_bar: TitleBar) -> None:
+        from nlapt_gui.widgets.title_bar import ACTION_TOOLS_PLACEHOLDER
+
+        actions = title_bar.menus[MENU_TOOLS].actions()
+        assert [a.text() for a in actions] == [ACTION_TOOLS_PLACEHOLDER]
+        assert not actions[0].isEnabled()
+
 
 class TestThemePopup:
     def test_popup_rows_match_themes(self, qtbot, title_bar: TitleBar) -> None:
@@ -104,6 +116,18 @@ class TestWindowControls:
         assert title_bar.min_button is not None
         assert title_bar.max_button is not None
         assert title_bar.close_button is not None
+
+    def test_toggle_recovers_from_fullscreen_state(
+        self, qtbot, title_bar: TitleBar
+    ) -> None:
+        # The old isMaximized()-only check could never leave FULLSCREEN.
+        window = title_bar.window()
+        window.showFullScreen()
+        title_bar.toggle_max_restore()
+        assert not (
+            window.windowState()
+            & (Qt.WindowState.WindowMaximized | Qt.WindowState.WindowFullScreen)
+        )
 
     def test_apply_tokens_does_not_raise(self, title_bar, manager) -> None:
         # Re-theming restyles every token-dependent part without error.

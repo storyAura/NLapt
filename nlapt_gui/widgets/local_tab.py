@@ -1,11 +1,15 @@
-"""设置 ▸ 本地推理 tab: catalog tree, runnability badges, downloads, server.
+"""设置 ▸ 本地推理 tab: catalog tree, run grades, downloads, server.
 
-Layout, top to bottom: a hardware summary line (lazy-detected on first
-show), the model tree (大系列 → 小系列 → 量化档 with a per-quant
-compatibility verdict), a detail line for the selected quant, the action
-row (下载 / 打开模型页 / 启动服务 / 设为当前模型 + progress bar) and the
-runtime settings form (目录 / llama-server / 上下文 / GPU 层 / 线程 /
-并发 / 端口).
+Landscape composition (用户要求 横构图): the catalog tree fills the left
+side; the right side stacks the selection detail, the action buttons, the
+runtime settings (下载目录 / 复用目录 / llama-server / 上下文 / GPU 层 /
+线程 / 并发 / 端口) and the hint. Per-quant「能否运行」is a plain
+five-level Chinese grade from :class:`nlapt.local.advisor.RunGrade`
+(轻松运行 / 流畅运行 / 可以运行 / 勉强能跑 / 跑不动).
+
+Model files download into the primary 下载目录 (default: inside the app,
+``models/``) and are FOUND in the primary + any 复用目录, so models already
+downloaded by other tools are reused instead of re-downloaded.
 
 All slow work goes through :class:`nlapt_gui.local_bridge.LocalBridge`.
 Like the settings dialog that hosts it, this tab is part of the sanctioned
@@ -26,6 +30,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QListWidget,
     QProgressBar,
     QPushButton,
     QSpinBox,
@@ -38,7 +43,7 @@ from PySide6.QtWidgets import (
 from nlapt.core.config import LLMProfile, load_config, save_config
 from nlapt.core.errors import NLaptError, StorageError, ValidationError
 from nlapt.diagnostics import get_logger
-from nlapt.local.advisor import RunAssessment, RunVerdict, assess, estimate_memory
+from nlapt.local.advisor import RunAssessment, RunGrade, assess, estimate_memory
 from nlapt.local.catalog import (
     CATALOG_SNAPSHOT_DATE,
     ModelFamily,
@@ -67,6 +72,7 @@ from nlapt_gui.local_bridge import (
     SERVER_RUNNING,
     SERVER_STARTING,
     LocalBridge,
+    default_models_dir,
 )
 from nlapt_gui.resources import config_path
 
@@ -78,48 +84,60 @@ LOCAL_API_TYPE = "openai"
 ROLE_FAMILY = Qt.ItemDataRole.UserRole
 ROLE_QUANT = Qt.ItemDataRole.UserRole + 1
 
-TREE_MIN_HEIGHT = 220
+# Landscape sizing: tree left, controls right.
+LOCAL_TAB_MIN_W = 840
+LOCAL_TAB_MIN_H = 520
+TREE_MIN_W = 430
+RIGHT_PANE_MIN_W = 330
+EXTRA_DIRS_LIST_H = 64
 CONTEXT_STEP = 512
 PROGRESS_BAR_MAX = 1000
 
 # UI strings.
-HW_PREFIX = "本机硬件:"
 HW_DETECTING = "正在检测本机硬件…"
-HW_UNKNOWN = "硬件检测失败 — 兼容性列将显示「?」"
+HW_UNKNOWN = "硬件检测失败 — 「能否运行」列将显示「未检测」"
 HW_NO_GPU = "未检测到 NVIDIA 独显(将以 CPU 推理)"
+HW_LINE = (
+    "本机硬件:CPU <b>{cores}</b> 核 · 内存 <b>{ram}</b>(可用 {avail})· {gpu}"
+)
+HW_GPU = "{name} · 显存 <b>{vram}</b>(空闲 {free})"
 BTN_DETECT = "重新检测"
 COL_MODEL = "模型"
 COL_SIZE = "体积"
 COL_DOWNLOADS = "热度"
-COL_VERDICT = "兼容性"
+COL_GRADE = "能否运行"
 TAG_VISION = "视觉"
 TAG_RECOMMENDED = "★ 推荐"
 CATALOG_HINT = (
     f"目录快照 {CATALOG_SNAPSHOT_DATE} · 热度为 HuggingFace 月下载量 · "
-    "兼容性依据本机硬件与下方上下文长度估算"
+    "「能否运行」依据本机硬件与右侧上下文长度估算"
 )
-DETAIL_EMPTY = "在上方选择一个量化档查看预计占用与操作"
+DETAIL_EMPTY = "在左侧展开一个系列,选择具体量化档查看评估与操作"
 DETAIL_LINE = (
-    "预计占用 {total}(权重 {weights}{mmproj} + 上下文 {kv} + 开销 {overhead})"
-    " · 显存预算 {gpu} · 内存预算 {ram}"
+    "<b>{grade}</b> — {sentence}<br>"
+    "预计占用 <b>{total}</b>(权重 {weights}{mmproj} + 上下文 {kv} + 开销 {overhead})<br>"
+    "显存预算 {gpu} · 内存预算 {ram}"
 )
 DETAIL_MMPROJ = " + 视觉 {size}"
-VERDICT_TEXT: dict[RunVerdict, str] = {
-    RunVerdict.GPU_FULL: "✓ 显存流畅",
-    RunVerdict.GPU_PARTIAL: "◐ 显存+内存",
-    RunVerdict.CPU_ONLY: "▢ 仅内存(慢)",
-    RunVerdict.NOT_RUNNABLE: "✗ 配置不足",
-    RunVerdict.UNKNOWN: "?",
+# 五级中文评级 (用户要求: 直接说能不能跑得动).
+GRADE_TEXT: dict[RunGrade, str] = {
+    RunGrade.PERFECT: "轻松运行",
+    RunGrade.SMOOTH: "流畅运行",
+    RunGrade.OK: "可以运行",
+    RunGrade.BARELY: "勉强能跑",
+    RunGrade.NO: "跑不动",
+    RunGrade.UNKNOWN: "未检测",
 }
-VERDICT_SENTENCE: dict[RunVerdict, str] = {
-    RunVerdict.GPU_FULL: "可完全载入显存,预计流畅运行",
-    RunVerdict.GPU_PARTIAL: "显存不够整模型,部分层将落到内存,速度中等",
-    RunVerdict.CPU_ONLY: "无可用独显,将以内存 + CPU 运行,速度较慢",
-    RunVerdict.NOT_RUNNABLE: "超出本机显存 + 内存预算,不建议运行(还差 {shortfall})",
-    RunVerdict.UNKNOWN: "硬件信息未知,无法预测",
+GRADE_SENTENCE: dict[RunGrade, str] = {
+    RunGrade.PERFECT: "显存余量充足,可完全载入显存,速度很快",
+    RunGrade.SMOOTH: "可完全载入显存,预计流畅运行",
+    RunGrade.OK: "需要内存参与(显存不足或无独显),中等速度,可正常使用",
+    RunGrade.BARELY: "余量很小,勉强能跑,速度较慢且可能不稳定",
+    RunGrade.NO: "超出本机显存 + 内存承受范围,跑不动(还差 {shortfall})",
+    RunGrade.UNKNOWN: "硬件信息未知,无法判断",
 }
 BTN_DOWNLOAD = "下载模型"
-BTN_DOWNLOAD_AGAIN = "已下载 ✓(重新校验)"
+BTN_DOWNLOAD_AGAIN = "已就绪 ✓(重新校验)"
 BTN_CANCEL_DOWNLOAD = "取消下载"
 BTN_PAGE = "打开模型页"
 BTN_SERVER_START = "启动本地服务"
@@ -128,7 +146,7 @@ BTN_APPLY = "设为当前模型"
 SERVER_STATUS_STOPPED = "服务未启动"
 SERVER_STATUS_STARTING = "正在启动服务(首次加载较慢)…"
 SERVER_STATUS_RUNNING = "服务运行中:{url}"
-LABEL_MODELS_DIR = "模型目录"
+LABEL_MODELS_DIR = "下载目录"
 LABEL_SERVER_PATH = "llama-server"
 BTN_BROWSE = "浏览…"
 LABEL_CONTEXT = "上下文长度"
@@ -138,14 +156,18 @@ LABEL_PARALLEL = "并发请求数"
 LABEL_PORT = "端口"
 SPECIAL_GPU_AUTO = "自动(全部)"
 SPECIAL_THREADS_AUTO = "自动"
+LABEL_EXTRA_DIRS = "复用目录(也在这些目录中查找已下载的模型)"
+BTN_ADD_DIR = "添加"
+BTN_REMOVE_DIR = "移除"
+CAPTION_PICK_EXTRA_DIR = "选择复用模型目录"
 SERVER_HINT = (
     "本地服务基于 llama.cpp 的 llama-server:请从其 GitHub Releases 下载对应"
     "平台的压缩包,解压后在上方选择 llama-server 可执行文件。"
-    "启动后「设为当前模型」会把翻译 / 重译切到本地模型。"
+    "「设为当前模型」会把翻译 / 重译切到本地模型。"
 )
 TOAST_SELECT_QUANT = "请先在列表中选择一个量化档"
 TOAST_DOWNLOAD_BUSY = "已有下载任务正在进行"
-TOAST_DOWNLOAD_OK = "已下载 {name} · {quant}"
+TOAST_DOWNLOAD_OK = "已就绪 {name} · {quant}"
 TOAST_DOWNLOAD_CANCELLED = "已取消下载(已下载部分保留,可续传)"
 TOAST_DOWNLOAD_FAIL = "下载失败: {message}"
 TOAST_NEED_SERVER_PATH = "请先选择 llama-server 可执行文件"
@@ -169,7 +191,7 @@ def _format_downloads(count: int) -> str:
 
 
 class LocalTab(QWidget):
-    """The real 本地推理 tab (replaces the v1.5 placeholder)."""
+    """The 本地推理 tab (landscape layout, five-level run grades)."""
 
     def __init__(
         self,
@@ -195,8 +217,9 @@ class LocalTab(QWidget):
 
     # -- construction ------------------------------------------------------------------
     def _build_ui(self) -> None:
+        self.setMinimumSize(LOCAL_TAB_MIN_W, LOCAL_TAB_MIN_H)
         self.hw_label = QLabel(HW_DETECTING, self)
-        self.hw_label.setProperty("muted", True)
+        self.hw_label.setTextFormat(Qt.TextFormat.RichText)
         self.hw_label.setWordWrap(True)
         self.detect_button = QPushButton(BTN_DETECT, self)
         self.detect_button.setProperty("variant", "outline")
@@ -204,10 +227,11 @@ class LocalTab(QWidget):
         hw_row.addWidget(self.hw_label, 1)
         hw_row.addWidget(self.detect_button, 0, Qt.AlignmentFlag.AlignTop)
 
+        # -- left: catalog tree -------------------------------------------------------
         self.tree = QTreeWidget(self)
         self.tree.setColumnCount(4)
-        self.tree.setHeaderLabels([COL_MODEL, COL_SIZE, COL_DOWNLOADS, COL_VERDICT])
-        self.tree.setMinimumHeight(TREE_MIN_HEIGHT)
+        self.tree.setHeaderLabels([COL_MODEL, COL_SIZE, COL_DOWNLOADS, COL_GRADE])
+        self.tree.setMinimumWidth(TREE_MIN_W)
         self.tree.setRootIsDecorated(True)
         header = self.tree.header()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
@@ -218,7 +242,14 @@ class LocalTab(QWidget):
         self.catalog_hint.setProperty("muted", True)
         self.catalog_hint.setWordWrap(True)
 
+        left_pane = QVBoxLayout()
+        left_pane.setSpacing(6)
+        left_pane.addWidget(self.tree, 1)
+        left_pane.addWidget(self.catalog_hint)
+
+        # -- right: detail, actions, runtime settings ---------------------------------
         self.detail_label = QLabel(DETAIL_EMPTY, self)
+        self.detail_label.setTextFormat(Qt.TextFormat.RichText)
         self.detail_label.setProperty("muted", True)
         self.detail_label.setWordWrap(True)
 
@@ -226,19 +257,18 @@ class LocalTab(QWidget):
         self.download_button.setProperty("variant", "accent")
         self.page_button = QPushButton(BTN_PAGE, self)
         self.page_button.setProperty("variant", "ghost")
+        action_row_top = QHBoxLayout()
+        action_row_top.addWidget(self.download_button)
+        action_row_top.addWidget(self.page_button)
+        action_row_top.addStretch(1)
         self.server_button = QPushButton(BTN_SERVER_START, self)
         self.server_button.setProperty("variant", "outline")
         self.apply_button = QPushButton(BTN_APPLY, self)
         self.apply_button.setProperty("variant", "outline")
-        action_row = QHBoxLayout()
-        for button in (
-            self.download_button,
-            self.page_button,
-            self.server_button,
-            self.apply_button,
-        ):
-            action_row.addWidget(button)
-        action_row.addStretch(1)
+        action_row_bottom = QHBoxLayout()
+        action_row_bottom.addWidget(self.server_button)
+        action_row_bottom.addWidget(self.apply_button)
+        action_row_bottom.addStretch(1)
 
         self.progress = QProgressBar(self)
         self.progress.setVisible(False)
@@ -274,6 +304,7 @@ class LocalTab(QWidget):
         self.port_spin.setRange(*PORT_RANGE)
 
         form = QFormLayout()
+        form.setVerticalSpacing(6)
         form.addRow(LABEL_MODELS_DIR, models_dir_row)
         form.addRow(LABEL_SERVER_PATH, server_path_row)
         form.addRow(LABEL_CONTEXT, self.context_spin)
@@ -282,20 +313,53 @@ class LocalTab(QWidget):
         form.addRow(LABEL_PARALLEL, self.parallel_spin)
         form.addRow(LABEL_PORT, self.port_spin)
 
+        self.extra_dirs_label = QLabel(LABEL_EXTRA_DIRS, self)
+        self.extra_dirs_label.setProperty("muted", True)
+        self.extra_dirs_label.setWordWrap(True)
+        self.extra_dirs_list = QListWidget(self)
+        self.extra_dirs_list.setFixedHeight(EXTRA_DIRS_LIST_H)
+        self.extra_add_button = QPushButton(BTN_ADD_DIR, self)
+        self.extra_add_button.setProperty("variant", "ghost")
+        self.extra_remove_button = QPushButton(BTN_REMOVE_DIR, self)
+        self.extra_remove_button.setProperty("variant", "ghost")
+        extra_buttons = QVBoxLayout()
+        extra_buttons.setSpacing(4)
+        extra_buttons.addWidget(self.extra_add_button)
+        extra_buttons.addWidget(self.extra_remove_button)
+        extra_buttons.addStretch(1)
+        extra_row = QHBoxLayout()
+        extra_row.addWidget(self.extra_dirs_list, 1)
+        extra_row.addLayout(extra_buttons)
+
         self.server_hint = QLabel(SERVER_HINT, self)
         self.server_hint.setProperty("muted", True)
         self.server_hint.setWordWrap(True)
 
+        right_pane = QVBoxLayout()
+        right_pane.setSpacing(8)
+        right_pane.addWidget(self.detail_label)
+        right_pane.addLayout(action_row_top)
+        right_pane.addLayout(action_row_bottom)
+        right_pane.addWidget(self.progress)
+        right_pane.addWidget(self.server_status)
+        right_pane.addLayout(form)
+        right_pane.addWidget(self.extra_dirs_label)
+        right_pane.addLayout(extra_row)
+        right_pane.addWidget(self.server_hint)
+        right_pane.addStretch(1)
+        right_holder = QWidget(self)
+        right_holder.setMinimumWidth(RIGHT_PANE_MIN_W)
+        right_holder.setLayout(right_pane)
+
+        body = QHBoxLayout()
+        body.setSpacing(12)
+        body.addLayout(left_pane, 3)
+        body.addWidget(right_holder, 2)
+
         column = QVBoxLayout(self)
+        column.setSpacing(8)
         column.addLayout(hw_row)
-        column.addWidget(self.tree, 1)
-        column.addWidget(self.catalog_hint)
-        column.addWidget(self.detail_label)
-        column.addLayout(action_row)
-        column.addWidget(self.progress)
-        column.addWidget(self.server_status)
-        column.addLayout(form)
-        column.addWidget(self.server_hint)
+        column.addLayout(body, 1)
 
     def _populate_tree(self) -> None:
         self.tree.clear()
@@ -303,6 +367,7 @@ class LocalTab(QWidget):
             series_item = QTreeWidgetItem([series.name, "", "", ""])
             series_item.setToolTip(0, series.description)
             series_item.setFlags(series_item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+            self._embolden(series_item, 0)
             self.tree.addTopLevelItem(series_item)
             for family in families_for(series.series_id):
                 name = f"{family.name} · {family.params_label}"
@@ -312,11 +377,14 @@ class LocalTab(QWidget):
                     [name, "", _format_downloads(family.downloads), ""]
                 )
                 tooltip = family.notes or family.name
-                family_item.setToolTip(0, f"{tooltip}\n{family.repo_id} · {family.license}")
+                family_item.setToolTip(
+                    0, f"{tooltip}\n{family.repo_id} · {family.license}"
+                )
                 family_item.setFlags(
                     family_item.flags() & ~Qt.ItemFlag.ItemIsSelectable
                 )
                 family_item.setData(0, ROLE_FAMILY, family.family_id)
+                self._embolden(family_item, 0)
                 series_item.addChild(family_item)
                 for quant in family.quants:
                     label = quant.label
@@ -327,13 +395,21 @@ class LocalTab(QWidget):
                             label,
                             format_bytes(quant.size_bytes),
                             "",
-                            VERDICT_TEXT[RunVerdict.UNKNOWN],
+                            GRADE_TEXT[RunGrade.UNKNOWN],
                         ]
                     )
                     quant_item.setData(0, ROLE_FAMILY, family.family_id)
                     quant_item.setData(0, ROLE_QUANT, quant.label)
+                    self._embolden(quant_item, 3)
                     family_item.addChild(quant_item)
             series_item.setExpanded(True)
+
+    @staticmethod
+    def _embolden(item: QTreeWidgetItem, column: int) -> None:
+        """Bold one cell (重要字眼需要明显 — names and grades stand out)."""
+        font = item.font(column)
+        font.setBold(True)
+        item.setFont(column, font)
 
     def _connect(self) -> None:
         self.detect_button.clicked.connect(self.refresh_hardware)
@@ -345,6 +421,8 @@ class LocalTab(QWidget):
         self.apply_button.clicked.connect(self._on_apply_clicked)
         self.models_dir_browse.clicked.connect(self._browse_models_dir)
         self.server_path_browse.clicked.connect(self._browse_server_path)
+        self.extra_add_button.clicked.connect(self._add_extra_dir)
+        self.extra_remove_button.clicked.connect(self._remove_extra_dir)
         bridge = self.bridge
         bridge.hardware_ready.connect(self._on_hardware_ready)
         bridge.download_progress.connect(self._on_download_progress)
@@ -354,8 +432,9 @@ class LocalTab(QWidget):
     def _prefill_from_settings(self) -> None:
         settings = self.bridge.settings
         self.models_dir_edit.setText(settings.models_dir)
-        self.models_dir_edit.setPlaceholderText(str(self.bridge.models_dir()))
+        self.models_dir_edit.setPlaceholderText(str(default_models_dir()))
         self.server_path_edit.setText(settings.server_path)
+        self.extra_dirs_list.addItems(list(settings.extra_dirs))
         self.context_spin.setValue(settings.context_length)
         self.gpu_layers_spin.setValue(settings.gpu_layers)
         self.threads_spin.setValue(settings.threads)
@@ -403,6 +482,7 @@ class LocalTab(QWidget):
         try:
             self.bridge.update_settings(
                 models_dir=self.models_dir_edit.text().strip(),
+                extra_dirs=self._extra_dirs(),
                 server_path=self.server_path_edit.text().strip(),
                 context_length=self.context_spin.value(),
                 gpu_layers=self.gpu_layers_spin.value(),
@@ -415,6 +495,12 @@ class LocalTab(QWidget):
         except NLaptError as exc:
             _LOGGER.exception("could not persist local settings")
             self._toast(TOAST_SETTINGS_FAILED.format(message=exc.message), TOAST_ERR)
+
+    def _extra_dirs(self) -> tuple[str, ...]:
+        return tuple(
+            self.extra_dirs_list.item(i).text()
+            for i in range(self.extra_dirs_list.count())
+        )
 
     # -- selection ---------------------------------------------------------------------
     def current_selection(self) -> tuple[ModelFamily, QuantFile] | None:
@@ -440,7 +526,7 @@ class LocalTab(QWidget):
                 )
         return tuple(items)
 
-    # -- verdicts ----------------------------------------------------------------------
+    # -- grades ------------------------------------------------------------------------
     def _refresh_verdicts(self) -> None:
         hardware = self._hardware
         context = self.context_spin.value()
@@ -448,17 +534,17 @@ class LocalTab(QWidget):
             family = find_family(str(item.data(0, ROLE_FAMILY)))
             quant = find_quant(family, str(item.data(0, ROLE_QUANT)))
             if hardware is None:
-                item.setText(3, VERDICT_TEXT[RunVerdict.UNKNOWN])
+                item.setText(3, GRADE_TEXT[RunGrade.UNKNOWN])
                 continue
             result = assess(family, quant, hardware, context_length=context)
-            item.setText(3, VERDICT_TEXT[result.verdict])
-            item.setToolTip(3, self._verdict_sentence(result))
+            item.setText(3, GRADE_TEXT[result.grade])
+            item.setToolTip(3, self._grade_sentence(result))
         self._refresh_selection_ui()
 
     @staticmethod
-    def _verdict_sentence(result: RunAssessment) -> str:
-        sentence = VERDICT_SENTENCE[result.verdict]
-        if result.verdict is RunVerdict.NOT_RUNNABLE:
+    def _grade_sentence(result: RunAssessment) -> str:
+        sentence = GRADE_SENTENCE[result.grade]
+        if result.grade is RunGrade.NO:
             sentence = sentence.format(shortfall=format_bytes(result.shortfall_bytes))
         return sentence
 
@@ -473,13 +559,19 @@ class LocalTab(QWidget):
             gpu_text = (
                 HW_NO_GPU
                 if gpu is None
-                else f"{gpu.name} · 显存 {format_bytes(gpu.vram_total_bytes)}"
-                f"(空闲 {format_bytes(gpu.vram_free_bytes)})"
+                else HW_GPU.format(
+                    name=gpu.name,
+                    vram=format_bytes(gpu.vram_total_bytes),
+                    free=format_bytes(gpu.vram_free_bytes),
+                )
             )
             self.hw_label.setText(
-                f"{HW_PREFIX}CPU {info.cpu_cores} 核 · "
-                f"内存 {format_bytes(info.ram_total_bytes)}"
-                f"(可用 {format_bytes(info.ram_available_bytes)})· {gpu_text}"
+                HW_LINE.format(
+                    cores=info.cpu_cores,
+                    ram=format_bytes(info.ram_total_bytes),
+                    avail=format_bytes(info.ram_available_bytes),
+                    gpu=gpu_text,
+                )
             )
         self._refresh_verdicts()
 
@@ -511,16 +603,20 @@ class LocalTab(QWidget):
         )
         if hardware is not None:
             result = assess(family, quant, hardware, context_length=context)
+            grade_word = GRADE_TEXT[result.grade]
+            sentence = self._grade_sentence(result)
             budgets = (
                 format_bytes(result.gpu_budget_bytes),
                 format_bytes(result.ram_budget_bytes),
             )
-            sentence = self._verdict_sentence(result)
         else:
+            grade_word = GRADE_TEXT[RunGrade.UNKNOWN]
+            sentence = GRADE_SENTENCE[RunGrade.UNKNOWN]
             budgets = ("?", "?")
-            sentence = VERDICT_SENTENCE[RunVerdict.UNKNOWN]
         self.detail_label.setText(
             DETAIL_LINE.format(
+                grade=grade_word,
+                sentence=sentence,
                 total=format_bytes(estimate.total_bytes),
                 weights=format_bytes(estimate.weights_bytes),
                 mmproj=mmproj_part,
@@ -529,7 +625,6 @@ class LocalTab(QWidget):
                 gpu=budgets[0],
                 ram=budgets[1],
             )
-            + f" — {sentence}"
         )
         downloaded = self.bridge.is_downloaded(family, quant)
         if downloading:
@@ -705,6 +800,16 @@ class LocalTab(QWidget):
         )
         if chosen:
             self.server_path_edit.setText(chosen)
+
+    def _add_extra_dir(self) -> None:
+        chosen = QFileDialog.getExistingDirectory(self, CAPTION_PICK_EXTRA_DIR, "")
+        if chosen and chosen not in self._extra_dirs():
+            self.extra_dirs_list.addItem(chosen)
+
+    def _remove_extra_dir(self) -> None:
+        row = self.extra_dirs_list.currentRow()
+        if row >= 0:
+            self.extra_dirs_list.takeItem(row)
 
     # -- misc --------------------------------------------------------------------------
     def _toast(self, text: str, kind: str) -> None:

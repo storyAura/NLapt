@@ -687,6 +687,42 @@ The v1.5 本地推理 placeholder was replaced by a working module (core side:
   `test_local_tab_is_placeholder` were removed
   (`test_local_tab_is_real` + a local-settings save round-trip replace it).
 
+## v1.6.1 — feedback round (window states, landscape 本地推理, menus)
+
+Four user-reported issues fixed (suite 1838 green):
+
+1. **Maximize/restore**: `MainWindow.toggle_max_restore` checks the RAW
+   window state (`WindowMaximized | WindowFullScreen`) — the old
+   `isMaximized()`-only branch could never leave a FULLSCREEN state
+   (全屏后无法恢复小窗). Restore runs `_ensure_normal_fits_screen` (on
+   small logical screens the fixed minimum equalled the screen, making
+   restore a visual no-op: minimum is lowered and an 86%-of-screen window
+   is centered). Both direction changes run through a short
+   `windowOpacity` dip (`_animate_state_switch`, skip-safe). The title
+   bar delegates to the window's toggle; dragging starts the system move
+   only after a real drag distance (a bare press used to enter the OS
+   move loop and swallow double-clicks), and dragging a zoomed window
+   un-zooms it first.
+2. **本地推理 tab is landscape** (tree left / detail + actions + runtime
+   settings right, tab min 840×520 so the dialog opens wide and 模型列
+   no longer truncates). 兼容性 became 「能否运行」 with the five-level
+   Chinese `RunGrade` (轻松运行 / 流畅运行 / 可以运行 / 勉强能跑 /
+   跑不动 — headroom factor 1.3 splits PERFECT/SMOOTH and OK/BARELY);
+   series/family names and grade cells are bold, the detail line leads
+   with the bold grade word. 下载目录 defaults INSIDE the app
+   (`default_models_dir()` → repo root or exe dir `models/`, git-ignored)
+   and `LocalSettings.extra_dirs` adds reuse directories: files are FOUND
+   across primary+extras (`find_model_file`/`find_mmproj_file`),
+   downloads skip anything a reuse dir already provides, and the server
+   spec uses the found paths.
+3. **提示词共用**: the 提示词 tab states explicitly that one prompt set
+   backs every LLM (online AND local) — behavior was already global via
+   `vision_prompts.json` + the active profile.
+4. **Menus**: 设置 is a TOP-LEVEL title-bar entry (`settings_button`,
+   opens the dialog directly); the 工具 menu stays as a future home with
+   a disabled 「更多工具(规划中)」 placeholder. `action_settings`
+   remains for programmatic callers.
+
 ## Testing rules
 
 - `tests/gui/conftest.py`: offscreen env; `qapp` from pytest-qt; fixture

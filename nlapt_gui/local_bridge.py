@@ -14,6 +14,7 @@ when the application exits (``atexit``).
 from __future__ import annotations
 
 import atexit
+import sys
 import threading
 from pathlib import Path
 from typing import Any
@@ -42,7 +43,7 @@ from nlapt.local.settings import (
     save_local_settings,
 )
 
-from nlapt_gui.resources import app_data_dir
+from nlapt_gui.resources import app_data_dir, resource_path
 from nlapt_gui.workers import run_async
 
 _LOGGER = get_logger(__name__)
@@ -82,6 +83,18 @@ def get_server_manager() -> LocalServerManager:
 def _alive(obj: QObject) -> bool:
     """Whether the underlying C++ object still exists (async-reply guard)."""
     return shiboken6.isValid(obj)
+
+
+def default_models_dir() -> Path:
+    """Default download dir INSIDE the app (用户要求: 默认放在项目内).
+
+    Next to the executable in a frozen build, the repo root in a source
+    checkout. Users can point the primary dir elsewhere and add extra
+    reuse directories on top.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent / MODELS_DIR_NAME
+    return resource_path(MODELS_DIR_NAME)
 
 
 class LocalBridge(QObject):
@@ -127,33 +140,71 @@ class LocalBridge(QObject):
         return self._settings
 
     def models_dir(self) -> Path:
-        """The configured model directory (default: app data dir / models)."""
+        """Primary (download) directory: user override or the in-app default."""
         configured = self._settings.models_dir.strip()
         if configured:
             return Path(configured)
-        return app_data_dir() / MODELS_DIR_NAME
+        return default_models_dir()
+
+    def models_dirs(self) -> tuple[Path, ...]:
+        """Primary dir + the extra reuse dirs (order kept, deduplicated)."""
+        dirs: list[Path] = [self.models_dir()]
+        for raw in self._settings.extra_dirs:
+            text = raw.strip()
+            if not text:
+                continue
+            candidate = Path(text)
+            if candidate not in dirs:
+                dirs.append(candidate)
+        return tuple(dirs)
 
     # -- files -------------------------------------------------------------------------
+    # File checks are deliberately synchronous: a few ``stat`` calls on
+    # selection change is the accepted small exception to the never-block
+    # rule (worst case is a sleeping network drive among the dirs).
     def model_file(self, family: ModelFamily, quant: QuantFile) -> Path:
+        """Download destination for a quant (always in the primary dir)."""
         return quant_path(self.models_dir(), family, quant)
 
     def mmproj_file(self, family: ModelFamily) -> Path | None:
+        """Download destination for the mmproj (always in the primary dir)."""
         return mmproj_path(self.models_dir(), family)
 
-    def is_downloaded(self, family: ModelFamily, quant: QuantFile) -> bool:
-        """Whether the quant (and its mmproj, for vision models) is complete.
+    def find_model_file(self, family: ModelFamily, quant: QuantFile) -> Path:
+        """An existing right-size copy in ANY dir, else the primary path."""
+        for base in self.models_dirs():
+            candidate = quant_path(base, family, quant)
+            if candidate.is_file() and candidate.stat().st_size == quant.size_bytes:
+                return candidate
+        return self.model_file(family, quant)
 
-        Deliberately synchronous: a couple of ``stat`` calls on selection
-        change is the accepted small exception to the never-block rule
-        (worst case is a sleeping network drive chosen as 模型目录).
-        """
-        model = self.model_file(family, quant)
+    def find_mmproj_file(self, family: ModelFamily) -> Path | None:
+        """An existing right-size mmproj in ANY dir, else the primary path."""
+        if not family.vision or not family.mmproj_filename:
+            return None
+        for base in self.models_dirs():
+            candidate = mmproj_path(base, family)
+            if (
+                candidate is not None
+                and candidate.is_file()
+                and candidate.stat().st_size == family.mmproj_bytes
+            ):
+                return candidate
+        return self.mmproj_file(family)
+
+    def is_downloaded(self, family: ModelFamily, quant: QuantFile) -> bool:
+        """Whether a complete quant (and mmproj, for vision) exists in any dir."""
+        model = self.find_model_file(family, quant)
         if not model.is_file() or model.stat().st_size != quant.size_bytes:
             return False
-        mmproj = self.mmproj_file(family)
-        if mmproj is None:
+        if not family.vision or not family.mmproj_filename:
             return True
-        return mmproj.is_file() and mmproj.stat().st_size == family.mmproj_bytes
+        mmproj = self.find_mmproj_file(family)
+        return (
+            mmproj is not None
+            and mmproj.is_file()
+            and mmproj.stat().st_size == family.mmproj_bytes
+        )
 
     # -- hardware ----------------------------------------------------------------------
     @property
@@ -183,25 +234,37 @@ class LocalBridge(QObject):
             return False
         family = find_family(family_id)
         quant = find_quant(family, quant_label)
+
+        def complete(path: Path | None, size: int) -> bool:
+            return path is not None and path.is_file() and path.stat().st_size == size
+
+        # Only fetch what no directory (incl. reuse dirs) already provides.
         jobs: list[tuple[str, Path, int, str]] = []
-        mmproj = self.mmproj_file(family)
-        if mmproj is not None:
+        mmproj_dest = self.mmproj_file(family)
+        if mmproj_dest is not None and not complete(
+            self.find_mmproj_file(family), family.mmproj_bytes
+        ):
             jobs.append(
                 (
                     download_url(family.repo_id, family.mmproj_filename),
-                    mmproj,
+                    mmproj_dest,
                     family.mmproj_bytes,
                     family.mmproj_sha256,
                 )
             )
-        jobs.append(
-            (
-                download_url(family.repo_id, quant.filename),
-                self.model_file(family, quant),
-                quant.size_bytes,
-                quant.sha256,
+        if not complete(self.find_model_file(family, quant), quant.size_bytes):
+            jobs.append(
+                (
+                    download_url(family.repo_id, quant.filename),
+                    self.model_file(family, quant),
+                    quant.size_bytes,
+                    quant.sha256,
+                )
             )
-        )
+        if not jobs:
+            # Everything already available (possibly from a reuse dir).
+            self.download_finished.emit(family_id, quant_label, DOWNLOAD_OK, "")
+            return True
         total_bytes = sum(expected for _url, _dest, expected, _sha in jobs)
         dest_keys = tuple(str(dest) for _url, dest, _expected, _sha in jobs)
         with _ACTIVE_LOCK:
@@ -292,12 +355,16 @@ class LocalBridge(QObject):
         return self._manager.current_base_url
 
     def build_server_spec(self, family: ModelFamily, quant: QuantFile) -> ServerSpec:
-        """ServerSpec for the current settings + a catalog selection."""
+        """ServerSpec for the current settings + a catalog selection.
+
+        Uses the FOUND files, so a model reused from an extra directory is
+        served from where it actually lives.
+        """
         settings = self._settings
-        mmproj = self.mmproj_file(family)
+        mmproj = self.find_mmproj_file(family)
         return ServerSpec(
             server_path=settings.server_path,
-            model_path=str(self.model_file(family, quant)),
+            model_path=str(self.find_model_file(family, quant)),
             port=settings.port,
             mmproj_path=str(mmproj) if mmproj is not None else "",
             context_length=settings.context_length,

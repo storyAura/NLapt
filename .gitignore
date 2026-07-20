@@ -30,6 +30,9 @@ venv/
 .backups/
 .nlapt/
 
+# Local-inference model downloads (default dir lives inside the project)
+models/
+
 # OS / editor
 Thumbs.db
 .DS_Store

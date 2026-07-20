@@ -136,27 +136,27 @@ class TestHardwareAndVerdicts:
         assert tab.bridge.hardware is None
         tab.show()
         qtbot.waitUntil(lambda: tab.bridge.hardware is not None, timeout=2000)
-        assert "CPU 16 核" in tab.hw_label.text()
+        assert "16" in tab.hw_label.text()
         assert "RTX 5090" in tab.hw_label.text()
 
-    def test_gpu_full_verdict_on_big_rig(self, qtbot, tab_controller) -> None:
+    def test_perfect_grade_on_big_rig(self, qtbot, tab_controller) -> None:
         tab = make_tab(qtbot, tab_controller)
         tab._on_hardware_ready(BIG_RIG)
         item = quant_item(tab, "toriigate-0.5", "Q4_K_M")
-        assert item.text(3) == "✓ 显存流畅"
+        assert item.text(3) == "轻松运行"
 
-    def test_cpu_only_verdict_without_gpu(self, qtbot, tab_controller) -> None:
+    def test_cpu_grade_without_gpu(self, qtbot, tab_controller) -> None:
         tab = make_tab(qtbot, tab_controller)
         tab._on_hardware_ready(NO_GPU_RIG)
         assert "未检测到 NVIDIA" in tab.hw_label.text()
         item = quant_item(tab, "toriigate-0.5", "Q4_K_M")
-        assert item.text(3) == "▢ 仅内存(慢)"
+        assert item.text(3) == "可以运行"
 
-    def test_not_runnable_on_tiny_rig(self, qtbot, tab_controller) -> None:
+    def test_no_grade_on_tiny_rig(self, qtbot, tab_controller) -> None:
         tab = make_tab(qtbot, tab_controller)
         tab._on_hardware_ready(TINY_RIG)
         item = quant_item(tab, "gemma4-31b", "Q8_0")
-        assert item.text(3) == "✗ 配置不足"
+        assert item.text(3) == "跑不动"
         assert "还差" in item.toolTip(3)
 
     def test_detection_failure_shows_unknown(self, qtbot, tab_controller) -> None:
@@ -164,14 +164,21 @@ class TestHardwareAndVerdicts:
         tab._on_hardware_ready(UNDETECTED)
         assert tab.hw_label.text() == HW_UNKNOWN
         item = quant_item(tab, "toriigate-0.5", "Q4_K_M")
-        assert item.text(3) == "?"
+        assert item.text(3) == "未检测"
 
     def test_context_change_recomputes_verdicts(self, qtbot, tab_controller) -> None:
         tab = make_tab(qtbot, tab_controller)
         tab._on_hardware_ready(BIG_RIG)
         tab.context_spin.setValue(32_768)
         item = quant_item(tab, "toriigate-0.5", "Q4_K_M")
-        assert item.text(3) != "?"
+        assert item.text(3) != "未检测"
+
+    def test_grade_cell_is_bold(self, qtbot, tab_controller) -> None:
+        tab = make_tab(qtbot, tab_controller)
+        item = quant_item(tab, "toriigate-0.5", "Q4_K_M")
+        assert item.font(3).bold()
+        family_item = item.parent()
+        assert family_item.font(0).bold()
 
 
 class TestSelection:
@@ -201,12 +208,14 @@ class TestPersistAndPrefill:
         tab.parallel_spin.setValue(6)
         tab.port_spin.setValue(2000)
         tab.server_path_edit.setText("C:/llama/llama-server.exe")
+        tab.extra_dirs_list.addItems(["D:/shared-models", "E:/lmstudio"])
         tab.persist()
         stored = load_local_settings(app_data_dir() / "local_llm.json")
         assert stored.context_length == 2048
         assert stored.parallel == 6
         assert stored.port == 2000
         assert stored.server_path == "C:/llama/llama-server.exe"
+        assert stored.extra_dirs == ("D:/shared-models", "E:/lmstudio")
         assert stored.family_id == "joycaption-beta-one"
         assert stored.quant_label == "Q4_K"
 
@@ -214,16 +223,37 @@ class TestPersistAndPrefill:
         save_local_settings(
             app_data_dir() / "local_llm.json",
             LocalSettings(
-                port=3000, parallel=7, family_id="gemma4-12b", quant_label="Q8_0"
+                port=3000,
+                parallel=7,
+                extra_dirs=("D:/shared",),
+                family_id="gemma4-12b",
+                quant_label="Q8_0",
             ),
         )
         tab = make_tab(qtbot, tab_controller)
         assert tab.port_spin.value() == 3000
         assert tab.parallel_spin.value() == 7
+        assert tab.extra_dirs_list.count() == 1
+        assert tab.extra_dirs_list.item(0).text() == "D:/shared"
         selection = tab.current_selection()
         assert selection is not None
         assert selection[0].family_id == "gemma4-12b"
         assert selection[1].label == "Q8_0"
+
+    def test_remove_extra_dir(self, qtbot, tab_controller) -> None:
+        tab = make_tab(qtbot, tab_controller)
+        tab.extra_dirs_list.addItems(["D:/a", "D:/b"])
+        tab.extra_dirs_list.setCurrentRow(0)
+        tab.extra_remove_button.click()
+        assert tab._extra_dirs() == ("D:/b",)
+
+    def test_models_dir_placeholder_is_in_app_default(
+        self, qtbot, tab_controller
+    ) -> None:
+        from nlapt_gui.local_bridge import default_models_dir
+
+        tab = make_tab(qtbot, tab_controller)
+        assert tab.models_dir_edit.placeholderText() == str(default_models_dir())
 
 
 class TestDownloadFlow:
@@ -247,7 +277,7 @@ class TestDownloadFlow:
         with qtbot.waitSignal(tab.bridge.download_finished, timeout=2000):
             tab.download_button.click()
         qtbot.waitUntil(lambda: not tab.progress.isVisible(), timeout=2000)
-        assert any("已下载" in text for text, _ in tab_toasts)
+        assert any("已就绪" in text for text, _ in tab_toasts)
         assert tab.download_button.text() != "取消下载"
 
 

@@ -7,10 +7,12 @@ import pytest
 from nlapt.core.errors import ValidationError
 from nlapt.local.advisor import (
     DEFAULT_CONTEXT_LENGTH,
+    HEADROOM_FACTOR,
     OVERHEAD_BASE_BYTES,
     RAM_USABLE_SHARE,
     VRAM_USABLE_SHARE,
     WEIGHTS_OVERHEAD_FACTOR,
+    RunGrade,
     RunVerdict,
     assess,
     estimate_memory,
@@ -144,3 +146,50 @@ class TestAssess:
         machine = hw(ram=16 * GIB)
         result = assess(family, family.quants[0], machine)
         assert result.estimate.kv_cache_bytes == KV_PER_TOKEN * DEFAULT_CONTEXT_LENGTH
+
+
+class TestGrades:
+    """五级中文评级 (RunGrade): headroom decides the split inside a verdict."""
+
+    def test_perfect_with_big_vram_headroom(self) -> None:
+        family = make_family()
+        machine = hw(ram=16 * GIB, gpus=(gpu(24 * GIB, 24 * GIB),))
+        result = assess(family, family.quants[0], machine)
+        assert result.verdict is RunVerdict.GPU_FULL
+        assert result.grade is RunGrade.PERFECT
+
+    def test_smooth_when_vram_fits_but_tight(self) -> None:
+        family = make_family()
+        required = estimate_memory(family, family.quants[0]).total_bytes
+        # Budget lands between 1.0x and HEADROOM_FACTOR x the requirement.
+        free = int(required * 1.1 / VRAM_USABLE_SHARE) + 1
+        result = assess(family, family.quants[0], hw(ram=16 * GIB, gpus=(gpu(free, free),)))
+        assert result.verdict is RunVerdict.GPU_FULL
+        assert result.grade is RunGrade.SMOOTH
+
+    def test_ok_on_cpu_with_ram_headroom(self) -> None:
+        family = make_family()
+        result = assess(family, family.quants[0], hw(ram=64 * GIB))
+        assert result.verdict is RunVerdict.CPU_ONLY
+        assert result.grade is RunGrade.OK
+
+    def test_barely_when_ram_tight(self) -> None:
+        family = make_family()
+        required = estimate_memory(family, family.quants[0]).total_bytes
+        ram = int(required * 1.1 / RAM_USABLE_SHARE) + 1
+        assert ram < int(required * HEADROOM_FACTOR / RAM_USABLE_SHARE)
+        result = assess(family, family.quants[0], hw(ram=ram))
+        assert result.verdict is RunVerdict.CPU_ONLY
+        assert result.grade is RunGrade.BARELY
+
+    def test_gpu_partial_with_combined_headroom_is_ok(self) -> None:
+        family = make_family()
+        machine = hw(ram=64 * GIB, gpus=(gpu(1 * GIB, 1 * GIB),))
+        result = assess(family, family.quants[0], machine)
+        assert result.verdict is RunVerdict.GPU_PARTIAL
+        assert result.grade is RunGrade.OK
+
+    def test_no_and_unknown_grades(self) -> None:
+        family = make_family()
+        assert assess(family, family.quants[0], hw(ram=1 * GIB)).grade is RunGrade.NO
+        assert assess(family, family.quants[0], hw(ram=0)).grade is RunGrade.UNKNOWN

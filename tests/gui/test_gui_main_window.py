@@ -75,6 +75,28 @@ class TestAssembly:
         assert closed == [True]
 
 
+class TestMaxRestore:
+    ZOOMED = Qt.WindowState.WindowMaximized | Qt.WindowState.WindowFullScreen
+
+    def test_toggle_maximizes_then_restores(self, qtbot, window) -> None:
+        window.toggle_max_restore()
+        assert window.windowState() & Qt.WindowState.WindowMaximized
+        window.toggle_max_restore()
+        assert not (window.windowState() & self.ZOOMED)
+
+    def test_toggle_recovers_from_fullscreen(self, qtbot, window) -> None:
+        # A window stuck in FULLSCREEN must come back to normal too — the
+        # old isMaximized()-only branch kept re-maximizing forever.
+        window.showFullScreen()
+        window.toggle_max_restore()
+        assert not (window.windowState() & self.ZOOMED)
+
+    def test_title_bar_button_delegates_to_window(self, qtbot, window) -> None:
+        window.showMaximized()
+        window.title_bar.toggle_max_restore()
+        assert not (window.windowState() & self.ZOOMED)
+
+
 class TestTitleBar:
     def test_menus_present(self, window) -> None:
         bar = window.title_bar

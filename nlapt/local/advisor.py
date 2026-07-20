@@ -35,12 +35,33 @@ MAX_CONTEXT_LENGTH = 1_048_576
 
 
 class RunVerdict(str, Enum):
-    """How well a model/quant is expected to run on the hardware."""
+    """Which resource scenario the model lands in on this hardware."""
 
     GPU_FULL = "gpu_full"
     GPU_PARTIAL = "gpu_partial"
     CPU_ONLY = "cpu_only"
     NOT_RUNNABLE = "not_runnable"
+    UNKNOWN = "unknown"
+
+
+# Budget/required ratio above which a run is considered to have comfortable
+# headroom (drives the PERFECT vs SMOOTH and OK vs BARELY grade split).
+HEADROOM_FACTOR = 1.3
+
+
+class RunGrade(str, Enum):
+    """Plain five-level "can this machine run it" answer for the UI.
+
+    Ordered best to worst: PERFECT (轻松运行) > SMOOTH (流畅运行) >
+    OK (可以运行) > BARELY (勉强能跑) > NO (跑不动); UNKNOWN when the
+    hardware could not be detected.
+    """
+
+    PERFECT = "perfect"
+    SMOOTH = "smooth"
+    OK = "ok"
+    BARELY = "barely"
+    NO = "no"
     UNKNOWN = "unknown"
 
 
@@ -65,9 +86,10 @@ class MemoryEstimate:
 
 @dataclass(frozen=True)
 class RunAssessment:
-    """Verdict plus the numbers that produced it (for the UI breakdown)."""
+    """Verdict + grade plus the numbers that produced them (UI breakdown)."""
 
     verdict: RunVerdict
+    grade: RunGrade
     estimate: MemoryEstimate
     gpu_budget_bytes: int
     ram_budget_bytes: int
@@ -109,6 +131,26 @@ def estimate_memory(
     )
 
 
+def _grade_for(
+    verdict: RunVerdict, required: int, gpu_budget: int, ram_budget: int
+) -> RunGrade:
+    """Collapse a verdict + headroom into the five-level grade."""
+    if verdict is RunVerdict.UNKNOWN:
+        return RunGrade.UNKNOWN
+    if verdict is RunVerdict.NOT_RUNNABLE:
+        return RunGrade.NO
+    if verdict is RunVerdict.GPU_FULL:
+        if gpu_budget >= int(required * HEADROOM_FACTOR):
+            return RunGrade.PERFECT
+        return RunGrade.SMOOTH
+    budget = (
+        gpu_budget + ram_budget if verdict is RunVerdict.GPU_PARTIAL else ram_budget
+    )
+    if budget >= int(required * HEADROOM_FACTOR):
+        return RunGrade.OK
+    return RunGrade.BARELY
+
+
 def assess(
     family: ModelFamily,
     quant: QuantFile,
@@ -133,6 +175,7 @@ def assess(
     if hardware.ram_total_bytes <= 0:
         return RunAssessment(
             verdict=RunVerdict.UNKNOWN,
+            grade=RunGrade.UNKNOWN,
             estimate=estimate,
             gpu_budget_bytes=gpu_budget,
             ram_budget_bytes=0,
@@ -154,6 +197,7 @@ def assess(
         shortfall = required - (gpu_budget + ram_budget)
     return RunAssessment(
         verdict=verdict,
+        grade=_grade_for(verdict, required, gpu_budget, ram_budget),
         estimate=estimate,
         gpu_budget_bytes=gpu_budget,
         ram_budget_bytes=ram_budget,

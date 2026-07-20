@@ -15,6 +15,7 @@ from __future__ import annotations
 from nlapt.local.advisor import (
     MemoryEstimate,
     RunAssessment,
+    RunGrade,
     RunVerdict,
     assess,
     estimate_memory,
@@ -65,6 +66,7 @@ __all__ = [
     "ModelSeries",
     "QuantFile",
     "RunAssessment",
+    "RunGrade",
     "RunVerdict",
     "ServerSpec",
     "all_families",

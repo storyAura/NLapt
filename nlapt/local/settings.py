@@ -41,7 +41,8 @@ GPU_LAYERS_RANGE = (-1, 999)
 class LocalSettings:
     """Immutable settings of the local-inference module."""
 
-    models_dir: str = ""  # empty -> caller supplies its default
+    models_dir: str = ""  # primary/download dir; empty -> caller's default
+    extra_dirs: tuple[str, ...] = ()  # additional search dirs (复用外部模型)
     server_path: str = ""  # llama-server executable; empty = not configured
     port: int = DEFAULT_PORT
     context_length: int = DEFAULT_CONTEXT_LENGTH
@@ -78,8 +79,19 @@ def load_local_settings(path: Path) -> LocalSettings:
     if not isinstance(raw, dict):
         _LOGGER.warning("local settings %s is not an object; using defaults", path)
         return LocalSettings()
+    raw_extra = raw.get("extra_dirs", [])
+    extra_dirs = (
+        tuple(
+            str(item).strip()
+            for item in raw_extra
+            if isinstance(item, str) and str(item).strip()
+        )
+        if isinstance(raw_extra, list)
+        else ()
+    )
     return LocalSettings(
         models_dir=str(raw.get("models_dir", "")),
+        extra_dirs=extra_dirs,
         server_path=str(raw.get("server_path", "")),
         port=_clamp(raw.get("port", DEFAULT_PORT), DEFAULT_PORT, PORT_RANGE),
         context_length=_clamp(

@@ -54,7 +54,7 @@ def test_dataset_scan_result_holds_tuples() -> None:
 
 
 def test_package_version() -> None:
-    assert nlapt.__version__ == "0.2.0"
+    assert nlapt.__version__ == "0.3.0"
 
 
 def test_package_root_lists_lazy_export_without_importing_it() -> None:

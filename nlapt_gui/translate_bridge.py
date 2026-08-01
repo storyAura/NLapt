@@ -30,6 +30,7 @@ from PySide6.QtCore import QObject, QThreadPool, Signal
 
 from nlapt.core.errors import LLMError
 from nlapt.diagnostics import get_logger
+from nlapt.llm.retry import RetryPolicy, with_retry
 from nlapt.llm.translate import (
     CJK_CHAR_RANGES,
     CachedTranslation,
@@ -85,6 +86,7 @@ class TranslateBridge(QObject):
         pool: QThreadPool | None = None,
         config: TranslationConfig | None = None,
         transport: Any = None,
+        retry_sleep: Callable[[float], None] = time.sleep,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -95,9 +97,18 @@ class TranslateBridge(QObject):
         # When a config is injected (tests) it is fixed; otherwise the active
         # provider selection is read fresh from disk so a 设置 save is picked
         # up without any explicit wiring. ``transport`` lets tests drive web
-        # providers through httpx.MockTransport.
+        # providers through httpx.MockTransport. ``retry_sleep`` is the web
+        # providers' backoff sleep, injectable so tests never really wait.
         self._fixed_config = config
         self._transport = transport
+        self._retry_sleep = retry_sleep
+
+    def _web_retry_policy(self) -> RetryPolicy:
+        """Spec-8 parity for web providers (they have no internal retry):
+        transient failures/timeouts back off and retry like the LLM path."""
+        return RetryPolicy(
+            max_retries=self._controller.app.config.request.max_retries
+        )
 
     def _config(self) -> TranslationConfig:
         if self._fixed_config is not None:
@@ -137,7 +148,16 @@ class TranslateBridge(QObject):
         except LLMError as exc:
             _LOGGER.info("translation provider %r unusable: %s", config.provider, exc)
             return None
-        return provider.translate
+        policy = self._web_retry_policy()
+
+        def web_translate(text: str, direction: Direction) -> str:
+            return with_retry(
+                lambda: provider.translate(text, direction),
+                policy,
+                sleep=self._retry_sleep,
+            )
+
+        return web_translate
 
     def request(self, key: str, text: str, *, fresh: bool = False) -> None:
         """Translate one segment asynchronously; emits ``segment_ready``.

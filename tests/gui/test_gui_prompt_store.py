@@ -11,6 +11,8 @@ from nlapt.core.errors import StorageError
 from nlapt_gui.prompt_store import (
     DEFAULT_PROMPT_NAME,
     DEFAULT_USER_PROMPT,
+    ENGINE_LLM,
+    ENGINE_LOCAL,
     VisionPrompts,
     load_vision_prompts,
     save_vision_prompts,
@@ -45,6 +47,33 @@ class TestModel:
         assert changed.user_prompt == "x"
 
 
+class TestEnginePrompts:
+    SHARED = VisionPrompts(
+        active="动漫", prompts={"动漫": "shared-sys"}, user_prompt="shared-user"
+    )
+
+    def test_unified_by_default(self) -> None:
+        prompts = self.SHARED
+        assert prompts.local_unified
+        assert prompts.system_text_for(ENGINE_LOCAL) == "shared-sys"
+        assert prompts.user_prompt_for(ENGINE_LOCAL) == "shared-user"
+        assert prompts.system_text_for(ENGINE_LLM) == "shared-sys"
+
+    def test_local_override_when_not_unified(self) -> None:
+        prompts = self.SHARED.with_changes(
+            local_unified=False, local_system="loc-sys", local_user_prompt="loc-user"
+        )
+        assert prompts.system_text_for(ENGINE_LOCAL) == "loc-sys"
+        assert prompts.user_prompt_for(ENGINE_LOCAL) == "loc-user"
+        # The LLM engine is untouched by the local override.
+        assert prompts.system_text_for(ENGINE_LLM) == "shared-sys"
+        assert prompts.user_prompt_for(ENGINE_LLM) == "shared-user"
+
+    def test_local_user_prompt_falls_back_to_builtin(self) -> None:
+        prompts = self.SHARED.with_changes(local_unified=False, local_user_prompt="  ")
+        assert prompts.user_prompt_for(ENGINE_LOCAL) == DEFAULT_USER_PROMPT
+
+
 class TestPersistence:
     def test_round_trip(self) -> None:
         original = VisionPrompts(
@@ -54,6 +83,26 @@ class TestPersistence:
         assert vision_prompts_path().exists()
         loaded = load_vision_prompts()
         assert loaded == original
+
+    def test_round_trip_with_local_fields(self) -> None:
+        original = VisionPrompts(
+            user_prompt="up",
+            local_unified=False,
+            local_system="loc-sys",
+            local_user_prompt="loc-user",
+        )
+        save_vision_prompts(original)
+        assert load_vision_prompts() == original
+
+    def test_legacy_file_defaults_to_unified(self, tmp_path: Path) -> None:
+        target = tmp_path / "vision_prompts.json"
+        target.write_text(
+            '{"active": "默认", "prompts": {}, "user_prompt": "up"}',
+            encoding="utf-8",
+        )
+        loaded = load_vision_prompts(target)
+        assert loaded.local_unified is True
+        assert loaded.local_system == ""
 
     def test_missing_file_gives_defaults(self) -> None:
         assert load_vision_prompts() == VisionPrompts()

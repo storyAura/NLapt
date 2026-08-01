@@ -575,7 +575,11 @@ class EditorPanel(QWidget):
         preview = self.translation_preview
         if not preview.is_active():
             return
-        preview.adjustSize()
+        # Clamp the card into the panel first (long results scroll inside it,
+        # keeping 替换/关闭 clickable), then anchor it under the toolbar.
+        preview.fit_within(
+            self.width() - 2 * TOOLBAR_MARGIN, self.height() - 2 * TOOLBAR_GAP
+        )
         # Below the toolbar, centered on it, clamped inside the panel.
         x = self.toolbar.x() + (self.toolbar.width() - preview.width()) // 2
         x = max(TOOLBAR_MARGIN, min(x, self.width() - preview.width() - TOOLBAR_MARGIN))

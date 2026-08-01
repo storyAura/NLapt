@@ -1,9 +1,10 @@
-"""Curated catalog of local GGUF models (设置 ▸ 本地推理).
+"""Curated catalog of local models (设置 ▸ 本地推理).
 
 A static, hand-picked snapshot of HuggingFace repositories: for every family
 the highest-download public GGUF conversion at snapshot time, the "heretic"
-(abliteration / uncensored) derivatives, and the two caption-specialist
-vision models this app is built around (ToriiGate / JoyCaption).
+(abliteration / uncensored) derivatives, and the caption-specialist vision
+models this app is built around (ToriiGate / JoyCaption / Florence-2
+PromptGen).
 
 Hierarchy: :class:`ModelSeries` (大系列) -> :class:`ModelFamily` (小系列)
 -> :class:`QuantFile` (量化档). File sizes and SHA256 digests are exact
@@ -12,6 +13,12 @@ values read from the HuggingFace API (LFS oids), so
 :mod:`nlapt.local.download` can verify integrity without any extra network
 round-trip. Download counts are a display-only snapshot taken on
 :data:`CATALOG_SNAPSHOT_DATE`.
+
+Families run on one of two engines: :data:`ENGINE_LLAMA` (a GGUF served by
+llama-server) or :data:`ENGINE_FLORENCE` (the Florence-2 ONNX pipeline of
+:mod:`nlapt.local.florence`, which llama.cpp cannot serve). Florence
+families list their sibling ONNX/tokenizer files in ``extra_files``; every
+listed file downloads into the same per-family directory.
 
 ``kv_bytes_per_token`` is a deliberately coarse fp16 K+V-cache heuristic per
 family (hybrid/sliding-window attention makes exact numbers configuration
@@ -28,7 +35,7 @@ from urllib.parse import quote
 from nlapt.core.errors import ValidationError
 
 # Date the download counts / file listings were captured from huggingface.co.
-CATALOG_SNAPSHOT_DATE = "2026-07-20"
+CATALOG_SNAPSHOT_DATE = "2026-07-29"
 # Base pattern for direct file downloads from a public HuggingFace repo.
 HF_RESOLVE_BASE = "https://huggingface.co/{repo_id}/resolve/main/{path}"
 # Base pattern for a repo's human-readable page.
@@ -42,6 +49,11 @@ SERIES_GEMMA4 = "gemma4"
 SERIES_GEMMA4_HERETIC = "gemma4-heretic"
 SERIES_TORIIGATE = "toriigate"
 SERIES_JOYCAPTION = "joycaption"
+SERIES_FLORENCE = "florence2-promptgen"
+
+# Inference engines a family can run on.
+ENGINE_LLAMA = "llama"  # single GGUF (+ optional mmproj) served by llama-server
+ENGINE_FLORENCE = "florence"  # ONNX pipeline run in-process (nlapt.local.florence)
 
 
 @dataclass(frozen=True)
@@ -70,11 +82,15 @@ class ModelFamily:
     vision: bool
     kv_bytes_per_token: int  # coarse fp16 K+V heuristic (see module docstring)
     quants: tuple[QuantFile, ...]
-    mmproj_filename: str = ""  # repo-relative; required when vision is True
+    mmproj_filename: str = ""  # repo-relative; required for ENGINE_LLAMA vision
     mmproj_bytes: int = 0
     mmproj_sha256: str = ""
     license: str = ""
     notes: str = ""
+    engine: str = ENGINE_LLAMA  # which runtime serves this family
+    # Additional required files beside the quant (ENGINE_FLORENCE: the
+    # sibling ONNX parts + tokenizer). Downloaded/verified like quants.
+    extra_files: tuple[QuantFile, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -112,6 +128,15 @@ ALL_SERIES: tuple[ModelSeries, ...] = (
         series_id=SERIES_JOYCAPTION,
         name="JoyCaption",
         description="fancyfeast 的自由图片标注视觉模型,写实照片类描述效果好。",
+    ),
+    ModelSeries(
+        series_id=SERIES_FLORENCE,
+        name="Florence-2 PromptGen",
+        description=(
+            "MiaoshouAI 基于微软 Florence-2 微调的轻量打标模型(约 1G 显存),"
+            "通过内置指令输出 danbooru 标签 / 各级标题 / 构图分析,"
+            "免 llama-server,推理时自动加载。"
+        ),
     ),
 )
 
@@ -518,6 +543,64 @@ ALL_FAMILIES: tuple[ModelFamily, ...] = (
         mmproj_sha256="94002cb5c354c7c9e538e64f37d593db9eceeca2e94573bae6cd3b2bd8bb1952",
         license="Llama 3.1",
         notes="基于 Llama-3.1-8B LLaVA · 写实图片描述",
+    ),
+    # -- Florence-2 PromptGen (ONNX engine, see nlapt.local.florence) --------------
+    ModelFamily(
+        family_id="florence2-promptgen-v2",
+        series_id=SERIES_FLORENCE,
+        name="Florence-2 PromptGen v2.0",
+        # The only FUNCTIONAL community ONNX export of MiaoshouAI's PromptGen
+        # v2.0 (llama.cpp cannot serve the Florence-2 architecture). Despite
+        # the repo name, the exported weights are the base-size (0.23B)
+        # architecture — verified from the graph dims; no large-size ONNX
+        # export exists anywhere at snapshot time.
+        repo_id="laub/Florence-2-large-PromptGen-v2.0-onnx",
+        downloads=11_085,  # snapshot of the original MiaoshouAI repo (热度)
+        params_label="0.23B",
+        vision=True,
+        kv_bytes_per_token=36_864,  # fp32 K+V of the 6-layer BART decoder
+        quants=(
+            _q(
+                "ONNX",
+                "onnx/decoder_model_merged.onnx",
+                388_209_807,
+                "4bd1dce482d3df8f6c592b248b0de8e62780d2ad5a3f3ae9b3d42b321b83a678",
+                recommended=True,
+            ),
+        ),
+        license="MIT",
+        notes=(
+            "打标特化 · 指令驱动(标签 / 标题 / 构图分析),免 llama-server;"
+            "社区 ONNX 导出为 base 架构(仓库名标 large,实为 0.23B;"
+            "large 版暂无可用 ONNX)"
+        ),
+        engine=ENGINE_FLORENCE,
+        extra_files=(
+            _q(
+                "vision_encoder",
+                "onnx/vision_encoder.onnx",
+                366_564_017,
+                "0894e2fd104d64e31d0fc22dd2dfba498f0455bcb5416534972777943c38ac17",
+            ),
+            _q(
+                "embed_tokens",
+                "onnx/embed_tokens.onnx",
+                157_560_044,
+                "b95f49725068d0addbb3c0522d842cb4d9e968106563583deccae3a462378ee1",
+            ),
+            _q(
+                "encoder_model",
+                "onnx/encoder_model.onnx",
+                173_380_907,
+                "3243b162d86802e572969581362b3efeba8329dbb8da1e2ff4fb053913e6c2df",
+            ),
+            _q(
+                "tokenizer",
+                "tokenizer.json",
+                2_297_961,
+                "d69dcdb2323e124ac4f800cb9863ddccea0d7bb11e16125e8df3bd60f2f8aeac",
+            ),
+        ),
     ),
 )
 

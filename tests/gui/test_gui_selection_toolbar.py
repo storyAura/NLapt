@@ -186,7 +186,8 @@ class TestCaptionBarEmbedding:
         panel = make_panel(qtbot, controller)
         assert isinstance(panel.caption_bar, CaptionBar)
         assert panel.caption_bar.translate_btn.isEnabled()
-        assert panel.caption_bar.reinfer_btn.text() == "重译"
+        assert panel.caption_bar.reinfer_btn.text() == "LLM 推理"
+        assert panel.caption_bar.local_infer_btn.text() == "本地推理"
         assert panel.caption_bar.delete_btn.text() == "删除"
 
     def test_caption_preview_hosted_on_panel_overlay(self, qtbot, controller) -> None:

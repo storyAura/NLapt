@@ -9,6 +9,11 @@ The llama-server process manager is a PROCESS-WIDE singleton
 (:func:`get_server_manager`): the settings dialog is recreated on every
 open, but a started server must survive dialog closes and be terminated
 when the application exits (``atexit``).
+
+Downloads are process-wide too: one task at a time, tracked in module state
+and broadcast through the :func:`get_download_hub` singleton, so a dialog
+reopened mid-download re-attaches to the live progress (and can cancel)
+instead of only being told a task exists.
 """
 
 from __future__ import annotations
@@ -16,15 +21,23 @@ from __future__ import annotations
 import atexit
 import sys
 import threading
+from dataclasses import dataclass
+from dataclasses import replace as _dc_replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import shiboken6
 from PySide6.QtCore import QObject, QThreadPool, Signal
 
-from nlapt.core.errors import DownloadCancelledError
+from nlapt.core.config import LLMProfile
+from nlapt.core.errors import DownloadCancelledError, LocalInferenceError, NLaptError
 from nlapt.diagnostics import get_logger
+from nlapt.llm.base import LLMMessage, LLMRequest, create_client
+from nlapt.llm.cleaning import clean_llm_output, ensure_not_refusal
+from nlapt.llm.vision import prepare_image
+from nlapt.local.advisor import auto_gpu_layers
 from nlapt.local.catalog import (
+    ENGINE_FLORENCE,
     ModelFamily,
     QuantFile,
     download_url,
@@ -34,7 +47,18 @@ from nlapt.local.catalog import (
     quant_path,
 )
 from nlapt.local.download import download_file
+from nlapt.local.florence import FlorenceEngine
+from nlapt.local.gguf import read_block_count
 from nlapt.local.hardware import HardwareInfo, detect_hardware
+from nlapt.local.presets import resolve_preset
+from nlapt.local.runtime import (
+    MSG_PLATFORM_UNSUPPORTED,
+    RuntimeAsset,
+    current_asset,
+    ensure_runtime,
+    find_server_exe,
+    runtime_dir,
+)
 from nlapt.local.server import LocalServerManager, ServerSpec
 from nlapt.local.settings import (
     SETTINGS_FILE_NAME,
@@ -49,8 +73,19 @@ from nlapt_gui.workers import run_async
 _LOGGER = get_logger(__name__)
 
 MODELS_DIR_NAME = "models"
+# Per-user directory holding the auto-provisioned llama.cpp runtime.
+RUNTIME_DIR_NAME = "runtime"
+# Local inference is slow on CPU offload; give requests generous headroom.
+LOCAL_VISION_TIMEOUT_SECONDS = 300.0
+LOCAL_VISION_PROFILE_NAME = "local-vision"
+LOCAL_VISION_API_TYPE = "openai"
 # Emit a progress signal at most every this many new bytes (UI flood guard).
 PROGRESS_EMIT_STEP_BYTES = 8 * 1024 * 1024
+
+# Actionable guidance when local inference is not ready yet.
+MSG_NO_MODEL_SELECTED = "未选择本地模型 — 打开 设置 ▸ 本地推理,选择并下载一个模型"
+MSG_NOT_DOWNLOADED = "本地模型尚未下载完成 — 打开 设置 ▸ 本地推理 下载"
+MSG_NOT_VISION = "所选本地模型不支持图片输入 — 请选择带「视觉」标记的模型"
 
 SERVER_STOPPED = "stopped"
 SERVER_STARTING = "starting"
@@ -64,12 +99,6 @@ DOWNLOAD_ERROR = "error"
 
 _SHARED_MANAGER: LocalServerManager | None = None
 
-# Destinations of in-flight downloads, PROCESS-wide: a download outlives the
-# dialog (and bridge) that started it, and two writers on one ``.part`` file
-# would corrupt it. Guarded by _ACTIVE_LOCK.
-_ACTIVE_DOWNLOAD_PATHS: set[str] = set()
-_ACTIVE_LOCK = threading.Lock()
-
 
 def get_server_manager() -> LocalServerManager:
     """Process-wide llama-server manager, stopped automatically at exit."""
@@ -78,6 +107,55 @@ def get_server_manager() -> LocalServerManager:
         _SHARED_MANAGER = LocalServerManager()
         atexit.register(_SHARED_MANAGER.stop)
     return _SHARED_MANAGER
+
+
+# -- process-wide download state ----------------------------------------------------
+# A download outlives the dialog (and bridge) that started it: the settings
+# dialog is recreated on every open, but the worker keeps writing. All
+# progress/finish signals therefore go through ONE process-wide hub that
+# every live bridge forwards from, and the current task snapshot lets a
+# freshly opened dialog re-attach (progress bar + cancel) instead of only
+# seeing a "download busy" toast. One download runs at a time.
+class _DownloadHub(QObject):
+    """Fan-out point for download signals; outlives every dialog/bridge."""
+
+    progress = Signal(str, str, object, object)  # family_id, quant_label, done, total
+    finished = Signal(str, str, str, str)  # family_id, quant_label, status, message
+
+
+@dataclass(frozen=True)
+class _ActiveDownload:
+    """Snapshot of the single in-flight download (replaced, never mutated)."""
+
+    family_id: str
+    quant_label: str
+    cancel: threading.Event
+    done: int = 0
+    total: int | None = None
+
+
+_HUB: _DownloadHub | None = None
+_ACTIVE_TASK: _ActiveDownload | None = None
+_ACTIVE_LOCK = threading.Lock()
+
+
+def get_download_hub() -> _DownloadHub:
+    """Process-wide download signal hub (created lazily on the GUI thread)."""
+    global _HUB
+    if _HUB is None:
+        _HUB = _DownloadHub()
+    return _HUB
+
+
+def active_download() -> tuple[str, str, int, int | None] | None:
+    """(family_id, quant_label, done_bytes, total_bytes) of the running
+    download, or None. The snapshot is what a reopened dialog re-attaches to.
+    """
+    with _ACTIVE_LOCK:
+        task = _ACTIVE_TASK
+        if task is None:
+            return None
+        return (task.family_id, task.quant_label, task.done, task.total)
 
 
 def _alive(obj: QObject) -> bool:
@@ -95,6 +173,337 @@ def default_models_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent / MODELS_DIR_NAME
     return resource_path(MODELS_DIR_NAME)
+
+
+# -- settings-driven path resolution (module level: reused OUTSIDE the dialog) ------
+def local_settings_path() -> Path:
+    """Location of the persisted local-inference settings."""
+    return app_data_dir() / SETTINGS_FILE_NAME
+
+
+def models_dir_for(settings: LocalSettings) -> Path:
+    """Primary (download) directory: user override or the in-app default."""
+    configured = settings.models_dir.strip()
+    return Path(configured) if configured else default_models_dir()
+
+
+def search_dirs(settings: LocalSettings) -> tuple[Path, ...]:
+    """Primary dir + the extra reuse dirs (order kept, deduplicated)."""
+    dirs: list[Path] = [models_dir_for(settings)]
+    for raw in settings.extra_dirs:
+        text = raw.strip()
+        if not text:
+            continue
+        candidate = Path(text)
+        if candidate not in dirs:
+            dirs.append(candidate)
+    return tuple(dirs)
+
+
+def find_model_file_in(
+    settings: LocalSettings, family: ModelFamily, quant: QuantFile
+) -> Path:
+    """An existing right-size copy in ANY dir, else the primary path.
+
+    Works for the main quant AND for ``family.extra_files`` entries — both
+    are :class:`QuantFile` values stored under their basename in the
+    per-family directory.
+    """
+    for base in search_dirs(settings):
+        candidate = quant_path(base, family, quant)
+        if candidate.is_file() and candidate.stat().st_size == quant.size_bytes:
+            return candidate
+    return quant_path(models_dir_for(settings), family, quant)
+
+
+def find_mmproj_file_in(settings: LocalSettings, family: ModelFamily) -> Path | None:
+    """An existing right-size mmproj in ANY dir, else the primary path."""
+    if not family.vision or not family.mmproj_filename:
+        return None
+    for base in search_dirs(settings):
+        candidate = mmproj_path(base, family)
+        if (
+            candidate is not None
+            and candidate.is_file()
+            and candidate.stat().st_size == family.mmproj_bytes
+        ):
+            return candidate
+    return mmproj_path(models_dir_for(settings), family)
+
+
+def is_downloaded_in(
+    settings: LocalSettings, family: ModelFamily, quant: QuantFile
+) -> bool:
+    """Whether the quant + extra files (+ mmproj, for vision) all exist."""
+
+    def complete(path: Path, size: int) -> bool:
+        return path.is_file() and path.stat().st_size == size
+
+    if not complete(find_model_file_in(settings, family, quant), quant.size_bytes):
+        return False
+    for extra in family.extra_files:
+        if not complete(find_model_file_in(settings, family, extra), extra.size_bytes):
+            return False
+    if not family.vision or not family.mmproj_filename:
+        return True
+    mmproj = find_mmproj_file_in(settings, family)
+    return mmproj is not None and complete(mmproj, family.mmproj_bytes)
+
+
+# -- llama.cpp runtime resolution ---------------------------------------------------
+def runtime_base_dir() -> Path:
+    """Per-user directory where the auto-provisioned runtime is kept."""
+    return app_data_dir() / RUNTIME_DIR_NAME
+
+
+def runtime_supported() -> bool:
+    """Whether a pinned runtime archive exists for this platform."""
+    return current_asset() is not None
+
+
+def pending_runtime_asset(settings: LocalSettings) -> RuntimeAsset | None:
+    """The runtime archive that still needs downloading (None when ready).
+
+    Ready means: a manual ``server_path`` is configured, the runtime is
+    already extracted, or the platform has no pinned archive (manual-only).
+    """
+    if resolve_server_path(settings):
+        return None
+    return current_asset()
+
+
+def resolve_server_path(settings: LocalSettings) -> str:
+    """The llama-server executable: manual setting first, else the runtime.
+
+    Empty string when neither exists yet — the runtime may still be
+    auto-provisioned later by :func:`nlapt.local.runtime.ensure_runtime`.
+    """
+    manual = settings.server_path.strip()
+    if manual:
+        return manual
+    exe = find_server_exe(runtime_dir(runtime_base_dir()))
+    return str(exe) if exe is not None else ""
+
+
+def build_spec_for(
+    settings: LocalSettings, family: ModelFamily, quant: QuantFile
+) -> ServerSpec:
+    """ServerSpec for ``settings`` + a catalog selection (found files used)."""
+    mmproj = find_mmproj_file_in(settings, family)
+    return ServerSpec(
+        server_path=resolve_server_path(settings),
+        model_path=str(find_model_file_in(settings, family, quant)),
+        port=settings.port,
+        mmproj_path=str(mmproj) if mmproj is not None else "",
+        context_length=settings.context_length,
+        gpu_layers=settings.gpu_layers,
+        threads=settings.threads,
+        parallel=settings.parallel,
+    )
+
+
+# -- launch-time spec finalization ---------------------------------------------------
+# Resolved 自动 GPU layer counts per (model_path, context_length). The cache
+# keeps every caller launching an IDENTICAL spec (free VRAM fluctuates between
+# probes; a changing value would make manager.ensure() restart the server
+# mid-batch) and avoids re-running nvidia-smi per request.
+# ponytail: cache lives for the process; restart the app after a big VRAM
+# change (e.g. closing a game) to re-probe.
+_AUTO_LAYERS_CACHE: dict[tuple[str, int], int] = {}
+_AUTO_LAYERS_LOCK = threading.Lock()
+
+
+def _auto_gpu_layers_for(
+    spec: ServerSpec, family: ModelFamily, quant: QuantFile
+) -> int:
+    # KV cache scales with the TOTAL context the server allocates
+    # (per-slot 上下文长度 × parallel slots, see server.total_context).
+    context = spec.context_length * spec.parallel
+    key = (spec.model_path, context)
+    with _AUTO_LAYERS_LOCK:
+        cached = _AUTO_LAYERS_CACHE.get(key)
+        if cached is not None:
+            return cached
+        hardware = detect_hardware()
+        block_count = read_block_count(Path(spec.model_path))
+        layers = auto_gpu_layers(
+            family,
+            quant,
+            hardware,
+            context_length=context,
+            block_count=block_count,
+        )
+        _AUTO_LAYERS_CACHE[key] = layers
+        _LOGGER.info(
+            "auto GPU layers for %s: -ngl %d (blocks=%s, total ctx=%d)",
+            Path(spec.model_path).name,
+            layers,
+            block_count,
+            context,
+        )
+        return layers
+
+
+def prepare_launch_spec(
+    spec: ServerSpec, family: ModelFamily, quant: QuantFile
+) -> ServerSpec:
+    """Blocking pre-launch finalization (call on a worker thread).
+
+    Provisions the pinned runtime when no llama-server is set, and resolves
+    自动 GPU layers (-1) into a count that actually fits the detected
+    hardware — blindly passing "offload everything" OOM-crashed llama-server
+    on GPUs where the advisor itself predicted partial offload.
+    """
+    if not spec.server_path:
+        spec = _dc_replace(
+            spec, server_path=str(ensure_runtime(runtime_base_dir()))
+        )
+    if spec.gpu_layers < 0:
+        spec = _dc_replace(
+            spec, gpu_layers=_auto_gpu_layers_for(spec, family, quant)
+        )
+    return spec
+
+
+# -- local inference target + captioner --------------------------------------------
+@dataclass(frozen=True)
+class LocalTarget:
+    """A validated, launchable local-model selection."""
+
+    family: ModelFamily
+    quant: QuantFile
+    spec: ServerSpec  # server_path may be "" until the runtime is ensured
+
+
+def resolve_local_target(
+    settings: LocalSettings | None = None, *, require_vision: bool = True
+) -> LocalTarget:
+    """The local model 推理 would use right now, or a typed actionable error.
+
+    Raises :class:`LocalInferenceError` when no model is selected /
+    downloaded / vision-capable, and :class:`LocalServerError` (from the
+    runtime module) when the platform needs a manual llama-server pick.
+    """
+    resolved = (
+        settings if settings is not None else load_local_settings(local_settings_path())
+    )
+    if not resolved.family_id or not resolved.quant_label:
+        raise LocalInferenceError(MSG_NO_MODEL_SELECTED)
+    try:
+        family = find_family(resolved.family_id)
+        quant = find_quant(family, resolved.quant_label)
+    except NLaptError as exc:
+        raise LocalInferenceError(MSG_NO_MODEL_SELECTED) from exc
+    if require_vision and not family.vision:
+        raise LocalInferenceError(MSG_NOT_VISION)
+    if not is_downloaded_in(resolved, family, quant):
+        raise LocalInferenceError(MSG_NOT_DOWNLOADED)
+    spec = build_spec_for(resolved, family, quant)
+    # Florence runs in-process — no llama-server / pinned runtime involved.
+    if (
+        family.engine != ENGINE_FLORENCE
+        and not spec.server_path
+        and not runtime_supported()
+    ):
+        raise LocalInferenceError(MSG_PLATFORM_UNSUPPORTED)
+    return LocalTarget(family=family, quant=quant, spec=spec)
+
+
+# -- Florence engine (in-process, PROCESS-wide like the server manager) -------------
+_FLORENCE_ENGINE: FlorenceEngine | None = None
+_FLORENCE_KEY: tuple[tuple[str, str], ...] = ()
+_FLORENCE_LOCK = threading.Lock()
+
+
+def florence_files_for(
+    settings: LocalSettings, family: ModelFamily, quant: QuantFile
+) -> dict[str, Path]:
+    """basename -> found local path for a Florence family's file set."""
+    files = {Path(quant.filename).name: find_model_file_in(settings, family, quant)}
+    for extra in family.extra_files:
+        files[Path(extra.filename).name] = find_model_file_in(settings, family, extra)
+    return files
+
+
+def get_florence_engine(files: dict[str, Path]) -> FlorenceEngine:
+    """Process-wide Florence engine for ``files`` (replaced when they change).
+
+    Keeping one engine alive between requests is the Florence version of
+    加载一次,推理全部 — sessions stay in memory until the file set changes
+    or the process exits.
+    """
+    global _FLORENCE_ENGINE, _FLORENCE_KEY
+    key = tuple(sorted((name, str(path)) for name, path in files.items()))
+    with _FLORENCE_LOCK:
+        if _FLORENCE_ENGINE is None or _FLORENCE_KEY != key:
+            _FLORENCE_ENGINE = FlorenceEngine(files)
+            _FLORENCE_KEY = key
+        return _FLORENCE_ENGINE
+
+
+def make_local_vision_captioner(
+    *, image_max_edge: int
+) -> Callable[[Path, str, str], str]:
+    """A ``(image_path, system, user_prompt) -> caption`` callable on the
+    CURRENT local settings, validating them now (typed errors, see
+    :func:`resolve_local_target`).
+
+    The callable blocks (runtime provisioning + server ensure + HTTP
+    round-trip) — run it on the worker pool. ``ensure`` reuses a running
+    server with the same spec, so consecutive calls never reload the model.
+
+    Florence families skip the server entirely: the ONNX engine runs
+    in-process, steered by the persisted 指令 (``settings.florence_task``);
+    the system/user prompts do not apply to it.
+
+    Caption specialists with official presets (:mod:`nlapt.local.presets`)
+    replace the passed prompts with the persisted preset's system/user pair
+    unless the user opted into 自定义 (``PRESET_CUSTOM``).
+    """
+    target = resolve_local_target()
+    family = target.family
+    settings = load_local_settings(local_settings_path())
+
+    if family.engine == ENGINE_FLORENCE:
+        engine = get_florence_engine(
+            florence_files_for(settings, family, target.quant)
+        )
+        task = settings.florence_task
+
+        def florence_caption(image_path: Path, system: str, user_prompt: str) -> str:
+            return engine.caption(image_path, task)
+
+        return florence_caption
+
+    preset = resolve_preset(family.family_id, settings.prompt_preset)
+
+    def caption(image_path: Path, system: str, user_prompt: str) -> str:
+        if preset is not None:
+            system = preset.system
+            user_prompt = preset.user_prompt
+        spec = prepare_launch_spec(target.spec, target.family, target.quant)
+        url = get_server_manager().ensure(spec)
+        profile = LLMProfile(
+            name=LOCAL_VISION_PROFILE_NAME,
+            api_type=LOCAL_VISION_API_TYPE,
+            base_url=url,
+            api_key="",
+            text_model=family.family_id,
+            vision_model=family.family_id,
+        )
+        client = create_client(profile)
+        image = prepare_image(image_path, max_edge=image_max_edge)
+        request = LLMRequest(
+            messages=(LLMMessage(role="user", text=user_prompt, images=(image,)),),
+            model=family.family_id,
+            system=system,
+            temperature=profile.temperature,
+            max_tokens=profile.max_tokens,
+            timeout=LOCAL_VISION_TIMEOUT_SECONDS,
+        )
+        return ensure_not_refusal(clean_llm_output(client.complete(request).text))
+
+    return caption
 
 
 class LocalBridge(QObject):
@@ -125,8 +534,13 @@ class LocalBridge(QObject):
         self._manager = manager if manager is not None else get_server_manager()
         self._settings = load_local_settings(self._settings_path)
         self._hardware: HardwareInfo | None = None
-        self._cancel_event: threading.Event | None = None
-        self._downloading = False
+        # Downloads are process-wide (they outlive the dialog that started
+        # them): forward the hub's signals so THIS bridge's listeners see the
+        # progress of a download any bridge started. Qt drops the connection
+        # automatically when this bridge is destroyed.
+        hub = get_download_hub()
+        hub.progress.connect(self.download_progress)
+        hub.finished.connect(self.download_finished)
 
     # -- settings ----------------------------------------------------------------------
     @property
@@ -141,22 +555,11 @@ class LocalBridge(QObject):
 
     def models_dir(self) -> Path:
         """Primary (download) directory: user override or the in-app default."""
-        configured = self._settings.models_dir.strip()
-        if configured:
-            return Path(configured)
-        return default_models_dir()
+        return models_dir_for(self._settings)
 
     def models_dirs(self) -> tuple[Path, ...]:
         """Primary dir + the extra reuse dirs (order kept, deduplicated)."""
-        dirs: list[Path] = [self.models_dir()]
-        for raw in self._settings.extra_dirs:
-            text = raw.strip()
-            if not text:
-                continue
-            candidate = Path(text)
-            if candidate not in dirs:
-                dirs.append(candidate)
-        return tuple(dirs)
+        return search_dirs(self._settings)
 
     # -- files -------------------------------------------------------------------------
     # File checks are deliberately synchronous: a few ``stat`` calls on
@@ -172,39 +575,15 @@ class LocalBridge(QObject):
 
     def find_model_file(self, family: ModelFamily, quant: QuantFile) -> Path:
         """An existing right-size copy in ANY dir, else the primary path."""
-        for base in self.models_dirs():
-            candidate = quant_path(base, family, quant)
-            if candidate.is_file() and candidate.stat().st_size == quant.size_bytes:
-                return candidate
-        return self.model_file(family, quant)
+        return find_model_file_in(self._settings, family, quant)
 
     def find_mmproj_file(self, family: ModelFamily) -> Path | None:
         """An existing right-size mmproj in ANY dir, else the primary path."""
-        if not family.vision or not family.mmproj_filename:
-            return None
-        for base in self.models_dirs():
-            candidate = mmproj_path(base, family)
-            if (
-                candidate is not None
-                and candidate.is_file()
-                and candidate.stat().st_size == family.mmproj_bytes
-            ):
-                return candidate
-        return self.mmproj_file(family)
+        return find_mmproj_file_in(self._settings, family)
 
     def is_downloaded(self, family: ModelFamily, quant: QuantFile) -> bool:
         """Whether a complete quant (and mmproj, for vision) exists in any dir."""
-        model = self.find_model_file(family, quant)
-        if not model.is_file() or model.stat().st_size != quant.size_bytes:
-            return False
-        if not family.vision or not family.mmproj_filename:
-            return True
-        mmproj = self.find_mmproj_file(family)
-        return (
-            mmproj is not None
-            and mmproj.is_file()
-            and mmproj.stat().st_size == family.mmproj_bytes
-        )
+        return is_downloaded_in(self._settings, family, quant)
 
     # -- hardware ----------------------------------------------------------------------
     @property
@@ -226,11 +605,24 @@ class LocalBridge(QObject):
 
     # -- downloads ---------------------------------------------------------------------
     def is_downloading(self) -> bool:
-        return self._downloading
+        """Whether ANY download is running process-wide (not just ours)."""
+        return active_download() is not None
+
+    def active_download(self) -> tuple[str, str, int, int | None] | None:
+        """Snapshot of the running download for UI re-attach (module state)."""
+        return active_download()
 
     def start_download(self, family_id: str, quant_label: str) -> bool:
-        """Download the quant + mmproj (resumable). False when already busy."""
-        if self._downloading:
+        """Download the quant + mmproj (resumable). False when already busy.
+
+        就绪即可用: when no llama-server is available yet (no manual path, no
+        extracted runtime) the pinned llama.cpp runtime is fetched in the
+        same run, so a finished download means the model can be inferred
+        immediately. One download runs at a time PROCESS-wide; progress and
+        completion are broadcast through the download hub so every open
+        dialog (including ones opened later) sees them.
+        """
+        if self.is_downloading():
             return False
         family = find_family(family_id)
         quant = find_quant(family, quant_label)
@@ -261,57 +653,86 @@ class LocalBridge(QObject):
                     quant.sha256,
                 )
             )
-        if not jobs:
+        for extra in family.extra_files:
+            if not complete(
+                find_model_file_in(self._settings, family, extra), extra.size_bytes
+            ):
+                jobs.append(
+                    (
+                        download_url(family.repo_id, extra.filename),
+                        quant_path(self.models_dir(), family, extra),
+                        extra.size_bytes,
+                        extra.sha256,
+                    )
+                )
+        # Florence needs no llama-server, so never provision the runtime for it.
+        runtime_asset = (
+            None
+            if family.engine == ENGINE_FLORENCE
+            else pending_runtime_asset(self._settings)
+        )
+        if not jobs and runtime_asset is None:
             # Everything already available (possibly from a reuse dir).
             self.download_finished.emit(family_id, quant_label, DOWNLOAD_OK, "")
             return True
         total_bytes = sum(expected for _url, _dest, expected, _sha in jobs)
-        dest_keys = tuple(str(dest) for _url, dest, _expected, _sha in jobs)
+        if runtime_asset is not None:
+            total_bytes += runtime_asset.size_bytes
+        cancel = threading.Event()
+        global _ACTIVE_TASK
         with _ACTIVE_LOCK:
             # A download started from a previous (now closed) dialog may still
-            # be writing these files — refuse to race it.
-            if any(key in _ACTIVE_DOWNLOAD_PATHS for key in dest_keys):
+            # be running — refuse to race it (the UI re-attaches instead).
+            if _ACTIVE_TASK is not None:
                 return False
-            _ACTIVE_DOWNLOAD_PATHS.update(dest_keys)
-        cancel = threading.Event()
-        self._cancel_event = cancel
-        self._downloading = True
-        bridge = self
+            _ACTIVE_TASK = _ActiveDownload(
+                family_id=family_id,
+                quant_label=quant_label,
+                cancel=cancel,
+                done=0,
+                total=total_bytes,
+            )
+        hub = get_download_hub()
 
         def work() -> str:
             finished_prefix = 0
             last_emitted = -PROGRESS_EMIT_STEP_BYTES
+
+            def report(done: int, _total: int | None, *, base: int) -> None:
+                nonlocal last_emitted
+                global _ACTIVE_TASK
+                overall = base + done
+                # Keep the re-attach snapshot fresh even between emits.
+                with _ACTIVE_LOCK:
+                    if _ACTIVE_TASK is not None:
+                        _ACTIVE_TASK = _dc_replace(_ACTIVE_TASK, done=overall)
+                if (
+                    overall - last_emitted < PROGRESS_EMIT_STEP_BYTES
+                    and overall != total_bytes
+                ):
+                    return
+                last_emitted = overall
+                # Worker-thread emit on the always-alive hub; Qt queues the
+                # delivery to every connected bridge on the GUI thread.
+                hub.progress.emit(family_id, quant_label, overall, total_bytes)
+
             try:
+                if runtime_asset is not None:
+                    ensure_runtime(
+                        runtime_base_dir(),
+                        progress=lambda done, _t: report(done, None, base=0),
+                        cancel=cancel,
+                    )
+                    finished_prefix = runtime_asset.size_bytes
                 for url, dest, expected, sha256 in jobs:
-
-                    def report(
-                        done: int, _total: int | None, *, base: int = finished_prefix
-                    ) -> None:
-                        nonlocal last_emitted
-                        overall = base + done
-                        if (
-                            overall - last_emitted < PROGRESS_EMIT_STEP_BYTES
-                            and overall != total_bytes
-                        ):
-                            return
-                        last_emitted = overall
-                        # Worker-thread emit: _alive() alone is racy against a
-                        # GUI-thread teardown, so a stale-object RuntimeError
-                        # is swallowed as well (progress is best-effort).
-                        try:
-                            if _alive(bridge):
-                                bridge.download_progress.emit(
-                                    family_id, quant_label, overall, total_bytes
-                                )
-                        except RuntimeError:
-                            _LOGGER.debug("progress emit after bridge teardown")
-
                     download_file(
                         url,
                         dest,
                         expected_bytes=expected,
                         expected_sha256=sha256 or None,
-                        progress=report,
+                        progress=lambda done, _t, *, b=finished_prefix: report(
+                            done, None, base=b
+                        ),
                         cancel=cancel,
                     )
                     finished_prefix += expected
@@ -320,18 +741,16 @@ class LocalBridge(QObject):
             return DOWNLOAD_OK
 
         def finish(status: str, message: str) -> None:
+            global _ACTIVE_TASK
             with _ACTIVE_LOCK:
-                _ACTIVE_DOWNLOAD_PATHS.difference_update(dest_keys)
-            self._downloading = False
-            self._cancel_event = None
+                _ACTIVE_TASK = None
             if status == DOWNLOAD_ERROR:
                 _LOGGER.warning(
                     "download failed for %s/%s: %s", family_id, quant_label, message
                 )
             elif status == DOWNLOAD_CANCELLED:
                 _LOGGER.info("download cancelled for %s/%s", family_id, quant_label)
-            if _alive(self):
-                self.download_finished.emit(family_id, quant_label, status, message)
+            hub.finished.emit(family_id, quant_label, status, message)
 
         run_async(
             self._pool,
@@ -342,10 +761,15 @@ class LocalBridge(QObject):
         return True
 
     def cancel_download(self) -> None:
-        """Signal the running download to stop (partial files are kept)."""
-        event = self._cancel_event
-        if event is not None:
-            event.set()
+        """Signal the running download to stop (partial files are kept).
+
+        Works from ANY bridge — a dialog reopened mid-download can cancel
+        the task its predecessor started.
+        """
+        with _ACTIVE_LOCK:
+            task = _ACTIVE_TASK
+        if task is not None:
+            task.cancel.set()
 
     # -- server ------------------------------------------------------------------------
     def server_running(self) -> bool:
@@ -357,28 +781,28 @@ class LocalBridge(QObject):
     def build_server_spec(self, family: ModelFamily, quant: QuantFile) -> ServerSpec:
         """ServerSpec for the current settings + a catalog selection.
 
-        Uses the FOUND files, so a model reused from an extra directory is
-        served from where it actually lives.
+        Uses the FOUND files (a model reused from an extra directory is
+        served from where it actually lives) and the RESOLVED llama-server
+        (manual setting first, else the auto-provisioned runtime).
         """
-        settings = self._settings
-        mmproj = self.find_mmproj_file(family)
-        return ServerSpec(
-            server_path=settings.server_path,
-            model_path=str(self.find_model_file(family, quant)),
-            port=settings.port,
-            mmproj_path=str(mmproj) if mmproj is not None else "",
-            context_length=settings.context_length,
-            gpu_layers=settings.gpu_layers,
-            threads=settings.threads,
-            parallel=settings.parallel,
-        )
+        return build_spec_for(self._settings, family, quant)
 
     def start_server(self, family_id: str, quant_label: str) -> None:
-        """Async llama-server start; progress via ``server_changed``."""
+        """Async llama-server start; progress via ``server_changed``.
+
+        When no llama-server executable is available yet, the pinned
+        llama.cpp runtime is downloaded and extracted first (on the pool);
+        自动 GPU layers resolve to a hardware-fitting count — both via
+        :func:`prepare_launch_spec`, so 启动本地服务 and the inference
+        captioner launch identical specs (``ensure`` keeps reusing one).
+        """
         family = find_family(family_id)
         quant = find_quant(family, quant_label)
         spec = self.build_server_spec(family, quant)
         self.server_changed.emit(SERVER_STARTING, "")
+
+        def work() -> str:
+            return self._manager.start(prepare_launch_spec(spec, family, quant))
 
         def done(url: object) -> None:
             if _alive(self):
@@ -389,12 +813,7 @@ class LocalBridge(QObject):
             if _alive(self):
                 self.server_changed.emit(SERVER_ERROR, message)
 
-        run_async(
-            self._pool,
-            lambda: self._manager.start(spec),
-            on_done=done,
-            on_error=failed,
-        )
+        run_async(self._pool, work, on_done=done, on_error=failed)
 
     def stop_server(self) -> None:
         """Async llama-server stop; emits ``server_changed('stopped', '')``."""

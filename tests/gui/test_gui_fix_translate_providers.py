@@ -176,6 +176,34 @@ class TestBridgeWebRequest:
             bridge.request("0002.png", "少女")
         assert blocker.args == ["0002.png", "少女", "a girl", True]
 
+    def test_google_transient_failure_is_retried(
+        self, qtbot, unconfigured_controller
+    ) -> None:
+        """Web providers get spec-8 retries (they have none internally)."""
+        calls: list[int] = []
+
+        def flaky(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            if len(calls) == 1:
+                return httpx.Response(500, text="boom")
+            return httpx.Response(
+                200, json=[[["a girl", "少女", None, None]], None, "zh-CN"]
+            )
+
+        sleeps: list[float] = []
+        bridge = TranslateBridge(
+            unconfigured_controller,
+            config=TranslationConfig(provider="google"),
+            transport=httpx.MockTransport(flaky),
+            retry_sleep=sleeps.append,
+        )
+        with qtbot.waitSignal(bridge.segment_ready, timeout=2000) as blocker:
+            bridge.request("0001.png", "少女")
+        assert blocker.args[2] == "a girl"
+        assert blocker.args[3] is True
+        assert len(calls) == 2  # failed once, then retried
+        assert sleeps  # backoff waited through the injected sleep only
+
     def test_baidu_unconfigured_emits_note(
         self, qtbot, unconfigured_controller
     ) -> None:

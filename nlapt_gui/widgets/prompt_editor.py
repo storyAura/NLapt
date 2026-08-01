@@ -18,6 +18,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QHBoxLayout,
@@ -43,12 +44,16 @@ _LOGGER = get_logger(__name__)
 
 # -- exact UI strings --------------------------------------------------------------
 NOTE_SHARED = (
-    "提示词全局共用:无论使用在线 API 还是本地模型,"
-    "图片推理(重译)都会使用这里的系统 / 用户提示词。"
+    "提示词默认统一管线:在线 LLM 与本地模型的图片推理都使用这里的"
+    "系统 / 用户提示词;取消下方勾选后可为本地推理单独设置一套。"
 )
 LABEL_TEMPLATE = "推理提示词模板"
 LABEL_SYSTEM = "系统提示词(推理图片前发送,默认留空)"
 LABEL_USER = "用户提示词(留空使用内置指令)"
+LABEL_LOCAL_UNIFIED = "本地推理共用上方提示词(统一管线)"
+LABEL_LOCAL_SYSTEM = "本地推理 · 系统提示词"
+LABEL_LOCAL_USER = "本地推理 · 用户提示词(留空使用内置指令)"
+LOCAL_EDIT_MIN_H = 60
 BUTTON_NEW = "新建自定义"
 BUTTON_SAVE_TEMPLATE = "保存模板"
 BUTTON_DELETE = "删除"
@@ -124,6 +129,21 @@ class PromptsTab(QWidget):
         self.user_edit.setMinimumHeight(USER_EDIT_MIN_H)
         column.addWidget(self.user_edit)
 
+        # 本地推理: unified by default, optional separate prompt pair.
+        self.local_unified_box = QCheckBox(LABEL_LOCAL_UNIFIED, self)
+        self.local_unified_box.toggled.connect(self._sync_local_visibility)
+        column.addWidget(self.local_unified_box)
+        self.local_system_label = self._muted_label(LABEL_LOCAL_SYSTEM)
+        column.addWidget(self.local_system_label)
+        self.local_system_edit = QPlainTextEdit(self)
+        self.local_system_edit.setMinimumHeight(LOCAL_EDIT_MIN_H)
+        column.addWidget(self.local_system_edit)
+        self.local_user_label = self._muted_label(LABEL_LOCAL_USER)
+        column.addWidget(self.local_user_label)
+        self.local_user_edit = QPlainTextEdit(self)
+        self.local_user_edit.setMinimumHeight(LOCAL_EDIT_MIN_H)
+        column.addWidget(self.local_user_edit)
+
         exports = QHBoxLayout()
         exports.setSpacing(6)
         self.export_current_button = self._button(BUTTON_EXPORT_CURRENT, self._on_export_current)
@@ -135,6 +155,21 @@ class PromptsTab(QWidget):
 
         self._reload_names(select=self._prompts.active)
         self.user_edit.setPlainText(self._prompts.user_prompt)
+        self.local_unified_box.setChecked(self._prompts.local_unified)
+        self.local_system_edit.setPlainText(self._prompts.local_system)
+        self.local_user_edit.setPlainText(self._prompts.local_user_prompt)
+        self._sync_local_visibility()
+
+    def _sync_local_visibility(self, *_args: object) -> None:
+        """Show the local prompt editors only when 统一管线 is off."""
+        separate = not self.local_unified_box.isChecked()
+        for widget in (
+            self.local_system_label,
+            self.local_system_edit,
+            self.local_user_label,
+            self.local_user_edit,
+        ):
+            widget.setVisible(separate)
 
     # -- helpers ------------------------------------------------------------------------
     def _muted_label(self, text: str) -> QLabel:
@@ -166,6 +201,9 @@ class PromptsTab(QWidget):
             active=active if active == DEFAULT_PROMPT_NAME or active in prompts else DEFAULT_PROMPT_NAME,
             prompts=prompts,
             user_prompt=self.user_edit.toPlainText(),
+            local_unified=self.local_unified_box.isChecked(),
+            local_system=self.local_system_edit.toPlainText(),
+            local_user_prompt=self.local_user_edit.toPlainText(),
         )
 
     def _persist(self, prompts: VisionPrompts) -> bool:

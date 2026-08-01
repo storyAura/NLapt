@@ -193,3 +193,32 @@ class TestCurrentPrompts:
         snapshot = tab.current_prompts()
         assert snapshot.prompts["动漫"] == "edited"
         assert snapshot.active == "动漫"
+
+
+class TestLocalPromptSection:
+    def test_unified_by_default_hides_local_editors(self, qtbot) -> None:
+        tab = make_tab(qtbot)
+        assert tab.local_unified_box.isChecked()
+        assert not tab.local_system_edit.isVisibleTo(tab)
+        assert not tab.local_user_edit.isVisibleTo(tab)
+
+    def test_unchecking_reveals_and_captures_local_prompts(self, qtbot) -> None:
+        tab = make_tab(qtbot)
+        tab.local_unified_box.setChecked(False)
+        assert tab.local_system_edit.isVisibleTo(tab)
+        tab.local_system_edit.setPlainText("loc-sys")
+        tab.local_user_edit.setPlainText("loc-user")
+        snapshot = tab.current_prompts()
+        assert snapshot.local_unified is False
+        assert snapshot.local_system == "loc-sys"
+        assert snapshot.local_user_prompt == "loc-user"
+
+    def test_prefill_restores_local_fields(self, qtbot) -> None:
+        prompts = VisionPrompts(
+            local_unified=False, local_system="a", local_user_prompt="b"
+        )
+        tab = make_tab(qtbot, prompts)
+        assert not tab.local_unified_box.isChecked()
+        assert tab.local_system_edit.toPlainText() == "a"
+        assert tab.local_user_edit.toPlainText() == "b"
+        assert tab.local_system_edit.isVisibleTo(tab)

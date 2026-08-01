@@ -30,6 +30,13 @@ CHAT_COMPLETIONS_ENDPOINT = "/chat/completions"
 AUTHORIZATION_HEADER = "Authorization"
 BEARER_PREFIX = "Bearer "
 SYSTEM_ROLE = "system"
+# Providers flag safety interception here; the content (if any) is a
+# sanitized replacement, not the caption that was asked for.
+FINISH_REASON_CONTENT_FILTER = "content_filter"
+MSG_CONTENT_FILTERED = (
+    "请求被服务商内容安全拦截(finish_reason=content_filter),"
+    "可重试或调整提示词/图片"
+)
 
 
 def _image_part(image: bytes) -> dict[str, Any]:
@@ -54,9 +61,22 @@ def _message_payload(request: LLMRequest) -> list[dict[str, Any]]:
 
 def _extract_text(data: dict[str, Any]) -> str:
     try:
-        choices = data["choices"]
-        content = choices[0]["message"]["content"]
+        choice = data["choices"][0]
     except (KeyError, IndexError, TypeError) as exc:
+        raise LLMRequestError(
+            f"{PROVIDER_NAME} response missing choices[0].message.content"
+        ) from exc
+    # Check the interception flag BEFORE the content: a filtered choice often
+    # carries a null/replaced message that would otherwise raise a generic
+    # parse error and hide the real cause.
+    if (
+        isinstance(choice, dict)
+        and choice.get("finish_reason") == FINISH_REASON_CONTENT_FILTER
+    ):
+        raise LLMRequestError(MSG_CONTENT_FILTERED)
+    try:
+        content = choice["message"]["content"]
+    except (KeyError, TypeError) as exc:
         raise LLMRequestError(
             f"{PROVIDER_NAME} response missing choices[0].message.content"
         ) from exc

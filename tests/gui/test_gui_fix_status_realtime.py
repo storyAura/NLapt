@@ -141,7 +141,7 @@ class TestSaveStateIndicator:
             raise StorageError("disk full")
 
         monkeypatch.setattr(controller.app, "save", boom)
-        with qtbot.waitSignal(controller.save_state_changed, timeout=2000) as blocker:
+        with qtbot.waitSignal(controller.save_state_changed, timeout=2000):
             controller.save_current()
         # first emission is "saving"; wait until the failure lands
         qtbot.waitUntil(lambda: bar.save_state_text() == SAVE_STATE_FAILED, timeout=2000)
@@ -160,3 +160,19 @@ class TestFilePanelUnsavedIndicator:
             controller.set_current(K1)
             controller.save_current()
         assert not panel.unsaved_label.isVisibleTo(panel)
+
+
+class TestBatchProgressLabel:
+    """v1.7: the status bar surfaces live 推标 progress."""
+
+    def test_progress_shows_and_finish_hides(self, qtbot, controller) -> None:
+        from nlapt_gui.widgets.status_bar import StatusBar
+
+        bar = StatusBar(controller)
+        qtbot.addWidget(bar)
+        assert not bar.batch_label.isVisibleTo(bar)
+        controller.batch_progress.emit("推标(LLM) · 2 张", 1, 2)
+        assert bar.batch_label.isVisibleTo(bar)
+        assert bar.batch_label.text() == "推标(LLM) · 2 张 1/2"
+        controller.batch_finished.emit("推标(LLM) · 2 张", None)
+        assert not bar.batch_label.isVisibleTo(bar)

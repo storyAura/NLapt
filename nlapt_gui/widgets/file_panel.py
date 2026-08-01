@@ -3,9 +3,17 @@
 Faithful to the CaptionForge design: header (folder icon, dataset name,
 mono path, refresh/open buttons), search input, view segmented control,
 全选/已选/清除 row, collapsible folder groups with a reflowing thumbnail
-grid or list rows, empty state and the footer stat line. All state flows
-through :class:`AppController`; the only outward signal is
-``open_folder_requested`` (the main window opens the directory dialog).
+grid or list rows, empty state and the footer stat line.
+
+文件夹多选 + 推标: every folder header carries a tri-state checkbox that
+selects the whole folder, an ALL row above the groups selects everything,
+and right-clicking opens the 推标 menu scoped to the click target — an
+image cell (这张图片, or 已选 + 全部 when it is part of a multi-selection),
+a folder header (此文件夹 / 此文件夹未标注 / 全部), or the ALL row and the
+根目录 group (全部 / 全部未标注 only). All state
+flows through :class:`AppController`; outward signals are
+``open_folder_requested`` and ``infer_requested(keys, engine)`` (the main
+window routes the latter into the vision bridge's batch entry point).
 """
 
 from __future__ import annotations
@@ -15,6 +23,7 @@ import math
 from PySide6.QtCore import (
     Property,
     QEasingCurve,
+    QPoint,
     QPropertyAnimation,
     QRectF,
     Qt,
@@ -27,6 +36,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMenu,
     QPushButton,
     QScrollArea,
     QVBoxLayout,
@@ -35,8 +45,10 @@ from PySide6.QtWidgets import (
 
 from nlapt.diagnostics import get_logger
 
-from nlapt_gui.controller import AppController
+from nlapt_gui.controller import FOLDER_ROOT_LABEL, AppController
+from nlapt_gui.prompt_store import ENGINE_LLM, ENGINE_LOCAL
 from nlapt_gui.theme.tokens import ThemeTokens
+from nlapt_gui.widgets.dialogs import ask_confirm
 from nlapt_gui.widgets.thumb_cells import (
     ListRow,
     ThumbCell,
@@ -81,6 +93,37 @@ COUNT_FMT = "{n} 张"
 COUNT_FILTERED_FMT = "{k}/{n} 张"
 VIEW_TIPS = {"list": "详细列表", "mid": "中图网格", "big": "大图网格"}
 _VIEW_ICONS = {"list": "view_list", "mid": "view_mid", "big": "view_big"}
+
+# ALL row + folder checkbox + 推标 context menu strings.
+TEXT_ALL_ROW = "ALL"
+TIP_FOLDER_CHECK = "选中 / 取消选中整个文件夹"
+TIP_ALL_CHECK = "选中 / 取消选中全部文件"
+MENU_INFER_FOLDER_LLM = "用 LLM 推理此文件夹({n} 张)"
+MENU_INFER_FOLDER_LOCAL = "用本地模型推理此文件夹({n} 张)"
+MENU_INFER_SELECTED_LLM = "用 LLM 推理已选({n} 张)"
+MENU_INFER_SELECTED_LOCAL = "用本地模型推理已选({n} 张)"
+MENU_INFER_ALL_LLM = "用 LLM 推理全部({n} 张)"
+MENU_INFER_ALL_LOCAL = "用本地模型推理全部({n} 张)"
+MENU_INFER_IMAGE_LLM = "用 LLM 推理这张图片"
+MENU_INFER_IMAGE_LOCAL = "用本地模型推理这张图片"
+MENU_INFER_FOLDER_UNLABELED_LLM = "用 LLM 推理此文件夹未标注({n} 张)"
+MENU_INFER_FOLDER_UNLABELED_LOCAL = "用本地模型推理此文件夹未标注({n} 张)"
+MENU_INFER_ALL_UNLABELED_LLM = "用 LLM 推理全部未标注({n} 张)"
+MENU_INFER_ALL_UNLABELED_LOCAL = "用本地模型推理全部未标注({n} 张)"
+MENU_CANCEL_INFER = "取消当前推标"
+CONFIRM_INFER_TITLE = "批量推标"
+CONFIRM_INFER_TEXT = (
+    "将用{word}为 {n} 张图片重新生成标注,覆盖现有内容。\n"
+    "执行前会自动备份,完成后可在 历史记录 面板整批回滚。"
+)
+ENGINE_CONFIRM_WORDS = {ENGINE_LLM: " LLM ", ENGINE_LOCAL: "本地模型"}
+
+# Selection coverage -> Qt check state (folder checkbox + ALL row).
+_COVERAGE_STATES = {
+    "all": Qt.CheckState.Checked,
+    "some": Qt.CheckState.PartiallyChecked,
+    "none": Qt.CheckState.Unchecked,
+}
 
 
 class _Arrow(QWidget):
@@ -176,9 +219,23 @@ class _FolderGroup(QWidget):
         self.header = QPushButton(self)
         self.header.setFixedHeight(GROUP_HEADER_H)
         self.header.setCursor(Qt.CursorShape.PointingHandCursor)
+        # Right-click a folder header -> the 推标 (batch caption) menu.
+        self.header.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.header.customContextMenuRequested.connect(
+            lambda pos: panel.show_infer_menu(self.folder, self.header, pos)
+        )
         header_lay = QHBoxLayout(self.header)
         header_lay.setContentsMargins(6, 0, 6, 0)
         header_lay.setSpacing(7)
+        # Folder multi-select checkbox (checkbox clicks never toggle collapse:
+        # the checkbox consumes its own mouse events).
+        self.check = QCheckBox(self.header)
+        self.check.setToolTip(TIP_FOLDER_CHECK)
+        self.check.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.check.clicked.connect(
+            lambda _checked: panel._on_folder_check_clicked(self.folder)
+        )
+        header_lay.addWidget(self.check)
         self.arrow = _Arrow(open_, panel, self.header)
         header_lay.addWidget(self.arrow)
         self._icon = QLabel(self.header)
@@ -211,6 +268,12 @@ class _FolderGroup(QWidget):
     def is_open(self) -> bool:
         return self._open
 
+    def set_check_state(self, coverage: str) -> None:
+        """Reflect the folder's selection coverage ('all'|'some'|'none')."""
+        self.check.blockSignals(True)
+        self.check.setCheckState(_COVERAGE_STATES[coverage])
+        self.check.blockSignals(False)
+
     def refresh_icon(self) -> None:
         tokens = self._panel.current_tokens()
         self._icon.setPixmap(make_icon("folder", tokens.text2, 13).pixmap(13, 13))
@@ -240,10 +303,51 @@ class _FolderGroup(QWidget):
         self._anim = anim
 
 
+class _AllRow(QWidget):
+    """The ALL row above the folder groups: select-everything checkbox.
+
+    Mirrors a folder header (checkbox + bold name + count) but covers the
+    whole dataset; right-click opens the 推标 menu scoped to 全部/全部未标注.
+    """
+
+    def __init__(self, panel: "FilePanel", parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._panel = panel
+        self.setFixedHeight(GROUP_HEADER_H)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(
+            lambda pos: panel.show_infer_menu(None, self, pos)
+        )
+        row = QHBoxLayout(self)
+        row.setContentsMargins(6, 0, 6, 0)
+        row.setSpacing(7)
+        self.check = QCheckBox(self)
+        self.check.setToolTip(TIP_ALL_CHECK)
+        self.check.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.check.clicked.connect(lambda _c: panel._on_all_row_clicked())
+        row.addWidget(self.check)
+        self.name_label = QLabel(TEXT_ALL_ROW, self)
+        self.name_label.setFont(ui_font(12, QFont.Weight.DemiBold))
+        row.addWidget(self.name_label, 1)
+        self.count_label = QLabel("", self)
+        self.count_label.setFont(mono_font(10))
+        self.count_label.setProperty("muted", True)
+        row.addWidget(self.count_label)
+
+    def refresh(self, coverage: str, total: int) -> None:
+        self.check.blockSignals(True)
+        self.check.setCheckState(_COVERAGE_STATES[coverage])
+        self.check.blockSignals(False)
+        self.count_label.setText(COUNT_FMT.format(n=total))
+        self.setVisible(total > 0)
+
+
 class FilePanel(QFrame):
     """The design's 文件列表 column, 300px wide, driven by AppController."""
 
     open_folder_requested = Signal()
+    # Batch 推标 request: (keys tuple, engine "llm"|"local").
+    infer_requested = Signal(object, str)
 
     def __init__(
         self,
@@ -371,6 +475,9 @@ class FilePanel(QFrame):
         self._groups_lay = QVBoxLayout(self._groups_host)
         self._groups_lay.setContentsMargins(12, 0, 12, 10)
         self._groups_lay.setSpacing(4)
+        # ALL row on top of the folders (select everything / 推标全部).
+        self.all_row = _AllRow(self, self._groups_host)
+        self._groups_lay.addWidget(self.all_row)
         self.empty_label = QLabel(TEXT_NO_MATCH, self._groups_host)
         self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.empty_label.setFont(ui_font(12))
@@ -489,6 +596,117 @@ class FilePanel(QFrame):
         else:
             self._controller.clear_selection()
 
+    def _on_all_row_clicked(self) -> None:
+        """ALL row checkbox: partial/none -> select everything; full -> clear."""
+        controller = self._controller
+        if len(controller.selected_keys()) == len(controller.keys()):
+            controller.clear_selection()
+        else:
+            controller.select_all()
+
+    def _on_folder_check_clicked(self, folder: str) -> None:
+        """Folder checkbox: partial/none -> select the folder; full -> clear it."""
+        state = self._controller.folder_selection_state(folder)
+        self._controller.set_folder_selected(folder, state != "all")
+
+    # -- 推标 context menu ---------------------------------------------------------------
+    def infer_menu_actions(
+        self, folder: str | None, image: str | None = None
+    ) -> list[tuple[str, object]]:
+        """(label, callable) entries for the 推标 menu (also the test seam).
+
+        Scoped to the right-click target: an image cell (``image``), a
+        folder header (``folder``), or the ALL row / 根目录 group (neither).
+        已选 entries only appear on a multi-selected image cell; 文件夹
+        entries only on non-root folder headers.
+        """
+        controller = self._controller
+        if controller.batch_running():
+            return [(MENU_CANCEL_INFER, controller.cancel_batch)]
+
+        def pair(
+            llm_label: str, local_label: str, keys: tuple[str, ...]
+        ) -> list[tuple[str, object]]:
+            n = len(keys)
+            return [
+                (llm_label.format(n=n), lambda: self._request_infer(keys, ENGINE_LLM)),
+                (local_label.format(n=n), lambda: self._request_infer(keys, ENGINE_LOCAL)),
+            ]
+
+        actions: list[tuple[str, object]] = []
+        if image is not None:
+            selected = controller.selected_keys()
+            if image in selected and len(selected) > 1:
+                actions += pair(MENU_INFER_SELECTED_LLM, MENU_INFER_SELECTED_LOCAL, selected)
+                actions += pair(MENU_INFER_ALL_LLM, MENU_INFER_ALL_LOCAL, controller.keys())
+            else:
+                actions += pair(MENU_INFER_IMAGE_LLM, MENU_INFER_IMAGE_LOCAL, (image,))
+            return actions
+
+        if folder is not None and folder != FOLDER_ROOT_LABEL:
+            keys = controller.folder_keys(folder)
+            if keys:
+                actions += pair(MENU_INFER_FOLDER_LLM, MENU_INFER_FOLDER_LOCAL, keys)
+                unlabeled = controller.unlabeled_keys(keys)
+                if unlabeled:
+                    actions += pair(
+                        MENU_INFER_FOLDER_UNLABELED_LLM,
+                        MENU_INFER_FOLDER_UNLABELED_LOCAL,
+                        unlabeled,
+                    )
+            every = controller.keys()
+            if every:
+                actions += pair(MENU_INFER_ALL_LLM, MENU_INFER_ALL_LOCAL, every)
+            return actions
+
+        every = controller.keys()
+        if every:
+            actions += pair(MENU_INFER_ALL_LLM, MENU_INFER_ALL_LOCAL, every)
+            unlabeled = controller.unlabeled_keys(every)
+            if unlabeled:
+                actions += pair(
+                    MENU_INFER_ALL_UNLABELED_LLM, MENU_INFER_ALL_UNLABELED_LOCAL, unlabeled
+                )
+        return actions
+
+    def show_infer_menu(
+        self, folder: str | None, widget: QWidget, pos: QPoint, image: str | None = None
+    ) -> None:
+        """Popup the 推标 menu for an image cell / folder header / the ALL row."""
+        actions = self.infer_menu_actions(folder, image)
+        if not actions:
+            return
+        menu = QMenu(self)
+        menu.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        previous_scope: object = None
+        for index, (label, handler) in enumerate(actions):
+            # Visual grouping: separator whenever the scope wording changes
+            # (spaces stripped so the LLM / 本地模型 variants pair up).
+            scope = (
+                label.split("(", 1)[0]
+                .replace("LLM", "")
+                .replace("本地模型", "")
+                .replace(" ", "")
+            )
+            if index and scope != previous_scope:
+                menu.addSeparator()
+            previous_scope = scope
+            menu.addAction(label).triggered.connect(
+                lambda _checked=False, run=handler: run()
+            )
+        menu.popup(widget.mapToGlobal(pos))
+
+    def _request_infer(self, keys: tuple[str, ...], engine: str) -> None:
+        """Confirm (captions get overwritten) then hand off to the bridge."""
+        word = ENGINE_CONFIRM_WORDS.get(engine, engine)
+        if not ask_confirm(
+            self.window(),
+            CONFIRM_INFER_TITLE,
+            CONFIRM_INFER_TEXT.format(word=word, n=len(keys)),
+        ):
+            return
+        self.infer_requested.emit(tuple(keys), engine)
+
     def _toggle_folder(self, group: _FolderGroup) -> None:
         open_ = not group.is_open
         group.set_open(open_, animate=True)
@@ -515,6 +733,10 @@ class FilePanel(QFrame):
         self.select_all_box.blockSignals(True)
         self.select_all_box.setChecked(total > 0 and selected == total)
         self.select_all_box.blockSignals(False)
+        coverage = "all" if total and selected == total else "some" if selected else "none"
+        self.all_row.refresh(coverage, total)
+        for group in self._groups:
+            group.set_check_state(controller.folder_selection_state(group.folder))
         self.stat_label.setText(controller.stat_line())
         self._refresh_unsaved_indicator()
 
@@ -552,7 +774,8 @@ class FilePanel(QFrame):
         filtering = bool(controller.filter_text.strip())
         visible_set = set(controller.filtered_keys())
         view_mode = controller.view_mode
-        insert_at = 0
+        # Groups go right below the ALL row (which stays first forever).
+        insert_at = self._groups_lay.indexOf(self.all_row) + 1
         total_visible = 0
         for folder in controller.folders():
             folder_keys = [k for k in controller.keys() if controller.folder_of(k) == folder]
@@ -567,6 +790,7 @@ class FilePanel(QFrame):
             content = self._build_group_content(visible, view_mode)
             open_ = bool(self._controller.settings.folder_open.get(folder, True))
             group = _FolderGroup(self, folder, count_text, content, open_)
+            group.set_check_state(controller.folder_selection_state(folder))
             self._groups_lay.insertWidget(insert_at, group)
             self._groups.append(group)
             insert_at += 1
@@ -581,6 +805,7 @@ class FilePanel(QFrame):
             for key in keys:
                 row = ListRow(key, self._controller, self._loader, self.current_tokens)
                 self._cells[key] = row
+                self._attach_cell_menu(row, key)
                 lay.addWidget(row)
             return host
         min_w = BIG_THUMB_MIN if view_mode == "big" else self._controller.settings.thumb_min
@@ -588,8 +813,16 @@ class FilePanel(QFrame):
         for key in keys:
             cell = ThumbCell(key, self._controller, self._loader, self.current_tokens)
             self._cells[key] = cell
+            self._attach_cell_menu(cell, key)
             cells.append(cell)
         return _ThumbGrid(cells, min_w)
+
+    def _attach_cell_menu(self, cell: QWidget, key: str) -> None:
+        """Right-clicking an image cell opens the 推标 menu scoped to it."""
+        cell.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        cell.customContextMenuRequested.connect(
+            lambda pos, w=cell, k=key: self.show_infer_menu(None, w, pos, image=k)
+        )
 
     # -- test/integration helpers ---------------------------------------------------------
     def cell(self, key: str) -> QWidget | None:

@@ -264,7 +264,7 @@ class TestDownloadFlow:
         assert not tab.download_button.isEnabled()
 
     def test_download_click_runs_to_finish(
-        self, qtbot, tab_controller, tab_toasts, monkeypatch
+        self, qtbot, tab_controller, tab_toasts, monkeypatch, tmp_path
     ) -> None:
         def fake_download(url, dest, *, expected_bytes=None, progress=None, cancel=None, **kw):  # noqa: ANN001, ANN003
             if progress is not None:
@@ -272,6 +272,11 @@ class TestDownloadFlow:
             return dest
 
         monkeypatch.setattr("nlapt_gui.local_bridge.download_file", fake_download)
+        # The runtime auto-provision job must stay hermetic in tests.
+        monkeypatch.setattr(
+            "nlapt_gui.local_bridge.ensure_runtime",
+            lambda base_dir, **kw: tmp_path / "llama-server.exe",
+        )
         tab = make_tab(qtbot, tab_controller)
         tab.tree.setCurrentItem(quant_item(tab, "toriigate-0.5", "Q4_K_M"))
         with qtbot.waitSignal(tab.bridge.download_finished, timeout=2000):
@@ -279,6 +284,88 @@ class TestDownloadFlow:
         qtbot.waitUntil(lambda: not tab.progress.isVisible(), timeout=2000)
         assert any("已就绪" in text for text, _ in tab_toasts)
         assert tab.download_button.text() != "取消下载"
+
+    def test_reopened_tab_reattaches_to_running_download(
+        self, qtbot, tab_controller, monkeypatch
+    ) -> None:
+        """关闭再打开设置页,下载进度条与取消按钮必须接回来."""
+        import threading
+
+        from nlapt.core.errors import DownloadCancelledError
+
+        from nlapt_gui.local_bridge import DOWNLOAD_CANCELLED
+
+        started = threading.Event()
+
+        def blocking_download(url, dest, *, expected_bytes=None, progress=None, cancel=None, **kw):  # noqa: ANN001, ANN003
+            if progress is not None:
+                progress(1, None)
+            started.set()
+            assert cancel.wait(timeout=5)
+            raise DownloadCancelledError("下载已取消")
+
+        monkeypatch.setattr("nlapt_gui.local_bridge.download_file", blocking_download)
+        starter = LocalBridge(manager=FakeManager())
+        starter.update_settings(
+            server_path="srv.exe",  # keep the runtime provision job out
+            family_id="toriigate-0.5",
+            quant_label="Q4_K_M",
+        )
+        assert starter.start_download("toriigate-0.5", "Q4_K_M")
+        assert started.wait(timeout=2)
+        # The dialog was closed and reopened: the NEW tab (fresh bridge)
+        # re-attaches — live progress bar, button in 取消下载 mode.
+        tab = make_tab(qtbot, tab_controller)
+        assert tab.progress.isVisibleTo(tab)
+        assert tab.download_button.text() == "取消下载"
+        assert tab.download_button.isEnabled()
+        with qtbot.waitSignal(tab.bridge.download_finished, timeout=2000) as blocker:
+            tab.download_button.click()  # cancels the predecessor's task
+        assert blocker.args[2] == DOWNLOAD_CANCELLED
+        qtbot.waitUntil(lambda: not tab.progress.isVisibleTo(tab), timeout=2000)
+
+
+class TestPromptPresets:
+    """提示词预设 combo: shown for caption specialists, persisted round-trip."""
+
+    def test_preset_row_shown_for_joycaption_with_official_entries(
+        self, qtbot, tab_controller
+    ) -> None:
+        tab = make_tab(qtbot, tab_controller)
+        tab.tree.setCurrentItem(quant_item(tab, "joycaption-beta-one", "Q4_K"))
+        assert tab.preset_combo.isVisibleTo(tab)
+        data = [tab.preset_combo.itemData(i) for i in range(tab.preset_combo.count())]
+        assert "Descriptive" in data
+        assert "Danbooru tag list" in data
+        assert "custom" in data  # 自定义 opt-out is always the last entry
+        # Default = the family's first official preset, not 自定义.
+        assert tab.preset_combo.currentData() == "Descriptive"
+
+    def test_preset_row_populates_for_toriigate(self, qtbot, tab_controller) -> None:
+        tab = make_tab(qtbot, tab_controller)
+        tab.tree.setCurrentItem(quant_item(tab, "toriigate-0.5", "Q4_K_M"))
+        assert tab.preset_combo.isVisibleTo(tab)
+        data = [tab.preset_combo.itemData(i) for i in range(tab.preset_combo.count())]
+        assert "long" in data
+        assert "json" in data
+
+    def test_preset_row_hidden_for_generic_models(self, qtbot, tab_controller) -> None:
+        tab = make_tab(qtbot, tab_controller)
+        tab.tree.setCurrentItem(quant_item(tab, "gemma4-12b", "Q4_K_M"))
+        assert not tab.preset_combo.isVisibleTo(tab)
+
+    def test_persist_and_prefill_round_trip(self, qtbot, tab_controller) -> None:
+        tab = make_tab(qtbot, tab_controller)
+        tab.tree.setCurrentItem(quant_item(tab, "joycaption-beta-one", "Q4_K"))
+        index = tab.preset_combo.findData("Danbooru tag list")
+        assert index >= 0
+        tab.preset_combo.setCurrentIndex(index)
+        tab.persist()
+        stored = load_local_settings(app_data_dir() / "local_llm.json")
+        assert stored.prompt_preset == "Danbooru tag list"
+        # A reopened dialog restores the persisted choice for that family.
+        reopened = make_tab(qtbot, tab_controller)
+        assert reopened.preset_combo.currentData() == "Danbooru tag list"
 
 
 class TestApplyProfile:
@@ -327,13 +414,43 @@ class TestApplyProfile:
 
 
 class TestServerFlow:
-    def test_server_requires_server_path(
-        self, qtbot, tab_controller, tab_toasts
+    def test_server_requires_server_path_only_without_runtime(
+        self, qtbot, tab_controller, tab_toasts, monkeypatch
     ) -> None:
+        # Platforms with no pinned runtime still demand a manual pick.
+        monkeypatch.setattr(
+            "nlapt_gui.widgets.local_tab.runtime_supported", lambda: False
+        )
         tab = make_tab(qtbot, tab_controller)
         tab.tree.setCurrentItem(quant_item(tab, "toriigate-0.5", "Q4_K_M"))
         tab.server_button.click()
         assert any("llama-server" in text for text, _ in tab_toasts)
+
+    def test_server_with_runtime_skips_manual_path_guard(
+        self, qtbot, tab_controller, tab_toasts, monkeypatch
+    ) -> None:
+        # 就绪即可用: with a pinned runtime the empty path is fine and the
+        # next guard (download check) is the one that speaks.
+        monkeypatch.setattr(
+            "nlapt_gui.widgets.local_tab.runtime_supported", lambda: True
+        )
+        tab = make_tab(qtbot, tab_controller)
+        tab.tree.setCurrentItem(quant_item(tab, "toriigate-0.5", "Q4_K_M"))
+        tab.server_button.click()
+        assert any("尚未下载" in text for text, _ in tab_toasts)
+        assert not any("请先选择 llama-server" in text for text, _ in tab_toasts)
+
+    def test_auto_placeholder_when_runtime_supported(
+        self, qtbot, tab_controller
+    ) -> None:
+        from nlapt.local.runtime import current_asset
+
+        from nlapt_gui.widgets.local_tab import SERVER_PATH_AUTO_PLACEHOLDER
+
+        if current_asset() is None:
+            pytest.skip("no pinned runtime for this platform")
+        tab = make_tab(qtbot, tab_controller)
+        assert tab.server_path_edit.placeholderText() == SERVER_PATH_AUTO_PLACEHOLDER
 
     def test_server_requires_download(
         self, qtbot, tab_controller, tab_toasts
@@ -352,6 +469,7 @@ class TestServerFlow:
         tab = make_tab(qtbot, tab_controller, bridge=bridge)
         monkeypatch.setattr(bridge, "is_downloaded", lambda family, quant: True)
         tab.server_path_edit.setText("C:/llama/llama-server.exe")
+        tab.gpu_layers_spin.setValue(9)  # 自动 (-1) would probe real hardware
         tab.tree.setCurrentItem(quant_item(tab, "toriigate-0.5", "Q4_K_M"))
         tab.server_button.click()
         qtbot.waitUntil(lambda: "运行中" in tab.server_status.text(), timeout=2000)
@@ -368,9 +486,90 @@ class TestServerFlow:
         tab = make_tab(qtbot, tab_controller, bridge=bridge)
         monkeypatch.setattr(bridge, "is_downloaded", lambda family, quant: True)
         tab.server_path_edit.setText("C:/llama/llama-server.exe")
+        tab.gpu_layers_spin.setValue(9)  # 自动 (-1) would probe real hardware
         tab.tree.setCurrentItem(quant_item(tab, "toriigate-0.5", "Q4_K_M"))
         tab.server_button.click()
         qtbot.waitUntil(
             lambda: any("启动失败" in text for text, _ in tab_toasts), timeout=2000
         )
         assert tab.server_button.isEnabled()
+
+
+class TestParallelAwareEstimates:
+    """v1.7: KV memory scales with 上下文长度 × 并发 (per-slot semantics)."""
+
+    def test_parallel_change_recomputes_verdicts(self, qtbot, tab_controller) -> None:
+        tab = make_tab(qtbot, tab_controller)
+        tab._on_hardware_ready(BIG_RIG)
+        item = quant_item(tab, "toriigate-0.5", "Q4_K_M")
+        before = item.text(3)
+        tab.parallel_spin.setValue(16)  # 16x the KV budget
+        assert item.text(3) != "未检测"
+        assert before  # grade stays populated after the recompute
+
+    def test_estimate_context_multiplies(self, qtbot, tab_controller) -> None:
+        tab = make_tab(qtbot, tab_controller)
+        tab.context_spin.setValue(4096)
+        tab.parallel_spin.setValue(4)
+        assert tab._estimate_context() == 16384
+
+
+class TestFlorenceTaskUI:
+    """The Florence-only 指令模式 row + engine-aware button states."""
+
+    FLOR = "florence2-promptgen-v2"
+
+    def test_task_row_toggles_with_selection(self, qtbot, tab_controller) -> None:
+        tab = make_tab(qtbot, tab_controller)
+        assert not tab._form.isRowVisible(tab.florence_task_combo)
+        tab.tree.setCurrentItem(quant_item(tab, self.FLOR, "ONNX"))
+        assert tab._form.isRowVisible(tab.florence_task_combo)
+        assert not tab.server_button.isEnabled()
+        assert not tab.apply_button.isEnabled()
+        tab.tree.setCurrentItem(quant_item(tab, "toriigate-0.5", "Q4_K_M"))
+        assert not tab._form.isRowVisible(tab.florence_task_combo)
+        assert tab.server_button.isEnabled()
+
+    def test_combo_lists_all_instructions(self, qtbot, tab_controller) -> None:
+        from nlapt.local.florence import FLORENCE_TASK_TOKENS
+
+        tab = make_tab(qtbot, tab_controller)
+        tokens = [
+            tab.florence_task_combo.itemData(i)
+            for i in range(tab.florence_task_combo.count())
+        ]
+        assert tokens == list(FLORENCE_TASK_TOKENS)
+
+    def test_task_persists_and_prefills(self, qtbot, tab_controller) -> None:
+        from nlapt.local.florence import TASK_MIXED_CAPTION
+
+        tab = make_tab(qtbot, tab_controller)
+        tab.tree.setCurrentItem(quant_item(tab, self.FLOR, "ONNX"))
+        index = tab.florence_task_combo.findData(TASK_MIXED_CAPTION)
+        tab.florence_task_combo.setCurrentIndex(index)
+        tab.persist()
+        stored = load_local_settings(app_data_dir() / "local_llm.json")
+        assert stored.florence_task == TASK_MIXED_CAPTION
+        fresh = make_tab(qtbot, tab_controller)
+        assert fresh.florence_task_combo.currentData() == TASK_MIXED_CAPTION
+
+    def test_size_column_shows_total_of_all_files(
+        self, qtbot, tab_controller
+    ) -> None:
+        from nlapt.local.catalog import find_family
+        from nlapt.local.hardware import format_bytes
+
+        tab = make_tab(qtbot, tab_controller)
+        family = find_family(self.FLOR)
+        total = family.quants[0].size_bytes + sum(
+            extra.size_bytes for extra in family.extra_files
+        )
+        assert quant_item(tab, self.FLOR, "ONNX").text(1) == format_bytes(total)
+
+    def test_server_click_explains_no_server_needed(
+        self, qtbot, tab_controller, tab_toasts
+    ) -> None:
+        tab = make_tab(qtbot, tab_controller)
+        tab.tree.setCurrentItem(quant_item(tab, self.FLOR, "ONNX"))
+        tab._on_server_clicked()  # the button itself is disabled
+        assert any("免启动服务" in text for text, _ in tab_toasts)

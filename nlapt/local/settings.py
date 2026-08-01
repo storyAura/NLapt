@@ -19,6 +19,7 @@ from pathlib import Path
 
 from nlapt.core.errors import StorageError
 from nlapt.diagnostics import get_logger
+from nlapt.local.florence import DEFAULT_FLORENCE_TASK, FLORENCE_TASK_TOKENS
 from nlapt.storage.atomic import atomic_write_text
 
 _LOGGER = get_logger(__name__)
@@ -51,10 +52,21 @@ class LocalSettings:
     parallel: int = DEFAULT_PARALLEL
     family_id: str = ""  # last selected catalog family
     quant_label: str = ""  # last selected quant label
+    # Instruction (指令) used by Florence-2 PromptGen families.
+    florence_task: str = DEFAULT_FLORENCE_TASK
+    # Official prompt preset id for caption-specialist GGUF families
+    # (nlapt.local.presets). "" = the family's default preset; the
+    # PRESET_CUSTOM sentinel opts out into the free-form 推理提示词.
+    prompt_preset: str = ""
 
     def with_changes(self, **changes: object) -> LocalSettings:
         """Return a copy with the given fields replaced (immutable update)."""
         return replace(self, **changes)  # type: ignore[arg-type]
+
+
+def _valid_task(value: object) -> str:
+    """Coerce a stored Florence 指令 to a known token; fall back to default."""
+    return value if value in FLORENCE_TASK_TOKENS else DEFAULT_FLORENCE_TASK
 
 
 def _clamp(value: object, default: int, bounds: tuple[int, int]) -> int:
@@ -110,6 +122,8 @@ def load_local_settings(path: Path) -> LocalSettings:
         ),
         family_id=str(raw.get("family_id", "")),
         quant_label=str(raw.get("quant_label", "")),
+        florence_task=_valid_task(raw.get("florence_task", DEFAULT_FLORENCE_TASK)),
+        prompt_preset=str(raw.get("prompt_preset", "")),
     )
 
 

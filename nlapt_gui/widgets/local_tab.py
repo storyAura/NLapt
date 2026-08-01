@@ -24,6 +24,7 @@ from dataclasses import replace as _dc_replace
 from PySide6.QtCore import Qt, QThreadPool, QUrl
 from PySide6.QtGui import QDesktopServices, QShowEvent
 from PySide6.QtWidgets import (
+    QComboBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -46,6 +47,7 @@ from nlapt.diagnostics import get_logger
 from nlapt.local.advisor import RunAssessment, RunGrade, assess, estimate_memory
 from nlapt.local.catalog import (
     CATALOG_SNAPSHOT_DATE,
+    ENGINE_FLORENCE,
     ModelFamily,
     QuantFile,
     all_series,
@@ -54,7 +56,9 @@ from nlapt.local.catalog import (
     find_quant,
     repo_page_url,
 )
+from nlapt.local.florence import FLORENCE_TASK_LABELS
 from nlapt.local.hardware import HardwareInfo, format_bytes
+from nlapt.local.presets import PRESET_CUSTOM, presets_for
 from nlapt.local.server import base_url as local_base_url
 from nlapt.local.settings import (
     CONTEXT_RANGE,
@@ -63,6 +67,8 @@ from nlapt.local.settings import (
     PORT_RANGE,
     THREADS_RANGE,
 )
+
+from nlapt.local.runtime import LLAMA_CPP_TAG
 
 from nlapt_gui.controller import AppController, TOAST_ERR, TOAST_OK, TOAST_WARN
 from nlapt_gui.local_bridge import (
@@ -73,6 +79,7 @@ from nlapt_gui.local_bridge import (
     SERVER_STARTING,
     LocalBridge,
     default_models_dir,
+    runtime_supported,
 )
 from nlapt_gui.resources import config_path
 
@@ -110,7 +117,7 @@ TAG_VISION = "视觉"
 TAG_RECOMMENDED = "★ 推荐"
 CATALOG_HINT = (
     f"目录快照 {CATALOG_SNAPSHOT_DATE} · 热度为 HuggingFace 月下载量 · "
-    "「能否运行」依据本机硬件与右侧上下文长度估算"
+    "「能否运行」依据本机硬件与右侧 上下文长度 × 并发请求数 估算"
 )
 DETAIL_EMPTY = "在左侧展开一个系列,选择具体量化档查看评估与操作"
 DETAIL_LINE = (
@@ -148,6 +155,7 @@ SERVER_STATUS_STARTING = "正在启动服务(首次加载较慢)…"
 SERVER_STATUS_RUNNING = "服务运行中:{url}"
 LABEL_MODELS_DIR = "下载目录"
 LABEL_SERVER_PATH = "llama-server"
+SERVER_PATH_AUTO_PLACEHOLDER = f"自动(内置 llama.cpp {LLAMA_CPP_TAG},首次使用自动下载)"
 BTN_BROWSE = "浏览…"
 LABEL_CONTEXT = "上下文长度"
 LABEL_GPU_LAYERS = "GPU 层数"
@@ -156,14 +164,29 @@ LABEL_PARALLEL = "并发请求数"
 LABEL_PORT = "端口"
 SPECIAL_GPU_AUTO = "自动(全部)"
 SPECIAL_THREADS_AUTO = "自动"
+LABEL_FLORENCE_TASK = "指令模式"
+TIP_FLORENCE_TASK = (
+    "Florence-2 PromptGen 由内置指令驱动(不使用推理提示词):"
+    "选择输出标签、各级标题或构图分析"
+)
+LABEL_PROMPT_PRESET = "提示词预设"
+PRESET_CUSTOM_LABEL = "自定义(使用推理提示词)"
+TIP_PROMPT_PRESET = (
+    "该模型按官方固定指令训练,使用预设可获得稳定输出;"
+    "选择「自定义」则沿用 设置 ▸ 提示词 里的推理提示词"
+)
+TIP_FLORENCE_NO_SERVER = "该模型免启动服务 — 推理时自动加载,无需 llama-server"
+TIP_FLORENCE_NO_APPLY = "该模型仅用于图片打标,不能作为翻译 / 重写的当前模型"
 LABEL_EXTRA_DIRS = "复用目录(也在这些目录中查找已下载的模型)"
 BTN_ADD_DIR = "添加"
 BTN_REMOVE_DIR = "移除"
 CAPTION_PICK_EXTRA_DIR = "选择复用模型目录"
 SERVER_HINT = (
-    "本地服务基于 llama.cpp 的 llama-server:请从其 GitHub Releases 下载对应"
-    "平台的压缩包,解压后在上方选择 llama-server 可执行文件。"
-    "「设为当前模型」会把翻译 / 重译切到本地模型。"
+    "本地服务基于 llama.cpp 的 llama-server:程序自带完整推理能力,"
+    "首次下载模型 / 启动服务时会自动获取官方运行时(上方留空即用自动版本,"
+    "也可手动指定可执行文件)。模型就绪后,编辑区与文件夹右键的「本地推理」"
+    "可直接使用;「设为当前模型」额外把翻译 / 重译也切到本地模型。"
+    "Florence-2 PromptGen 模型例外:免服务、免运行时,按「指令模式」直接打标。"
 )
 TOAST_SELECT_QUANT = "请先在列表中选择一个量化档"
 TOAST_DOWNLOAD_BUSY = "已有下载任务正在进行"
@@ -303,8 +326,25 @@ class LocalTab(QWidget):
         self.port_spin = QSpinBox(self)
         self.port_spin.setRange(*PORT_RANGE)
 
+        self.florence_task_combo = QComboBox(self)
+        for token, label in FLORENCE_TASK_LABELS.items():
+            self.florence_task_combo.addItem(label, token)
+        self.florence_task_combo.setToolTip(TIP_FLORENCE_TASK)
+
+        # 提示词预设 row: only shown for caption specialists with official
+        # presets (JoyCaption / ToriiGate); populated per selected family.
+        self.preset_combo = QComboBox(self)
+        self.preset_combo.setToolTip(TIP_PROMPT_PRESET)
+        self._preset_family_id = ""
+
         form = QFormLayout()
         form.setVerticalSpacing(6)
+        # 指令模式 row: only meaningful (and only shown) for Florence models.
+        form.addRow(LABEL_FLORENCE_TASK, self.florence_task_combo)
+        form.addRow(LABEL_PROMPT_PRESET, self.preset_combo)
+        self._form = form
+        form.setRowVisible(self.florence_task_combo, False)
+        form.setRowVisible(self.preset_combo, False)
         form.addRow(LABEL_MODELS_DIR, models_dir_row)
         form.addRow(LABEL_SERVER_PATH, server_path_row)
         form.addRow(LABEL_CONTEXT, self.context_spin)
@@ -386,6 +426,7 @@ class LocalTab(QWidget):
                 family_item.setData(0, ROLE_FAMILY, family.family_id)
                 self._embolden(family_item, 0)
                 series_item.addChild(family_item)
+                extras_bytes = sum(extra.size_bytes for extra in family.extra_files)
                 for quant in family.quants:
                     label = quant.label
                     if quant.recommended:
@@ -393,7 +434,7 @@ class LocalTab(QWidget):
                     quant_item = QTreeWidgetItem(
                         [
                             label,
-                            format_bytes(quant.size_bytes),
+                            format_bytes(quant.size_bytes + extras_bytes),
                             "",
                             GRADE_TEXT[RunGrade.UNKNOWN],
                         ]
@@ -415,6 +456,8 @@ class LocalTab(QWidget):
         self.detect_button.clicked.connect(self.refresh_hardware)
         self.tree.currentItemChanged.connect(self._on_selection_changed)
         self.context_spin.valueChanged.connect(self._refresh_verdicts)
+        # KV memory scales with ctx × parallel (per-slot context semantics).
+        self.parallel_spin.valueChanged.connect(self._refresh_verdicts)
         self.download_button.clicked.connect(self._on_download_clicked)
         self.page_button.clicked.connect(self._on_page_clicked)
         self.server_button.clicked.connect(self._on_server_clicked)
@@ -434,7 +477,12 @@ class LocalTab(QWidget):
         self.models_dir_edit.setText(settings.models_dir)
         self.models_dir_edit.setPlaceholderText(str(default_models_dir()))
         self.server_path_edit.setText(settings.server_path)
+        if runtime_supported():
+            self.server_path_edit.setPlaceholderText(SERVER_PATH_AUTO_PLACEHOLDER)
         self.extra_dirs_list.addItems(list(settings.extra_dirs))
+        task_index = self.florence_task_combo.findData(settings.florence_task)
+        if task_index >= 0:
+            self.florence_task_combo.setCurrentIndex(task_index)
         self.context_spin.setValue(settings.context_length)
         self.gpu_layers_spin.setValue(settings.gpu_layers)
         self.threads_spin.setValue(settings.threads)
@@ -448,6 +496,16 @@ class LocalTab(QWidget):
             self.server_status.setText(
                 SERVER_STATUS_RUNNING.format(url=self.bridge.server_base_url())
             )
+        active = self.bridge.active_download()
+        if active is not None:
+            # Re-attach to a download started before this tab existed: show
+            # the live progress bar at its current position; the hub keeps
+            # feeding _on_download_progress, and _refresh_selection_ui turns
+            # the button into 取消下载 via is_downloading().
+            family_id, quant_label, done, total = active
+            self._select_quant_item(family_id, quant_label)
+            self.progress.setVisible(True)
+            self._on_download_progress(family_id, quant_label, done, total)
 
     def _select_quant_item(self, family_id: str, quant_label: str) -> None:
         for item in self._quant_items():
@@ -491,6 +549,8 @@ class LocalTab(QWidget):
                 port=self.port_spin.value(),
                 family_id=selection[0].family_id if selection else "",
                 quant_label=selection[1].label if selection else "",
+                florence_task=self.florence_task_combo.currentData(),
+                prompt_preset=self._current_preset_choice(),
             )
         except NLaptError as exc:
             _LOGGER.exception("could not persist local settings")
@@ -527,9 +587,13 @@ class LocalTab(QWidget):
         return tuple(items)
 
     # -- grades ------------------------------------------------------------------------
+    def _estimate_context(self) -> int:
+        """Context the server will actually allocate: per-slot ctx × slots."""
+        return self.context_spin.value() * max(1, self.parallel_spin.value())
+
     def _refresh_verdicts(self) -> None:
         hardware = self._hardware
-        context = self.context_spin.value()
+        context = self._estimate_context()
         for item in self._quant_items():
             family = find_family(str(item.data(0, ROLE_FAMILY)))
             quant = find_quant(family, str(item.data(0, ROLE_QUANT)))
@@ -591,10 +655,12 @@ class LocalTab(QWidget):
             self.page_button.setEnabled(False)
             self.server_button.setEnabled(self.bridge.server_running())
             self.apply_button.setEnabled(False)
+            self._form.setRowVisible(self.florence_task_combo, False)
+            self._form.setRowVisible(self.preset_combo, False)
             return
         family, quant = selection
         hardware = self._hardware
-        context = self.context_spin.value()
+        context = self._estimate_context()
         estimate = estimate_memory(family, quant, context_length=context)
         mmproj_part = (
             DETAIL_MMPROJ.format(size=format_bytes(estimate.mmproj_bytes))
@@ -636,8 +702,46 @@ class LocalTab(QWidget):
             )
             self.download_button.setEnabled(True)
         self.page_button.setEnabled(True)
-        self.server_button.setEnabled(True)
-        self.apply_button.setEnabled(downloaded)
+        is_florence = family.engine == ENGINE_FLORENCE
+        self._form.setRowVisible(self.florence_task_combo, is_florence)
+        has_presets = bool(presets_for(family.family_id))
+        self._form.setRowVisible(self.preset_combo, has_presets)
+        if has_presets:
+            self._populate_presets(family)
+        if is_florence:
+            # Florence loads in-process on demand: the server button only
+            # remains usable to STOP an already-running llama server, and
+            # 设为当前模型 (a text-LLM concern) does not apply.
+            self.server_button.setEnabled(self.bridge.server_running())
+            self.server_button.setToolTip(TIP_FLORENCE_NO_SERVER)
+            self.apply_button.setEnabled(False)
+            self.apply_button.setToolTip(TIP_FLORENCE_NO_APPLY)
+        else:
+            self.server_button.setEnabled(True)
+            self.server_button.setToolTip("")
+            self.apply_button.setEnabled(downloaded)
+            self.apply_button.setToolTip("")
+
+    # -- prompt presets ----------------------------------------------------------------
+    def _populate_presets(self, family: ModelFamily) -> None:
+        """Fill the 预设 combo for a family, restoring the persisted choice."""
+        if family.family_id == self._preset_family_id:
+            return
+        self._preset_family_id = family.family_id
+        self.preset_combo.clear()
+        for preset in presets_for(family.family_id):
+            self.preset_combo.addItem(preset.label, preset.preset_id)
+        self.preset_combo.addItem(PRESET_CUSTOM_LABEL, PRESET_CUSTOM)
+        index = self.preset_combo.findData(self.bridge.settings.prompt_preset)
+        # Unknown/empty stored ids land on the family's default (first) preset.
+        self.preset_combo.setCurrentIndex(index if index >= 0 else 0)
+
+    def _current_preset_choice(self) -> str:
+        """Combo choice when populated; otherwise keep the stored value."""
+        data = self.preset_combo.currentData()
+        if data is None:
+            return self.bridge.settings.prompt_preset
+        return str(data)
 
     # -- downloads ---------------------------------------------------------------------
     def _on_download_clicked(self) -> None:
@@ -712,8 +816,13 @@ class LocalTab(QWidget):
             self._toast(TOAST_SELECT_QUANT, TOAST_WARN)
             return
         family, quant = selection
+        if family.engine == ENGINE_FLORENCE:
+            self._toast(TIP_FLORENCE_NO_SERVER, TOAST_WARN)
+            return
         self.persist()
-        if not self.bridge.settings.server_path.strip():
+        # A manual path OR the auto-provisioned runtime works; only a
+        # platform with neither still needs a manual pick.
+        if not self.bridge.settings.server_path.strip() and not runtime_supported():
             self._toast(TOAST_NEED_SERVER_PATH, TOAST_WARN)
             return
         if not self.bridge.is_downloaded(family, quant):

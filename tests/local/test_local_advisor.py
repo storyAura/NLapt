@@ -15,6 +15,7 @@ from nlapt.local.advisor import (
     RunGrade,
     RunVerdict,
     assess,
+    auto_gpu_layers,
     estimate_memory,
 )
 from nlapt.local.catalog import ModelFamily, QuantFile
@@ -193,3 +194,112 @@ class TestGrades:
         family = make_family()
         assert assess(family, family.quants[0], hw(ram=1 * GIB)).grade is RunGrade.NO
         assert assess(family, family.quants[0], hw(ram=0)).grade is RunGrade.UNKNOWN
+
+
+class TestAutoGpuLayers:
+    """auto_gpu_layers: 自动 must fit the budget, never OOM-offload (v1.7)."""
+
+    CONTEXT = 2048
+    BLOCKS = 40
+
+    def estimate(self):
+        family = make_family()
+        return family, estimate_memory(
+            family, family.quants[0], context_length=self.CONTEXT
+        )
+
+    def test_no_gpu_means_zero_layers(self) -> None:
+        family = make_family()
+        layers = auto_gpu_layers(
+            family, family.quants[0], hw(ram=8 * 1024**3),
+            context_length=self.CONTEXT, block_count=self.BLOCKS,
+        )
+        assert layers == 0
+
+    def test_full_fit_offloads_everything(self) -> None:
+        from nlapt.local.server import GPU_LAYERS_ALL
+
+        family, estimate = self.estimate()
+        roomy = int(estimate.total_bytes / VRAM_USABLE_SHARE) + 1
+        layers = auto_gpu_layers(
+            family, family.quants[0],
+            hw(ram=8 * 1024**3, gpus=(gpu(roomy, roomy),)),
+            context_length=self.CONTEXT, block_count=self.BLOCKS,
+        )
+        assert layers == GPU_LAYERS_ALL
+
+    def test_partial_fit_matches_manual_math(self) -> None:
+        family, estimate = self.estimate()
+        free = int(estimate.total_bytes * 0.6)  # deliberately too small
+        layers = auto_gpu_layers(
+            family, family.quants[0],
+            hw(ram=8 * 1024**3, gpus=(gpu(free, free),)),
+            context_length=self.CONTEXT, block_count=self.BLOCKS,
+        )
+        budget = int(free * VRAM_USABLE_SHARE)
+        per_layer = (estimate.weights_bytes + estimate.kv_cache_bytes) / self.BLOCKS
+        expected = int(
+            (budget - estimate.mmproj_bytes - estimate.overhead_bytes) // per_layer
+        )
+        assert layers == max(0, min(expected, self.BLOCKS))
+        assert 0 < layers < self.BLOCKS
+
+    def test_tiny_budget_falls_back_to_cpu(self) -> None:
+        family, _estimate = self.estimate()
+        layers = auto_gpu_layers(
+            family, family.quants[0],
+            hw(ram=8 * 1024**3, gpus=(gpu(1024, 1024),)),  # 1 KiB VRAM
+            context_length=self.CONTEXT, block_count=self.BLOCKS,
+        )
+        assert layers == 0
+
+    def test_unknown_block_count_is_conservative(self) -> None:
+        family, estimate = self.estimate()
+        free = int(estimate.total_bytes * 0.6)
+        layers = auto_gpu_layers(
+            family, family.quants[0],
+            hw(ram=8 * 1024**3, gpus=(gpu(free, free),)),
+            context_length=self.CONTEXT, block_count=None,
+        )
+        assert layers == 0  # cannot split layers we cannot count
+
+    def test_zero_free_vram_uses_total(self) -> None:
+        from nlapt.local.server import GPU_LAYERS_ALL
+
+        family, estimate = self.estimate()
+        roomy = int(estimate.total_bytes / VRAM_USABLE_SHARE) + 1
+        layers = auto_gpu_layers(
+            family, family.quants[0],
+            hw(ram=8 * 1024**3, gpus=(gpu(roomy, 0),)),  # free unknown -> total
+            context_length=self.CONTEXT, block_count=self.BLOCKS,
+        )
+        assert layers == GPU_LAYERS_ALL
+
+
+class TestFlorenceEstimates:
+    """Florence families: fixed-shape context + extra files in the weights."""
+
+    def family(self):  # noqa: ANN201
+        from nlapt.local.catalog import find_family
+
+        return find_family("florence2-promptgen-v2")
+
+    def test_weights_include_extra_files(self) -> None:
+        family = self.family()
+        quant = family.quants[0]
+        estimate = estimate_memory(family, quant)
+        expected = quant.size_bytes + sum(e.size_bytes for e in family.extra_files)
+        assert estimate.weights_bytes == expected
+        assert estimate.mmproj_bytes == 0
+
+    def test_context_setting_does_not_apply(self) -> None:
+        from nlapt.local.advisor import FLORENCE_CONTEXT_TOKENS
+
+        family = self.family()
+        quant = family.quants[0]
+        small = estimate_memory(family, quant, context_length=512)
+        huge = estimate_memory(family, quant, context_length=131_072)
+        assert small == huge
+        assert small.kv_cache_bytes == (
+            family.kv_bytes_per_token * FLORENCE_CONTEXT_TOKENS
+        )

@@ -245,6 +245,20 @@ QCheckBox::indicator:checked {{
     border-color: {t.accent};
 }}
 
+/* ---------- progress bars ---------- */
+QProgressBar {{
+    background: {t.surface2};
+    border: 1px solid {t.bd};
+    border-radius: 4px;
+    color: {t.text2};
+    font-size: 10.5px;
+    text-align: center;
+}}
+QProgressBar::chunk {{
+    background: {t.accent};
+    border-radius: 3px;
+}}
+
 /* ---------- scrollbars ---------- */
 QScrollBar:vertical {{
     background: transparent;

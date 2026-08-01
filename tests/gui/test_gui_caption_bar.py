@@ -1,17 +1,21 @@
-"""Tests for nlapt_gui.widgets.caption_bar (标注工作区 翻译/重译/删除)."""
+"""Tests for nlapt_gui.widgets.caption_bar (翻译 / LLM 推理 / 本地推理 / 删除)."""
 
 from __future__ import annotations
 
 from PySide6.QtCore import QObject, Signal
 
 import nlapt_gui.widgets.caption_bar as caption_bar_module
+from nlapt_gui.prompt_store import ENGINE_LLM, ENGINE_LOCAL
 from nlapt_gui.widgets.caption_bar import (
-    BAR_REINFER,
-    BAR_REINFER_BUSY,
+    BAR_INFER_BUSY,
+    BAR_INFER_LLM,
+    BAR_INFER_LOCAL,
     CONFIRM_DELETE_TITLE,
-    LABEL_REINFERRED,
+    LABEL_INFERRED_LLM,
+    LABEL_INFERRED_LOCAL,
     TOAST_DELETED,
     TOAST_EMPTY_CAPTION,
+    TOAST_LOCAL_UNCONFIGURED,
     TOAST_TRANSLATE_UNCONFIGURED,
     TOAST_VISION_UNCONFIGURED,
     CaptionBar,
@@ -38,20 +42,20 @@ class StubTranslateBridge(QObject):
 
 
 class StubVisionBridge(QObject):
-    """Duck-typed VisionBridge (request + caption_ready)."""
+    """Duck-typed VisionBridge (request(key, engine) + caption_ready)."""
 
     caption_ready = Signal(str, str, bool)
 
     def __init__(self, *, configured: bool = True) -> None:
         super().__init__()
         self._configured = configured
-        self.requests: list[str] = []
+        self.requests: list[tuple[str, str]] = []
 
-    def configured(self) -> bool:
+    def configured(self, engine: str = ENGINE_LLM) -> bool:
         return self._configured
 
-    def request(self, key: str) -> None:
-        self.requests.append(key)
+    def request(self, key: str, engine: str = ENGINE_LLM) -> None:
+        self.requests.append((key, engine))
 
 
 def make_bar(
@@ -136,26 +140,43 @@ class TestTranslate:
 
 
 class TestReinfer:
-    def test_request_flow_and_busy_state(self, qtbot, controller) -> None:
+    def test_llm_request_flow_and_busy_state(self, qtbot, controller) -> None:
         vision = StubVisionBridge()
         bar = make_bar(qtbot, controller, vision=vision)
         bar.reinfer_btn.click()
-        assert vision.requests == [KEY]
-        assert bar.reinfer_btn.text() == BAR_REINFER_BUSY
+        assert vision.requests == [(KEY, ENGINE_LLM)]
+        assert bar.reinfer_btn.text() == BAR_INFER_BUSY
         assert not bar.reinfer_btn.isEnabled()
+        assert not bar.local_infer_btn.isEnabled()  # one inference at a time
         vision.caption_ready.emit(KEY, "new caption", True)
-        assert bar.reinfer_btn.text() == BAR_REINFER
+        assert bar.reinfer_btn.text() == BAR_INFER_LLM
         assert bar.reinfer_btn.isEnabled()
+        assert bar.local_infer_btn.isEnabled()
         assert bar.preview.is_active()
         bar.preview.apply_requested.emit()
         assert controller.record(KEY).text == "new caption"
-        assert controller.history.entries(KEY)[0].label == LABEL_REINFERRED
+        assert controller.history.entries(KEY)[0].label == LABEL_INFERRED_LLM
 
-    def test_unconfigured_toasts(self, qtbot, controller, toasts) -> None:
+    def test_local_request_flow(self, qtbot, controller) -> None:
+        vision = StubVisionBridge()
+        bar = make_bar(qtbot, controller, vision=vision)
+        bar.local_infer_btn.click()
+        assert vision.requests == [(KEY, ENGINE_LOCAL)]
+        assert bar.local_infer_btn.text() == BAR_INFER_BUSY
+        assert bar.reinfer_btn.text() == BAR_INFER_LLM  # only the busy engine changes
+        vision.caption_ready.emit(KEY, "local caption", True)
+        assert bar.local_infer_btn.text() == BAR_INFER_LOCAL
+        bar.preview.apply_requested.emit()
+        assert controller.record(KEY).text == "local caption"
+        assert controller.history.entries(KEY)[0].label == LABEL_INFERRED_LOCAL
+
+    def test_unconfigured_toasts_per_engine(self, qtbot, controller, toasts) -> None:
         vision = StubVisionBridge(configured=False)
         bar = make_bar(qtbot, controller, vision=vision)
         bar.reinfer_btn.click()
         assert (TOAST_VISION_UNCONFIGURED, "warn") in toasts
+        bar.local_infer_btn.click()
+        assert (TOAST_LOCAL_UNCONFIGURED, "warn") in toasts
         assert not vision.requests
 
     def test_failure_resets_button(self, qtbot, controller, toasts) -> None:
@@ -163,8 +184,55 @@ class TestReinfer:
         bar = make_bar(qtbot, controller, vision=vision)
         bar.reinfer_btn.click()
         vision.caption_ready.emit(KEY, "boom", False)
-        assert bar.reinfer_btn.text() == BAR_REINFER
-        assert any("重译失败" in text for text, _kind in toasts)
+        assert bar.reinfer_btn.text() == BAR_INFER_LLM
+        assert any("推理失败" in text for text, _kind in toasts)
+
+
+class TestPreviewFitsHost:
+    """Regression: a long inference result must not clip 替换/关闭 (user report)."""
+
+    HOST_W = 600
+    HOST_H = 300
+    LONG_TEXT = "A very long natural-language caption sentence. " * 80
+
+    def make_hosted_bar(self, qtbot, controller, vision) -> tuple[CaptionBar, object]:
+        from PySide6.QtWidgets import QWidget
+
+        host = QWidget()
+        qtbot.addWidget(host)
+        host.resize(self.HOST_W, self.HOST_H)
+        host.show()
+        bar = CaptionBar(controller, vision_bridge=vision, overlay_host=host)
+        qtbot.addWidget(bar)
+        return bar, host
+
+    def test_long_result_keeps_buttons_inside_host(self, qtbot, controller) -> None:
+        vision = StubVisionBridge()
+        bar, host = self.make_hosted_bar(qtbot, controller, vision)
+        bar.reinfer_btn.click()
+        vision.caption_ready.emit(KEY, self.LONG_TEXT, True)
+        assert bar.preview.is_active()
+        geo = bar.preview.geometry()
+        assert geo.bottom() <= host.height()  # buttons stay clickable
+        assert geo.right() <= host.width()
+        # The body overflow moved INTO the scroll area, not past the host.
+        assert bar.preview.body_scroll.verticalScrollBar().maximum() > 0
+
+    def test_long_result_can_still_be_applied(self, qtbot, controller) -> None:
+        vision = StubVisionBridge()
+        bar, _host = self.make_hosted_bar(qtbot, controller, vision)
+        bar.reinfer_btn.click()
+        vision.caption_ready.emit(KEY, self.LONG_TEXT, True)
+        bar.preview.apply_btn.pressed.emit()
+        assert controller.record(KEY).text == self.LONG_TEXT
+        assert not bar.preview.is_active()
+
+    def test_short_result_needs_no_scrollbar(self, qtbot, controller) -> None:
+        vision = StubVisionBridge()
+        bar, _host = self.make_hosted_bar(qtbot, controller, vision)
+        bar.reinfer_btn.click()
+        vision.caption_ready.emit(KEY, "short caption", True)
+        assert bar.preview.body_scroll.verticalScrollBar().maximum() == 0
 
 
 class TestDelete:

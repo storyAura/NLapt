@@ -46,6 +46,9 @@ SAVE_STATE_SAVING = "保存中…"
 SAVE_STATE_FAILED = "保存失败"
 SAVE_STATE_DIRTY_FMT = "未保存 {n}"
 
+# Live batch (推标) progress, hidden while idle.
+BATCH_PROGRESS_FMT = "{description} {done}/{total}"
+
 _MONO_FAMILY = ", ".join(f'"{name}"' for name in MONO_STACK)
 
 
@@ -74,6 +77,11 @@ class StatusBar(QFrame):
         # Real save-state indicator (spec 2.3).
         self.save_label = QLabel(self)
         row.addWidget(self.save_label)
+        # Live 推标 progress (hidden while no batch runs).
+        self.batch_label = QLabel(self)
+        self.batch_label.setProperty("saveState", "saving")
+        self.batch_label.hide()
+        row.addWidget(self.batch_label)
         self.left_label = QLabel(self)
         self.left_label.setProperty("mono", "true")
         row.addWidget(self.left_label)
@@ -93,6 +101,8 @@ class StatusBar(QFrame):
         controller.caption_changed.connect(lambda _key: self._refresh_save_state())
         controller.files_saved.connect(lambda _keys: self._refresh_save_state())
         controller.save_state_changed.connect(self._on_save_state)
+        controller.batch_progress.connect(self._on_batch_progress)
+        controller.batch_finished.connect(lambda _d, _r: self.batch_label.hide())
 
         self._clock_timer = QTimer(self)
         self._clock_timer.setInterval(CLOCK_INTERVAL_MS)
@@ -111,6 +121,13 @@ class StatusBar(QFrame):
         self.clock_label.setText(
             QDateTime.currentDateTime().toString(CLOCK_FORMAT)
         )
+
+    # -- batch progress -----------------------------------------------------------------
+    def _on_batch_progress(self, description: str, done: int, total: int) -> None:
+        self.batch_label.setText(
+            BATCH_PROGRESS_FMT.format(description=description, done=done, total=total)
+        )
+        self.batch_label.show()
 
     # -- save state ---------------------------------------------------------------------
     def _on_save_state(self, state: str) -> None:

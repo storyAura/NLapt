@@ -8,6 +8,16 @@ tests never spawn real processes or wait on wall-clock time.
 
 Vision models pass their mmproj projector via ``--mmproj``; a negative
 ``gpu_layers`` maps to :data:`GPU_LAYERS_ALL` ("offload everything").
+
+Two launch decisions came from field debugging (v1.7):
+
+* ``-c`` is ``context_length × parallel`` — llama-server SPLITS the total
+  context across its ``--parallel`` slots, so passing the raw setting gave
+  each request only a fraction of the configured 上下文长度.
+* ``--reasoning off`` — thinking-capable models (Gemma 4) spend the whole
+  token budget inside their reasoning channel and return an EMPTY
+  ``content`` for captioning requests; this app wants captions, not
+  chain-of-thought.
 """
 
 from __future__ import annotations
@@ -71,8 +81,18 @@ class ServerSpec:
     parallel: int = 2
 
 
+def total_context(spec: ServerSpec) -> int:
+    """Total ``-c`` value: per-slot 上下文长度 × parallel slots."""
+    return spec.context_length * spec.parallel
+
+
 def build_server_args(spec: ServerSpec) -> tuple[str, ...]:
-    """The llama-server argument vector for ``spec`` (validated, no shell)."""
+    """The llama-server argument vector for ``spec`` (validated, no shell).
+
+    ``spec.context_length`` is PER SLOT: llama-server divides ``-c`` by
+    ``--parallel``, so the emitted ``-c`` is :func:`total_context`.
+    Reasoning/thinking is disabled (see module docstring).
+    """
     if not spec.server_path:
         raise ValidationError("请先在设置中选择 llama-server 可执行文件")
     if not spec.model_path:
@@ -94,11 +114,13 @@ def build_server_args(spec: ServerSpec) -> tuple[str, ...]:
         "--port",
         str(spec.port),
         "-c",
-        str(spec.context_length),
+        str(total_context(spec)),
         "--parallel",
         str(spec.parallel),
         "-ngl",
         str(gpu_layers),
+        "--reasoning",
+        "off",
     ]
     if spec.threads > 0:
         args.extend(["-t", str(spec.threads)])
@@ -160,6 +182,7 @@ class LocalServerManager:
         self._clock = clock
         self._process: ManagedProcess | None = None
         self._port: int | None = None
+        self._spec: ServerSpec | None = None
         # RLock: start() calls stop() when a previous server is running.
         self._lock = threading.RLock()
 
@@ -167,6 +190,11 @@ class LocalServerManager:
     def is_running(self) -> bool:
         """Whether the managed process is alive right now."""
         return self._process is not None and self._process.poll() is None
+
+    @property
+    def current_spec(self) -> ServerSpec | None:
+        """The spec of the running server (None when stopped)."""
+        return self._spec if self.is_running() else None
 
     @property
     def current_base_url(self) -> str:
@@ -203,6 +231,7 @@ class LocalServerManager:
             except OSError as exc:
                 raise LocalServerError(f"无法启动 llama-server: {exc}") from exc
             self._port = spec.port
+            self._spec = spec
 
             probe = health_url(spec.port)
             deadline = self._clock() + ready_timeout
@@ -212,7 +241,8 @@ class LocalServerManager:
                     self._process = None
                     raise LocalServerError(
                         f"llama-server 启动失败,提前退出(退出码 {exit_code})。"
-                        "常见原因:显存不足或模型文件损坏。"
+                        "常见原因:显存不足或模型文件损坏;可在 设置 ▸ 本地推理 "
+                        "调低 GPU 层数 / 上下文长度,或换更小的量化档后重试。"
                     )
                 if self._health(probe):
                     _LOGGER.info("llama-server ready on port %d", spec.port)
@@ -224,12 +254,29 @@ class LocalServerManager:
                 "大模型首次加载较慢,可换更小的量化档重试。"
             )
 
+    def ensure(
+        self, spec: ServerSpec, *, ready_timeout: float = READY_TIMEOUT_SECONDS
+    ) -> str:
+        """Return a server serving exactly ``spec``, starting one only if needed.
+
+        The keep-alive primitive behind batch inference (加载一次,推理全部):
+        when the running server was started with an identical spec its base
+        URL is returned immediately — no model unload/reload; any other
+        state starts (and, via :meth:`start`, first stops) a server.
+        """
+        with self._lock:
+            if self.is_running() and self._spec == spec:
+                _LOGGER.debug("llama-server already serving this spec; reusing")
+                return base_url(spec.port)
+            return self.start(spec, ready_timeout=ready_timeout)
+
     def stop(self) -> None:
         """Terminate the managed process (terminate → wait → kill). Idempotent."""
         with self._lock:
             process = self._process
             self._process = None
             self._port = None
+            self._spec = None
         if process is None or process.poll() is not None:
             return
         try:

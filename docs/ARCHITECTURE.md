@@ -928,3 +928,150 @@ error types in `nlapt.core.errors`: `LocalInferenceError(NLaptError)`,
 
 Tests mirror the package under `tests/local/` (fake openers, fake
 processes, injected clocks — no network, no real waits).
+
+---
+
+## v1.7 addendum — 推标 caption batches + pinned llama.cpp runtime (additive)
+
+- `nlapt/local/runtime.py` (new, stdlib + `nlapt.local.download`): pinned
+  llama.cpp release snapshot (`LLAMA_CPP_TAG` = b10088, byte sizes + SHA256
+  from the GitHub release API `digest` field, captured on
+  `RUNTIME_SNAPSHOT_DATE`; update table and date together). Windows/Linux
+  x64 pin the **Vulkan** builds (one archive drives NVIDIA/AMD/Intel and
+  falls back to llama.cpp's CPU backend), win-arm64/macos-arm64 pin the CPU
+  builds. `runtime_platform_key()` / `current_asset()` gate per-platform
+  support (unsupported → manual `server_path` flow only);
+  `runtime_dir(base)` is versioned by tag; `find_server_exe(dir)` searches
+  recursively (flat zip vs `build/bin` tar layouts), shallowest match wins;
+  `ensure_runtime(base_dir, progress=, cancel=, opener=)` fast-paths an
+  extracted exe, else downloads via `download_file` (resumable +
+  digest-verified), extracts (`zipfile` / `tarfile` with `filter="data"`),
+  deletes the archive, chmods the exe on POSIX. Raises `LocalServerError`
+  with actionable Chinese messages.
+- `LocalServerManager` tracks the launching `ServerSpec`
+  (`current_spec`, None when stopped) and gains
+  `ensure(spec, ready_timeout=...)`: running with an **equal** spec →
+  return the base URL immediately (no model reload); anything else →
+  `start(spec)` (which still stops a previous server first). This is the
+  keep-alive primitive behind batch inference: load once, serve every
+  item, unload only after the batch.
+- `NLaptApp.run_caption_batch(keys, caption_fn, *, description, engine="",
+  concurrency=1, controller=None, on_progress=None) -> BatchReport`:
+  destructive vision batch (推标) that WRITES captions. Follows the batch
+  safety model: pre-execution snapshot, per-file save, one `kind="batch"`
+  oplog record (whole-batch rollback), resume checkpoint id from
+  `("caption:"+engine, keys, engine)`. `caption_fn(key, image_path)` runs
+  on the engine's thread pool with the requested concurrency; store /
+  undo / index / disk mutations are serialized under the app lock. An
+  empty/whitespace result → failed item (`EMPTY_CAPTION_ERROR`), caption
+  untouched; unchanged text → ok with `NO_CHANGE_DETAIL`.
+- `nlapt/local/gguf.py` (new, stdlib): `read_block_count(path)` — minimal
+  GGUF v2/v3 metadata scan for the `<arch>.block_count` key (skips
+  fixed/string/array values with defensive caps); never raises, `None` on
+  anything unexpected.
+- `advisor.auto_gpu_layers(family, quant, hardware, *, context_length,
+  block_count)` — the `-ngl` value that FITS the scaled free VRAM: full
+  estimate fits → `GPU_LAYERS_ALL`; no GPU → 0; otherwise weights+kv are
+  spread over `block_count` layers, mmproj+overhead reserved first, and
+  the remaining budget buys whole layers (clamped). Unknown block_count
+  while not fitting → 0 (a slow CPU run beats a crashed server). Fixes
+  the field OOM: `-ngl 999` on an 8 GB GPU with an 8.3 GB estimate made
+  llama-server exit(1) during load. The early-exit `LocalServerError`
+  message now also suggests lowering GPU 层数 / 上下文.
+- `server.build_server_args` (behavior, field-debugged on real hardware):
+  emits `-c` = `total_context(spec)` = `context_length × parallel`
+  (llama-server SPLITS `-c` across its slots — the raw setting silently
+  gave each request only 1/parallel of the configured 上下文长度) and
+  appends `--reasoning off` (thinking models — Gemma 4 — burned the whole
+  token budget in their reasoning channel and returned an EMPTY `content`
+  for caption requests; verified against a live llama-server b10088).
+  `ServerSpec.context_length` is therefore PER-SLOT; memory estimates for
+  launches must use the total (`auto_gpu_layers` callers pass ctx×parallel).
+
+## v1.8 addendum — Florence-2 PromptGen ONNX engine (additive)
+
+- Catalog families now carry an inference engine: `ModelFamily.engine`
+  (`ENGINE_LLAMA` "llama" — default, single GGUF + optional mmproj served
+  by llama-server — or `ENGINE_FLORENCE` "florence") and
+  `ModelFamily.extra_files: tuple[QuantFile, ...]` (additional required
+  files beside the quant; empty for llama families). Extra files download,
+  verify (exact bytes + SHA256) and resolve exactly like quants
+  (basename inside the per-family dir; `quant_path` works for them).
+  New series `florence2-promptgen` with family `florence2-promptgen-v2`
+  (repo `laub/Florence-2-large-PromptGen-v2.0-onnx` — the only FUNCTIONAL
+  community ONNX export; despite the repo name the weights are the
+  base-size 0.23B architecture, verified from the graph dims. The
+  sibling `...-base-...-onnx` repo is a broken text-only export whose
+  encoder cannot take image features).
+- `nlapt/local/florence.py` (new): in-process Florence-2 pipeline over
+  onnxruntime (optional dep, lazy import; `numpy`/`Pillow` likewise).
+  Public surface: task tokens (`TASK_GENERATE_TAGS` … `TASK_MIXED_CAPTION_PLUS`),
+  `FLORENCE_TASK_LABELS` (token → Chinese label, display order),
+  `FLORENCE_TASK_TOKENS`, `DEFAULT_FLORENCE_TASK` (= `<GENERATE_TAGS>`),
+  `validate_task`, `prompt_for_task` (standard Florence tasks map to their
+  fixed English questions verbatim from the official processor; PromptGen
+  additions pass through literally — how the model was trained),
+  `FlorenceTokenizer` (byte-level BPE over `tokenizer.json`; ASCII
+  pre-tokenizer — prompts are catalog-pinned ASCII), and `FlorenceEngine`:
+  `FlorenceEngine(files: Mapping[basename, Path], *, session_factory=None)`,
+  `load()` (lazy, locked, idempotent), `unload()`, `is_loaded()`,
+  `caption(image_path, task) -> str`. Pipeline: CLIP-style 768×768
+  preprocess → vision_encoder → embed_tokens(prompt ids `<s>…</s>`) →
+  concat → encoder → greedy merged-decoder loop with KV cache, forced BOS
+  and 3-gram repetition blocking (`forced_bos_token_id=0`,
+  `no_repeat_ngram_size=3` from the model config; reference uses
+  num_beams=3 — greedy is the documented simplification). KV layout
+  (layers/heads/head-dim) is read from the decoder session's declared
+  input shapes, so the engine serves any Florence-2 export size; on cache
+  steps the export returns zero-element cross-attention dummies
+  (e.g. shape (0,1,1,1)) which are ignored — the first real tensors are
+  kept. Sessions are thread-safe for concurrent `caption` calls. Typed
+  errors: `LocalInferenceError` (missing deps/files, actionable Chinese),
+  `ValidationError` (unknown task / incomplete file mapping). All required
+  file basenames: `REQUIRED_FILES` (4 ONNX parts + tokenizer.json).
+- `LocalSettings.florence_task: str = DEFAULT_FLORENCE_TASK` — the
+  persisted 指令; unknown stored values fall back to the default on load.
+- `advisor.estimate_memory`: weights now include `extra_files` sizes; for
+  `ENGINE_FLORENCE` the caller's context_length is replaced by the fixed
+  `FLORENCE_CONTEXT_TOKENS` (= 1664: 577 image tokens + ≤1024 generated —
+  the llama-server 上下文长度 setting does not apply to this engine).
+- Optional dependency group `local = ["onnxruntime", "numpy"]`
+  (pyproject); the PyInstaller spec adds both to hiddenimports.
+
+## v1.9 addendum — interception guards, web-translate timeout, prompt presets (additive)
+
+- `nlapt.llm.cleaning`: new `ensure_not_refusal(text) -> str` plus the
+  `REFUSAL_PREFIXES` / `REFUSAL_MARKERS` / `MSG_REFUSAL` constants. Raises
+  `LLMOutputError` (Chinese, includes an 80-char preview) when the text
+  reads like a safety refusal ("I'm sorry…", "抱歉…", "content policy" …).
+  Matching is lowercase; prefixes anchor at the start, markers match
+  anywhere. Applied by VISION captioners only — translations may
+  legitimately start with such words, so `clean_llm_output` itself is
+  unchanged.
+- `nlapt.llm.openai_client`: `_extract_text` now checks
+  `choices[0].finish_reason == "content_filter"` BEFORE parsing the
+  message content and raises `LLMRequestError(MSG_CONTENT_FILTERED)`
+  (Chinese, retryable — filter trips are often probabilistic). A filtered
+  choice with a null/replaced message no longer surfaces as a generic
+  parse error.
+- `nlapt.llm.web_translate`: new `WEB_TRANSLATE_TIMEOUT_SECONDS = 15.0`
+  is the default `timeout` of all three providers (was the LLM default
+  60 s). Healthy endpoints answer in seconds; a short per-attempt timeout
+  plus the caller's retry beats one long hang. The constructor parameter
+  is unchanged for callers that need a different budget.
+- `nlapt.local.presets` (new module): hardcoded snapshot (2026-08-01) of
+  the official instructions the caption specialists were trained on.
+  `PromptPreset(preset_id, label, system, user_prompt)` (frozen),
+  `PRESET_CUSTOM = "custom"` sentinel, `TORIIGATE_PRESETS` (10 formats,
+  verbatim from Minthy/ToriiGate-0.5 `scripts/prompts.py`, assembled like
+  the official `make_user_query`: `# Captioning format:` + body + the
+  recognize-characters directive), `JOYCAPTION_PRESETS` (12 caption
+  types, verbatim index-0 templates of the official Space's
+  `CAPTION_TYPE_MAP`, plus its recommended system prompt),
+  `PRESETS_BY_FAMILY` keyed by catalog `family_id`, `presets_for(id)`,
+  and `resolve_preset(family_id, preset_id) -> PromptPreset | None`:
+  `PRESET_CUSTOM` or a family without presets → None (free-form prompts);
+  empty/unknown id → the family's FIRST preset (default). Gemma families
+  intentionally have no entry; Florence keeps its own 指令模式.
+- `LocalSettings.prompt_preset: str = ""` — persisted preset id
+  (round-tripped as-is; semantics live in `resolve_preset`).

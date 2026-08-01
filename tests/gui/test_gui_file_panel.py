@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QPoint, Qt
 
 import nlapt_gui.widgets as widgets_pkg
 from nlapt_gui.controller import FOLDER_ROOT_LABEL, AppController
@@ -228,3 +228,183 @@ class TestPaintAndTheme:
         panel.apply_tokens(THEMES["深邃"])
         assert panel.current_tokens().name == "深邃"
         assert not panel.grab().isNull()
+
+
+class TestFolderMultiSelect:
+    def test_folder_checkbox_selects_whole_folder(
+        self, qtbot, panel: FilePanel, controller: AppController
+    ) -> None:
+        group = panel.folder_group("10_concept")
+        assert group is not None
+        qtbot.mouseClick(group.check, Qt.MouseButton.LeftButton)
+        assert controller.selected_keys() == (K3, K4)
+        assert group.check.checkState() == Qt.CheckState.Checked
+        qtbot.mouseClick(group.check, Qt.MouseButton.LeftButton)
+        assert controller.selected_keys() == ()
+        assert group.check.checkState() == Qt.CheckState.Unchecked
+
+    def test_partial_folder_shows_tristate(
+        self, panel: FilePanel, controller: AppController
+    ) -> None:
+        controller.toggle_selected(K3)
+        group = panel.folder_group("10_concept")
+        assert group.check.checkState() == Qt.CheckState.PartiallyChecked
+
+    def test_all_row_selects_everything(
+        self, qtbot, panel: FilePanel, controller: AppController
+    ) -> None:
+        assert panel.all_row.isVisibleTo(panel)
+        assert panel.all_row.name_label.text() == "ALL"
+        assert panel.all_row.count_label.text() == "4 张"
+        qtbot.mouseClick(panel.all_row.check, Qt.MouseButton.LeftButton)
+        assert controller.selected_keys() == (K1, K2, K3, K4)
+        assert panel.all_row.check.checkState() == Qt.CheckState.Checked
+        qtbot.mouseClick(panel.all_row.check, Qt.MouseButton.LeftButton)
+        assert controller.selected_keys() == ()
+
+    def test_controller_folder_helpers(self, controller: AppController) -> None:
+        assert controller.folder_keys("10_concept") == (K3, K4)
+        assert controller.folder_selection_state("10_concept") == "none"
+        controller.set_folder_selected("10_concept", True)
+        assert controller.folder_selection_state("10_concept") == "all"
+        controller.set_folder_selected("10_concept", False)
+        assert controller.folder_selection_state("10_concept") == "none"
+
+
+class TestInferMenu:
+    def test_folder_menu_lists_folder_unlabeled_and_all_scopes(
+        self, panel: FilePanel, controller: AppController
+    ) -> None:
+        controller.toggle_selected(K1)  # 已选 never shows on folder menus
+        labels = [label for label, _run in panel.infer_menu_actions("10_concept")]
+        assert "用 LLM 推理此文件夹(2 张)" in labels
+        assert "用本地模型推理此文件夹(2 张)" in labels
+        assert "用 LLM 推理此文件夹未标注(1 张)" in labels
+        assert "用本地模型推理此文件夹未标注(1 张)" in labels
+        assert "用 LLM 推理全部(4 张)" in labels
+        assert "用本地模型推理全部(4 张)" in labels
+        assert not any("已选" in label for label in labels)
+
+    def test_all_row_menu_hides_selection_and_folder_scopes(
+        self, panel: FilePanel, controller: AppController
+    ) -> None:
+        controller.toggle_selected(K1)
+        labels = [label for label, _run in panel.infer_menu_actions(None)]
+        assert not any("已选" in label for label in labels)
+        assert not any("此文件夹" in label for label in labels)
+        assert "用 LLM 推理全部(4 张)" in labels
+        assert "用 LLM 推理全部未标注(1 张)" in labels
+        assert "用本地模型推理全部未标注(1 张)" in labels
+
+    def test_root_group_menu_matches_all_row(
+        self, panel: FilePanel, controller: AppController
+    ) -> None:
+        controller.toggle_selected(K1)
+        labels = [label for label, _run in panel.infer_menu_actions(FOLDER_ROOT_LABEL)]
+        assert not any("此文件夹" in label for label in labels)
+        assert not any("已选" in label for label in labels)
+        assert "用 LLM 推理全部(4 张)" in labels
+        assert "用 LLM 推理全部未标注(1 张)" in labels
+
+    def test_image_menu_single_image(
+        self, panel: FilePanel, controller: AppController
+    ) -> None:
+        labels = [label for label, _run in panel.infer_menu_actions(None, image=K1)]
+        assert labels == ["用 LLM 推理这张图片", "用本地模型推理这张图片"]
+
+    def test_image_menu_multiselect_adds_selected_and_all(
+        self, panel: FilePanel, controller: AppController
+    ) -> None:
+        controller.toggle_selected(K1)
+        controller.toggle_selected(K2)
+        labels = [label for label, _run in panel.infer_menu_actions(None, image=K1)]
+        assert "用 LLM 推理已选(2 张)" in labels
+        assert "用本地模型推理已选(2 张)" in labels
+        assert "用 LLM 推理全部(4 张)" in labels
+        assert "用本地模型推理全部(4 张)" in labels
+        assert not any("这张图片" in label for label in labels)
+        assert not any("此文件夹" in label for label in labels)
+
+    def test_image_menu_unselected_image_ignores_selection(
+        self, panel: FilePanel, controller: AppController
+    ) -> None:
+        controller.toggle_selected(K1)
+        controller.toggle_selected(K2)
+        labels = [label for label, _run in panel.infer_menu_actions(None, image=K3)]
+        assert labels == ["用 LLM 推理这张图片", "用本地模型推理这张图片"]
+
+    def test_image_action_infers_single_key(
+        self, qtbot, panel: FilePanel, controller: AppController, monkeypatch
+    ) -> None:
+        import nlapt_gui.widgets.file_panel as fp_module
+
+        monkeypatch.setattr(fp_module, "ask_confirm", lambda *a, **k: True)
+        received: list[tuple[tuple[str, ...], str]] = []
+        panel.infer_requested.connect(
+            lambda keys, engine: received.append((tuple(keys), engine))
+        )
+        dict(panel.infer_menu_actions(None, image=K2))["用 LLM 推理这张图片"]()
+        assert received == [((K2,), "llm")]
+
+    def test_unlabeled_action_targets_only_unlabeled(
+        self, qtbot, panel: FilePanel, controller: AppController, monkeypatch
+    ) -> None:
+        import nlapt_gui.widgets.file_panel as fp_module
+
+        monkeypatch.setattr(fp_module, "ask_confirm", lambda *a, **k: True)
+        received: list[tuple[tuple[str, ...], str]] = []
+        panel.infer_requested.connect(
+            lambda keys, engine: received.append((tuple(keys), engine))
+        )
+        actions = dict(panel.infer_menu_actions("10_concept"))
+        actions["用本地模型推理此文件夹未标注(1 张)"]()
+        assert received == [((K4,), "local")]
+
+    def test_cell_right_click_opens_image_menu(
+        self, panel: FilePanel, controller: AppController, monkeypatch
+    ) -> None:
+        calls: list[tuple[str | None, str | None]] = []
+        monkeypatch.setattr(
+            panel,
+            "show_infer_menu",
+            lambda folder, _w, _pos, image=None: calls.append((folder, image)),
+        )
+        panel.cell(K1).customContextMenuRequested.emit(QPoint(3, 3))
+        assert calls == [(None, K1)]
+
+    def test_menu_offers_cancel_while_batch_runs(
+        self, panel: FilePanel, controller: AppController, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(controller, "batch_running", lambda: True)
+        cancels: list[bool] = []
+        monkeypatch.setattr(controller, "cancel_batch", lambda: cancels.append(True))
+        actions = panel.infer_menu_actions("10_concept")
+        assert [label for label, _run in actions] == ["取消当前推标"]
+        actions[0][1]()
+        assert cancels == [True]
+
+    def test_confirmed_action_emits_infer_requested(
+        self, qtbot, panel: FilePanel, controller: AppController, monkeypatch
+    ) -> None:
+        import nlapt_gui.widgets.file_panel as fp_module
+
+        monkeypatch.setattr(fp_module, "ask_confirm", lambda *a, **k: True)
+        received: list[tuple[tuple[str, ...], str]] = []
+        panel.infer_requested.connect(
+            lambda keys, engine: received.append((tuple(keys), engine))
+        )
+        actions = dict(panel.infer_menu_actions("10_concept"))
+        actions["用本地模型推理此文件夹(2 张)"]()
+        assert received == [((K3, K4), "local")]
+
+    def test_cancelled_confirm_emits_nothing(
+        self, qtbot, panel: FilePanel, controller: AppController, monkeypatch
+    ) -> None:
+        import nlapt_gui.widgets.file_panel as fp_module
+
+        monkeypatch.setattr(fp_module, "ask_confirm", lambda *a, **k: False)
+        received: list[object] = []
+        panel.infer_requested.connect(lambda keys, engine: received.append(keys))
+        actions = dict(panel.infer_menu_actions(None))
+        actions["用 LLM 推理全部(4 张)"]()
+        assert received == []

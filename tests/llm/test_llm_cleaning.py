@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from nlapt.core.errors import LLMOutputError, ValidationError
-from nlapt.llm.cleaning import OUTPUT_CONSTRAINT, clean_llm_output
+from nlapt.llm.cleaning import OUTPUT_CONSTRAINT, clean_llm_output, ensure_not_refusal
 
 
 class TestOutputConstraint:
@@ -130,3 +130,46 @@ class TestEmptyResults:
     def test_empty_after_cleaning_raises(self, raw: str) -> None:
         with pytest.raises(LLMOutputError):
             clean_llm_output(raw)
+
+
+class TestEnsureNotRefusal:
+    """Safety-interception guard: refusal replies never become captions."""
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "a red fox in the snow",
+            "1girl, solo, purple eyes, blonde hair, low twintails",
+            "A young woman with short, dark, wavy hair stands by a pool.",
+            # 'sorry'/'无法' inside legit captions must NOT trip the guard.
+            "sorry expression, apologetic pose, tears",
+            "a sign reading 'no entry', 无法通行的告示牌",
+        ],
+    )
+    def test_normal_captions_pass_through(self, text: str) -> None:
+        assert ensure_not_refusal(text) == text
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "I'm sorry, but I can't help with that request.",
+            "I cannot assist with describing this image.",
+            "I can't describe explicit content.",
+            "As an AI, I am unable to provide that description.",
+            "This request goes against my guidelines and content policy.",
+            "抱歉,我无法描述这张图片。",
+            "对不起,这张图片违反了内容政策。",
+        ],
+    )
+    def test_refusals_raise_llm_output_error(self, text: str) -> None:
+        with pytest.raises(LLMOutputError) as excinfo:
+            ensure_not_refusal(text)
+        assert "拦截" in str(excinfo.value)
+
+    def test_detection_is_case_insensitive(self) -> None:
+        with pytest.raises(LLMOutputError):
+            ensure_not_refusal("I'M SORRY, I CANNOT DO THAT.")
+
+    def test_non_string_raises_validation_error(self) -> None:
+        with pytest.raises(ValidationError):
+            ensure_not_refusal(None)  # type: ignore[arg-type]

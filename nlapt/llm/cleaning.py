@@ -31,6 +31,54 @@ LABEL_WORDS: tuple[str, ...] = ("caption", "output", "result", "标注", "输出
 LABEL_SEPARATORS: tuple[str, ...] = (":", "：")  # : ：
 MAX_CLEAN_PASSES = 10
 
+# -- refusal / safety-interception detection (spec 7.4 hardening) -------------------
+# When a provider's safety layer intercepts a caption request, the reply is a
+# refusal ("I'm sorry, I can't ...") or a policy blurb instead of a caption.
+# Callers that WRITE captions run the cleaned text through
+# :func:`ensure_not_refusal` so an intercepted reply becomes a visible failure
+# instead of silently landing in the dataset. Matching is against the lowered
+# text: prefixes anchor at the start, markers match anywhere.
+REFUSAL_PREFIXES: tuple[str, ...] = (
+    "i'm sorry",
+    "i am sorry",
+    "i apologize",
+    "i apologise",
+    "i cannot",
+    "i can't",
+    "i can not",
+    "i'm unable",
+    "i am unable",
+    "i won't",
+    "i will not",
+    "as an ai",
+    "sorry, but",
+    "unfortunately, i",
+    "抱歉",
+    "很抱歉",
+    "对不起",
+    "我不能",
+    "我无法",
+    "作为ai",
+    "作为一个ai",
+    "作为人工智能",
+)
+REFUSAL_MARKERS: tuple[str, ...] = (
+    "cannot assist",
+    "can't assist",
+    "unable to assist",
+    "cannot help with",
+    "can't help with",
+    "against my guidelines",
+    "content policy",
+    "i must decline",
+    "无法协助",
+    "无法帮助",
+    "不能提供",
+    "无法提供",
+)
+REFUSAL_PREVIEW_CHARS = 80
+MSG_REFUSAL = "模型拒绝了本次请求(疑似触发内容安全拦截),该图已按失败处理:{preview}"
+
 
 def _strip_code_fence(text: str) -> str:
     if not text.startswith(CODE_FENCE) or not text.endswith(CODE_FENCE):
@@ -95,4 +143,25 @@ def clean_llm_output(raw: str) -> str:
     if not text:
         _LOGGER.debug("LLM output empty after cleaning (raw length %d)", len(raw))
         raise LLMOutputError("LLM output was empty after cleaning")
+    return text
+
+
+def ensure_not_refusal(text: str) -> str:
+    """Return ``text`` unchanged unless it reads like a safety refusal.
+
+    Applied to vision captions only (translations may legitimately start
+    with words like 抱歉 when the source text does). Raises
+    :class:`LLMOutputError` so batch items fail visibly instead of writing
+    an intercepted reply into the dataset.
+    """
+    if not isinstance(text, str):
+        raise ValidationError(f"text must be a string, got {type(text).__name__}")
+    lowered = text.strip().lower()
+    refused = lowered.startswith(REFUSAL_PREFIXES) or any(
+        marker in lowered for marker in REFUSAL_MARKERS
+    )
+    if refused:
+        preview = text.strip()[:REFUSAL_PREVIEW_CHARS]
+        _LOGGER.warning("LLM reply looks like a safety refusal: %r", preview)
+        raise LLMOutputError(MSG_REFUSAL.format(preview=preview))
     return text

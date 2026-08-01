@@ -9,6 +9,7 @@ signals so every handler runs on the GUI thread.
 
 from __future__ import annotations
 
+import time
 from dataclasses import replace as _dc_replace
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
@@ -17,6 +18,7 @@ from PySide6.QtCore import QObject, QThreadPool, Signal
 from PySide6.QtGui import QGuiApplication, QImageReader
 
 from nlapt.app import NLaptApp
+from nlapt.batch.progress import BatchController, BatchReport
 from nlapt.captions.chips import join_chips, split_chips
 from nlapt.captions.store import CaptionRecord
 from nlapt.core.config import AppConfig, get_active_profile
@@ -26,7 +28,10 @@ from nlapt.core.models import DatasetScanResult, ImageFile
 from nlapt.core.states import CaptionState
 from nlapt.diagnostics import get_logger
 from nlapt.llm.base import LLMMessage, LLMRequest, create_client
-from nlapt.llm.cleaning import clean_llm_output
+from nlapt.llm.cleaning import clean_llm_output, ensure_not_refusal
+from nlapt.llm.retry import MinIntervalLimiter
+# Shared spec-8 pacing/retry helper; also reused by nlapt.llm.translate.
+from nlapt.llm.rewrite import _paced_complete
 from nlapt.llm.translate import TranslationCache, Translator
 from nlapt.llm.vision import prepare_image
 from nlapt.ops.base import TextOperation
@@ -101,7 +106,9 @@ class AppController(QObject):
     mode_changed = Signal(str)  # chips|sents|text
     view_mode_changed = Signal(str)  # list|mid|big
     files_saved = Signal(tuple)  # keys just saved
+    batch_started = Signal(str, int)  # description, total — caption batch (推标) began
     batch_finished = Signal(str, object)  # description, BatchReport
+    batch_progress = Signal(str, int, int)  # description, done, total
     toast_requested = Signal(str, str)  # text, kind: ok|warn|err|info
     busy_changed = Signal(bool)
     save_state_changed = Signal(str)  # "saving" | "saved" | "failed" (spec 2.3 三态)
@@ -135,6 +142,7 @@ class AppController(QObject):
         self._translator_resolved = False
         self._rescanning = False
         self._batch_in_flight = False
+        self._batch_controller: BatchController | None = None
         self._core_event.connect(self._on_core_event)
         self._unsubscribes = [
             self._app.bus.subscribe(EVT_ENCODING_ISSUES, self._bridge_event),
@@ -415,6 +423,37 @@ class AppController(QObject):
     def select_all(self) -> None:
         self._selected = set(self._keys)
         self._after_selection_change()
+
+    def folder_keys(self, folder: str) -> tuple[str, ...]:
+        """All keys inside one relative folder (根目录 for root files)."""
+        return tuple(k for k in self._keys if self.folder_of(k) == folder)
+
+    def unlabeled_keys(self, keys: Sequence[str]) -> tuple[str, ...]:
+        """Subset of ``keys`` whose caption is 未标注 (empty body text)."""
+        return tuple(
+            k for k in keys if self.record(k).state is CaptionState.UNLABELED
+        )
+
+    def folder_selection_state(self, folder: str) -> str:
+        """'all' | 'some' | 'none' — selection coverage of one folder."""
+        keys = self.folder_keys(folder)
+        selected = sum(1 for k in keys if k in self._selected)
+        if keys and selected == len(keys):
+            return "all"
+        return "some" if selected else "none"
+
+    def set_folder_selected(self, folder: str, selected: bool) -> None:
+        """Select/deselect every file of a folder (文件夹多选 checkbox)."""
+        keys = self.folder_keys(folder)
+        if not keys:
+            return
+        if selected:
+            self._anchor = keys[0]
+            self._selected.update(keys)
+            self._after_selection_change()
+        else:
+            self._selected.difference_update(keys)
+            self.selection_changed.emit()
 
     def clear_selection(self) -> None:
         if not self._selected:
@@ -721,6 +760,112 @@ class AppController(QObject):
 
         run_async(self._pool, job, on_done=done, on_error=failed)
 
+    # -- batch vision captioning (推标) -------------------------------------------------
+    TOAST_INFER_STARTED = "开始推标 {n} 张(右键文件夹可取消)"
+    TOAST_INFER_DONE = "推标完成:成功 {ok} / 失败 {fail}(可在 历史记录 回滚)"
+    TOAST_INFER_CANCELLED = "推标已取消:本次完成 {ok} 张(重新开始可续跑)"
+    TOAST_INFER_CANCELLING = "正在取消推标(等待进行中的请求完成)…"
+
+    def batch_running(self) -> bool:
+        """Whether an async batch (推标 or text op) is currently in flight."""
+        return self._batch_in_flight
+
+    def cancel_batch(self) -> None:
+        """Cooperatively cancel the running 推标 batch (completed items kept)."""
+        controller = self._batch_controller
+        if controller is None:
+            return
+        controller.cancel()
+        self.toast_requested.emit(self.TOAST_INFER_CANCELLING, TOAST_INFO)
+
+    def run_caption_batch(
+        self,
+        keys: Sequence[str],
+        caption_fn: Callable[[str, Path], str],
+        *,
+        description: str,
+        history_label: str,
+        engine: str = "",
+        concurrency: int = 1,
+        on_finished: Callable[[object], None] | None = None,
+    ) -> bool:
+        """Batch 推标 via :meth:`NLaptApp.run_caption_batch`, off-thread.
+
+        Results are written directly (snapshot + oplog rollback in the
+        core); per-file labeled history entries are pushed here so every
+        image keeps its undo trail. ``batch_started`` fires on the GUI
+        thread before the work is queued (the progress window's show
+        trigger); progress is re-emitted through ``batch_progress``;
+        ``on_finished(report_or_None)`` always runs last (engine cleanup
+        hook, e.g. stopping a batch-started server).
+        """
+        keys = tuple(keys)
+        if self._batch_in_flight or self._rescanning:
+            self.toast_requested.emit(self.TOAST_BUSY, TOAST_WARN)
+            return False
+        if not keys:
+            self.toast_requested.emit(TOAST_NO_SELECTION, TOAST_WARN)
+            return False
+        before: Mapping[str, str] = {key: self.record(key).text for key in keys}
+        batch_controller = BatchController()
+        self._batch_controller = batch_controller
+        self._batch_in_flight = True
+        self.busy_changed.emit(True)
+        self.toast_requested.emit(
+            self.TOAST_INFER_STARTED.format(n=len(keys)), TOAST_INFO
+        )
+        self.batch_started.emit(description, len(keys))
+
+        def progress(done: int, total: int, _key: str) -> None:
+            # Worker-thread emit; Qt auto-queues delivery to GUI receivers.
+            self.batch_progress.emit(description, done, total)
+
+        def job() -> object:
+            return self._app.run_caption_batch(
+                keys,
+                caption_fn,
+                description=description,
+                engine=engine,
+                concurrency=concurrency,
+                controller=batch_controller,
+                on_progress=progress,
+            )
+
+        def finish_common() -> None:
+            self._batch_in_flight = False
+            self._batch_controller = None
+            self.busy_changed.emit(False)
+
+        def done(report: object) -> None:
+            changed = tuple(key for key in keys if self.record(key).text != before[key])
+            for key in changed:
+                self._history.push(key, history_label, self.record(key).text)
+                self.caption_changed.emit(key)
+            finish_common()
+            if isinstance(report, BatchReport) and report.status.value == "cancelled":
+                self.toast_requested.emit(
+                    self.TOAST_INFER_CANCELLED.format(ok=report.succeeded), TOAST_WARN
+                )
+            else:
+                ok = report.succeeded if isinstance(report, BatchReport) else len(changed)
+                fail = report.failed if isinstance(report, BatchReport) else 0
+                self.toast_requested.emit(
+                    self.TOAST_INFER_DONE.format(ok=ok, fail=fail),
+                    TOAST_OK if fail == 0 else TOAST_WARN,
+                )
+            self.batch_finished.emit(description, report)
+            if on_finished is not None:
+                on_finished(report)
+
+        def failed(message: str) -> None:
+            finish_common()
+            self.toast_requested.emit(message, TOAST_ERR)
+            if on_finished is not None:
+                on_finished(None)
+
+        run_async(self._pool, job, on_done=done, on_error=failed)
+        return True
+
     # -- services ---------------------------------------------------------------------
     def make_translator_or_none(self) -> Translator | None:
         """Translator from the active LLM profile; None when unconfigured. Cached."""
@@ -740,7 +885,7 @@ class AppController(QObject):
         self._translator_resolved = False
 
     def make_vision_captioner_or_none(
-        self,
+        self, *, retry_sleep: Callable[[float], None] = time.sleep
     ) -> Callable[[Path, str, str], str] | None:
         """A ``(image_path, system, user_prompt) -> caption`` callable, or None.
 
@@ -748,6 +893,14 @@ class AppController(QObject):
         (统一模式 saves the shared model into ``vision_model`` too, so that
         field alone decides vision availability). The callable blocks on the
         HTTP round-trip — run it on the worker pool.
+
+        Requests run under the spec-8 controls (``config.request``): retries
+        with exponential backoff on transient request errors and one shared
+        min-interval limiter across every call of this captioner (a batch
+        builds ONE captioner, so pacing spans the whole batch). Replies that
+        read like a safety refusal raise ``LLMOutputError`` instead of being
+        written as captions. ``retry_sleep`` is the backoff sleep, injectable
+        so tests never really wait.
         """
         config = self._app.config
         profile = get_active_profile(config)
@@ -755,6 +908,7 @@ class AppController(QObject):
             return None
         request_control = config.request
         max_edge = config.image_max_edge
+        limiter = MinIntervalLimiter(request_control.min_interval)
 
         def caption(image_path: Path, system: str, user_prompt: str) -> str:
             client = create_client(profile)
@@ -769,7 +923,14 @@ class AppController(QObject):
                 max_tokens=profile.max_tokens,
                 timeout=request_control.timeout,
             )
-            return clean_llm_output(client.complete(request).text)
+            response = _paced_complete(
+                client,
+                request,
+                control=request_control,
+                limiter=limiter,
+                retry_sleep=retry_sleep,
+            )
+            return ensure_not_refusal(clean_llm_output(response.text))
 
         return caption
 

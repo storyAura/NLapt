@@ -87,16 +87,33 @@ class TestBuildServerArgs:
             "--port",
             "18434",
             "-c",
-            "8192",
+            "32768",  # per-slot 8192 × 4 slots (llama-server splits -c)
             "--parallel",
             "4",
             "-ngl",
             "20",
+            "--reasoning",
+            "off",
             "-t",
             "8",
             "--mmproj",
             "proj.gguf",
         )
+
+    def test_context_is_per_slot_times_parallel(self) -> None:
+        spec = ServerSpec(
+            server_path="srv", model_path="m", port=18434,
+            context_length=4096, parallel=4,
+        )
+        args = build_server_args(spec)
+        assert args[args.index("-c") + 1] == "16384"
+
+    def test_reasoning_disabled_for_captioning(self) -> None:
+        # Thinking models burned the whole budget in their reasoning
+        # channel and returned empty captions (field bug).
+        spec = ServerSpec(server_path="srv", model_path="m", port=18434)
+        args = build_server_args(spec)
+        assert args[args.index("--reasoning") + 1] == "off"
 
     def test_auto_gpu_layers_maps_to_all(self) -> None:
         spec = ServerSpec(server_path="srv", model_path="m", port=18434, gpu_layers=-1)
@@ -229,3 +246,49 @@ class TestManagerLifecycle:
         manager = LocalServerManager(popen=boom)
         with pytest.raises(LocalServerError, match="无法启动"):
             manager.start(make_spec(tmp_path))
+
+
+class TestEnsure:
+    def make_manager(self) -> tuple[LocalServerManager, list[FakeProcess]]:
+        spawned: list[FakeProcess] = []
+
+        def popen(args):  # noqa: ANN001
+            process = FakeProcess()
+            spawned.append(process)
+            return process
+
+        clock, sleep = make_clock()
+        manager = LocalServerManager(
+            popen=popen, health_check=lambda url: True, sleep=sleep, clock=clock
+        )
+        return manager, spawned
+
+    def test_ensure_starts_when_stopped(self, tmp_path: Path) -> None:
+        manager, spawned = self.make_manager()
+        spec = make_spec(tmp_path)
+        assert manager.ensure(spec) == base_url(spec.port)
+        assert len(spawned) == 1
+        assert manager.current_spec == spec
+
+    def test_ensure_same_spec_reuses_running_server(self, tmp_path: Path) -> None:
+        manager, spawned = self.make_manager()
+        spec = make_spec(tmp_path)
+        manager.ensure(spec)
+        # Equal spec (fresh instance): NO reload of the model.
+        assert manager.ensure(make_spec(tmp_path)) == base_url(spec.port)
+        assert len(spawned) == 1
+
+    def test_ensure_different_spec_restarts(self, tmp_path: Path) -> None:
+        manager, spawned = self.make_manager()
+        manager.ensure(make_spec(tmp_path))
+        manager.ensure(make_spec(tmp_path, port=18435))
+        assert len(spawned) == 2
+        assert spawned[0].terminated  # previous server stopped first
+        assert manager.current_spec is not None
+        assert manager.current_spec.port == 18435
+
+    def test_stop_clears_current_spec(self, tmp_path: Path) -> None:
+        manager, _spawned = self.make_manager()
+        manager.ensure(make_spec(tmp_path))
+        manager.stop()
+        assert manager.current_spec is None

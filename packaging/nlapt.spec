@@ -40,6 +40,9 @@ HIDDEN_IMPORTS = [
     *collect_submodules("nlapt_gui"),
     "httpx",
     "PIL.Image",
+    # Florence-2 ONNX engine deps, imported lazily inside functions.
+    "onnxruntime",
+    "numpy",
 ]
 
 # Modules that must never ship in the bundle.

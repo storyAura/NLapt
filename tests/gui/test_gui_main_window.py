@@ -66,6 +66,12 @@ class TestAssembly:
     def test_editor_panel_uses_real_translate_bridge(self, window) -> None:
         assert window.editor_panel._bridge is window.translate_bridge
 
+    def test_owns_batch_progress_dialog(self, window) -> None:
+        from nlapt_gui.widgets.batch_progress_dialog import BatchProgressDialog
+
+        assert isinstance(window.batch_progress_dialog, BatchProgressDialog)
+        assert not window.batch_progress_dialog.isVisible()
+
     def test_close_calls_controller_close(self, qtbot, controller, manager, monkeypatch) -> None:
         win = MainWindow(controller, manager)
         qtbot.addWidget(win)

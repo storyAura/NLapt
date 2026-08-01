@@ -90,6 +90,20 @@ class _FadeMixin:
             0.0, 1.0, DIALOG_FADE_IN_MS, lambda: self.setWindowOpacity(1.0)  # type: ignore[attr-defined]
         )
 
+    def prepare_reshow(self) -> None:
+        """Arm centering + the open fade again on a reused dialog instance.
+
+        A still-running close fade is stopped first (Qt emits ``finished``
+        on stop, so the pending hide completes synchronously) and both
+        one-shot flags reset — the next ``show()`` behaves like a fresh
+        first open.
+        """
+        if self._fade_anim is not None:
+            self._fade_anim.stop()
+            self._fade_anim = None
+        self._fade_shown_once = False
+        self._fade_closing = False
+
     def done(self, result: int) -> None:  # noqa: A003 - Qt override
         if (
             self._fade_closing

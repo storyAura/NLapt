@@ -35,14 +35,26 @@ DEFAULT_USER_PROMPT = (
     "suitable for image-generation training. Reply with the caption text only."
 )
 
+# Inference engines (统一管线 by default; local may override its prompts).
+ENGINE_LLM = "llm"
+ENGINE_LOCAL = "local"
+
 
 @dataclass(frozen=True)
 class VisionPrompts:
-    """Immutable prompt configuration for image inference."""
+    """Immutable prompt configuration for image inference.
+
+    One shared prompt set drives every engine (统一管线). When
+    ``local_unified`` is off, 本地推理 uses its own ``local_system`` /
+    ``local_user_prompt`` pair instead.
+    """
 
     active: str = DEFAULT_PROMPT_NAME
     prompts: Mapping[str, str] = field(default_factory=dict)  # custom name -> text
     user_prompt: str = ""
+    local_unified: bool = True
+    local_system: str = ""
+    local_user_prompt: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "prompts", dict(self.prompts))
@@ -61,6 +73,19 @@ class VisionPrompts:
         """The user prompt, falling back to the built-in instruction."""
         stripped = self.user_prompt.strip()
         return stripped if stripped else DEFAULT_USER_PROMPT
+
+    def system_text_for(self, engine: str) -> str:
+        """System prompt for an engine (local override when not unified)."""
+        if engine == ENGINE_LOCAL and not self.local_unified:
+            return self.local_system
+        return self.system_text()
+
+    def user_prompt_for(self, engine: str) -> str:
+        """User prompt for an engine, with the built-in fallback applied."""
+        if engine == ENGINE_LOCAL and not self.local_unified:
+            stripped = self.local_user_prompt.strip()
+            return stripped if stripped else DEFAULT_USER_PROMPT
+        return self.effective_user_prompt()
 
     def with_changes(self, **changes: object) -> "VisionPrompts":
         """Return a copy with the given fields replaced (immutable update)."""
@@ -101,10 +126,17 @@ def load_vision_prompts(path: Path | None = None) -> VisionPrompts:
     ):
         active = DEFAULT_PROMPT_NAME
     user_prompt = raw.get("user_prompt", "")
+    local_system = raw.get("local_system", "")
+    local_user_prompt = raw.get("local_user_prompt", "")
     return VisionPrompts(
         active=active,
         prompts=prompts,
         user_prompt=user_prompt if isinstance(user_prompt, str) else "",
+        local_unified=bool(raw.get("local_unified", True)),
+        local_system=local_system if isinstance(local_system, str) else "",
+        local_user_prompt=(
+            local_user_prompt if isinstance(local_user_prompt, str) else ""
+        ),
     )
 
 
@@ -117,6 +149,9 @@ def save_vision_prompts(prompts: VisionPrompts, path: Path | None = None) -> Non
         "active": prompts.active,
         "prompts": dict(prompts.prompts),
         "user_prompt": prompts.user_prompt,
+        "local_unified": prompts.local_unified,
+        "local_system": prompts.local_system,
+        "local_user_prompt": prompts.local_user_prompt,
     }
     atomic_write_text(target, json.dumps(payload, ensure_ascii=False, indent=2))
     _LOGGER.info("vision prompts saved (active=%s)", prompts.active)

@@ -723,6 +723,195 @@ Four user-reported issues fixed (suite 1838 green):
    a disabled 「更多工具(规划中)」 placeholder. `action_settings`
    remains for programmatic callers.
 
+## v1.7 — 推标(LLM / 本地)、文件夹多选、内置 llama.cpp 运行时
+
+User feature round (5 requests) — all additive:
+
+1. **文件夹右键推标 + ALL 行 + 文件夹多选** (`file_panel.py`): every
+   `_FolderGroup` header carries a tri-state `QCheckBox` (click selects /
+   clears the whole folder via `AppController.set_folder_selected`;
+   coverage from `folder_selection_state` → all/some/none) and a
+   `CustomContextMenu`; an `_AllRow` ("ALL" + total count + checkbox)
+   sits permanently above the groups (`all_row`, groups insert after it).
+   Right-click (folder header or ALL row) → 推标 menu built by
+   `infer_menu_actions(folder)` (the test seam): 此文件夹 / 已选 / 全部 ×
+   LLM / 本地模型, with `取消当前推标` replacing everything while
+   `controller.batch_running()`. Choosing an action runs `ask_confirm`
+   (captions get overwritten; snapshot + 历史回滚 mentioned) and emits
+   `infer_requested(keys_tuple, engine)`; MainWindow routes it to
+   `vision_bridge.request_batch`.
+2. **Caption bar 两个推理按钮** (`caption_bar.py`): 重译 became
+   `LLM 推理` (`reinfer_btn`) + `本地推理` (`local_infer_btn`), both
+   through `_on_infer(engine)`; pending state is `(key, engine)`, busy
+   text `推理中…` on the active engine's button only, per-engine
+   unconfigured toasts (`TOAST_VISION_UNCONFIGURED` /
+   `TOAST_LOCAL_UNCONFIGURED`), history labels `推理(LLM)` / `推理(本地)`,
+   preview title `{name} · 推理结果`. `configured(engine)` is duck-called
+   with a no-arg fallback for legacy bridges.
+3. **VisionBridge engines** (`vision_bridge.py`): `request(key,
+   engine=ENGINE_LLM)` and `configured(engine)`; `ENGINE_LLM`/`ENGINE_LOCAL`
+   live in `prompt_store` (re-exported). The local captioner comes from
+   `local_bridge.make_local_vision_captioner` (test seam:
+   `local_captioner_factory` ctor arg; typed `NLaptError` → emitted as a
+   failed `caption_ready`). `request_batch(keys, engine)` resolves the
+   engine captioner + per-engine prompts + concurrency (LLM →
+   `config.request.concurrency`, local → `LocalSettings.parallel`), then
+   calls `AppController.run_caption_batch`; for a local batch it records
+   whether the server was already running and stops it AFTER the whole
+   batch only if the batch started it (加载一次、全部推完再卸载).
+4. **AppController batch surface** (`controller.py`):
+   `run_caption_batch(keys, caption_fn, *, description, history_label,
+   engine, concurrency, on_finished) -> bool` (busy-guarded like
+   `_run_batch`; pushes per-file labeled history for changed keys; toasts
+   开始/完成/取消; emits new `batch_progress(description, done, total)`
+   from the worker thread — Qt queues delivery), `cancel_batch()`
+   (cooperative `BatchController.cancel`), `batch_running()`, plus folder
+   selection helpers `folder_keys` / `folder_selection_state` /
+   `set_folder_selected`.
+5. **统一提示词管线 + 本地覆写** (`prompt_store.py`, `prompt_editor.py`):
+   `VisionPrompts` gains `local_unified=True`, `local_system`,
+   `local_user_prompt` and engine-aware `system_text_for(engine)` /
+   `user_prompt_for(engine)` (local fallback to `DEFAULT_USER_PROMPT`
+   when its user prompt is empty). The 提示词 tab adds a
+   `本地推理共用上方提示词(统一管线)` checkbox; unchecking reveals the
+   local system/user editors (`local_system_edit`, `local_user_edit`).
+6. **就绪即可用 runtime** (`local_bridge.py`, `local_tab.py`): settings
+   path helpers went module-level (`local_settings_path`,
+   `models_dir_for`, `search_dirs`, `find_model_file_in`,
+   `find_mmproj_file_in`, `is_downloaded_in`, `build_spec_for`) so
+   inference works outside the settings dialog; `runtime_base_dir()` =
+   `app_data_dir()/runtime`; `resolve_server_path` = manual setting →
+   extracted runtime → "". `pending_runtime_asset` folds the pinned
+   llama.cpp archive into `start_download` (progress totals include it),
+   and `start_server` auto-provisions via `ensure_runtime` on the pool.
+   `resolve_local_target(settings=None, require_vision=True)` validates
+   selection/download/vision/runtime with actionable Chinese
+   `LocalInferenceError`s; `make_local_vision_captioner(image_max_edge=)`
+   returns the blocking `(image_path, system, user) -> caption` callable
+   (ensure runtime → `manager.ensure(spec)` → OpenAI-compatible request,
+   `LOCAL_VISION_TIMEOUT_SECONDS` 300s). The 本地推理 tab shows an
+   auto placeholder for llama-server, only demands a manual path when the
+   platform has no pinned runtime, and its hint explains 就绪即可用.
+7. **StatusBar** shows `batch_label` (`推标(...) done/total`) driven by
+   `batch_progress`, hidden on `batch_finished`.
+8. **Auto GPU layers fix** (user report: llama-server 退出码 1 / OOM):
+   `local_bridge.prepare_launch_spec(spec, family, quant)` is the single
+   blocking pre-launch step (worker thread only) — provisions the runtime
+   when `server_path` is empty AND resolves 自动 (-1) GPU layers via
+   `detect_hardware` + `gguf.read_block_count` + `advisor.auto_gpu_layers`.
+   Resolved counts are cached per (model_path, context_length) under a
+   lock so every caller (设置 ▸ 启动本地服务, single 推理, batch workers)
+   launches an IDENTICAL spec and `manager.ensure()` keeps reusing the
+   running server (fluctuating free-VRAM probes must not restart it
+   mid-batch). Manual `gpu_layers >= 0` passes through untouched, no
+   probe. Tests that reach `start_server` set explicit gpu_layers (or
+   patch `local_bridge.detect_hardware`) to stay hermetic.
+9. **Per-slot context + no-thinking launch** (user report: 推理返回空文本):
+   `_auto_gpu_layers_for` budgets KV with `context_length × parallel`
+   (cache key includes the total), matching `build_server_args`' new
+   `-c` semantics; the 本地推理 tab's 「能否运行」/明细 estimates use
+   `_estimate_context()` (ctx × parallel, recomputed when either spin
+   changes) and the catalog hint says so.
+10. **Preview clamp fix** (same round, user report 推理结果无法应用):
+   `TranslationPreview` hosts its body in a `QScrollArea` (`body_scroll`)
+   and gains `fit_within(max_w, max_h)` — deterministic manual sizing
+   (label `heightForWidth` at the real inner width + chrome) so the
+   title and 替换/关闭 buttons ALWAYS stay inside the host while a long
+   inference result scrolls inside the card. Both positioners clamp
+   before anchoring: `CaptionBar.reposition_overlay` (host minus
+   `overlay_top`/margins) and `EditorPanel._position_preview` (panel
+   minus toolbar gaps).
+
+## v1.7.1 — 推标进度窗口(实时进度 / 速度 / 预计剩余)
+
+User request: 推标(LLM / 本地)开始时弹出独立窗口,实时显示进度条、张数、
+速度与预计剩余时间,风格与全局主题一致。Additive:
+
+1. **AppController**: new `batch_started(description, total)` signal,
+   emitted on the GUI thread by `run_caption_batch` right after the busy
+   flip / started toast — the progress window's show trigger
+   (`batch_progress` alone could arrive only after the first slow item).
+   Text-op batches (`_run_batch`) do NOT emit it.
+2. **BatchProgressDialog** (`widgets/batch_progress_dialog.py`): non-modal
+   `CenteredDialog` owned by MainWindow (`batch_progress_dialog`),
+   self-wired to controller signals. `batch_started` resets state and
+   shows (each batch re-opens centered with the standard fade via the new
+   `_FadeMixin.prepare_reshow()`); `batch_progress` updates bar / count /
+   percent and recomputes speed + ETA; an `_active` flag makes text-op
+   `batch_finished` and late queued progress events no-ops. Header = batch
+   description + right-aligned mono percent; slim themed `QProgressBar`
+   (`BAR_HEIGHT_PX` 8, text hidden); stat grid 进度 / 速度(`{rate:.1f}
+   张/分`, overall average done÷elapsed) / 已用时间 / 预计剩余(both
+   `format_duration`: `mm:ss`, `h:mm:ss` from 1h; placeholder `—` until
+   the first item lands). Buttons: 后台运行 (`close()` — the batch keeps
+   running, the status bar still shows progress; the window returns on the
+   next batch) and 取消推标 (`controller.cancel_batch()`, flips to
+   disabled 正在取消…, re-armed on the next `batch_started`). Elapsed/ETA
+   tick from a 1s QTimer; wall time comes from an injectable monotonic
+   `clock` ctor arg and `refresh_stats()` is public (the test seam — tests
+   advance the fake clock and call it directly).
+3. **Theme QSS**: global `QProgressBar` styling (surface2 trough, 1px bd
+   border, radius 4, accent chunk radius 3, centered text2 10.5px text) —
+   the 本地推理 download bar inherits it unchanged.
+
+## v1.8 — Florence-2 PromptGen 打标模型(指令模式设置)
+
+User request: 收录 Florence-2 PromptGen v2.0 并为其特有的指令提示
+(`<GENERATE_TAGS>` 等)提供一个设置。Additive:
+
+1. **LocalTab**: new 指令模式 form row — `florence_task_combo`
+   (`QComboBox`, entries from `FLORENCE_TASK_LABELS`, token in userData) —
+   the FIRST form row, visible only while the selected family's engine is
+   `ENGINE_FLORENCE` (`QFormLayout.setRowVisible`). `persist()` writes
+   `florence_task=combo.currentData()`; prefill restores it. For Florence
+   selections the server button is enabled only to STOP an already-running
+   llama server (tooltip `TIP_FLORENCE_NO_SERVER`; `_on_server_clicked`
+   guard toasts it) and 设为当前模型 is disabled
+   (`TIP_FLORENCE_NO_APPLY` — the model cannot serve translate/rewrite).
+   The 体积 column shows quant + extra_files total; `SERVER_HINT` gained a
+   Florence exception sentence.
+2. **local_bridge**: `is_downloaded_in` / `start_download` cover
+   `family.extra_files` (same resumable download + SHA256 verify; the
+   llama.cpp runtime is never provisioned for Florence families);
+   `find_model_file_in` doubles for extra files (basename in family dir,
+   reuse dirs honored). `resolve_local_target` skips the llama-runtime
+   platform check for Florence. `make_local_vision_captioner` branches:
+   Florence → process-wide `get_florence_engine(florence_files_for(...))`
+   singleton (replaced when the resolved file set changes) captioning
+   in-process with the persisted `settings.florence_task`; the
+   system/user prompts from prompt_store do NOT apply. llama path
+   unchanged. VisionBridge / caption batches need no changes — the
+   captioner factory hides the engine; the post-batch server stop is a
+   no-op for Florence (sessions stay warm until the process exits or the
+   file set changes).
+
+## v1.9 — 推标右键菜单按目标分作用域 + 未标注推理
+
+User request: 右键菜单只显示与点击目标相关的作用域;多选图片时提供
+推理全部;文件夹菜单新增"推理未标注"。Behavior change in
+`file_panel.py` + one `AppController` helper:
+
+1. **AppController**: new `unlabeled_keys(keys) -> tuple[str, ...]` —
+   subset of `keys` whose `record(key).state is CaptionState.UNLABELED`
+   (empty body text), input order preserved.
+2. **FilePanel menu seam**: `infer_menu_actions(folder, image=None)` /
+   `show_infer_menu(folder, widget, pos, image=None)`. The menu is scoped
+   to the right-click target (取消当前推标 still replaces everything while
+   `batch_running()`):
+   - **image cell** (`image=key`; cells get `CustomContextMenu` via
+     `_attach_cell_menu` in `_build_group_content`): if the key is part of
+     a multi-selection (`len(selected) > 1` and key selected) → 已选 ×2 +
+     全部 ×2; otherwise 这张图片 ×2 (`MENU_INFER_IMAGE_*`, that key only).
+   - **folder header** (non-root): 此文件夹 ×2 + 此文件夹未标注 ×2
+     (`MENU_INFER_FOLDER_UNLABELED_*`, only when the folder has unlabeled
+     files) + 全部 ×2.
+   - **ALL row and the 根目录 group** (folder `FOLDER_ROOT_LABEL` maps to
+     the same menu): 全部 ×2 + 全部未标注 ×2 (`MENU_INFER_ALL_UNLABELED_*`,
+     only when present). 已选 / 此文件夹 never appear here — 已选 entries
+     exist only on multi-selected image cells.
+   Separator grouping strips spaces from the scope key so the LLM/本地模型
+   variants of one scope stay in the same group.
+
 ## Testing rules
 
 - `tests/gui/conftest.py`: offscreen env; `qapp` from pytest-qt; fixture
@@ -740,3 +929,49 @@ Four user-reported issues fixed (suite 1838 green):
 - LLM in tests: `nlapt.llm.base.register_client` with MockLLMClient; unique api_type per
   test module.
 ```
+
+## v1.10 — 拦截防护、下载进度重连、翻译重试、官方预设提示词
+
+User request: LLM 推标偶发被安全策略拦截,产物风格明显异常;设置页关闭
+重开后看不到下载进度只弹「已有下载任务正在进行」;翻译偶发超时;
+JoyCaption / ToriiGate 这类模型自带官方预设,需要全部补上。
+
+1. **推标请求走 spec-8 管控 + 拦截防护**:
+   `AppController.make_vision_captioner_or_none(*, retry_sleep=time.sleep)`
+   现在通过 `_paced_complete`(nlapt.llm.rewrite)执行请求 —
+   `config.request` 的超时/指数退避重试/最小间隔全部生效,一个
+   captioner 实例共享一个 `MinIntervalLimiter`(整个批次同一节奏)。
+   清洗后的结果再过 `ensure_not_refusal`:疑似拒绝话术抛
+   `LLMOutputError` → 单张推理在编辑区显示错误、批量里计入失败并保留
+   原标注,不再把"道歉文"写进数据集。本地 llama captioner 同样加了
+   refusal 防护(不加重试 — 本地 300 s 超时重试只会翻倍等待)。
+2. **下载任务进程级化(重开对话框可重连)**:`local_bridge` 新增
+   `_DownloadHub`(进程级 QObject,`get_download_hub()`)与单一活动任务
+   快照 `active_download() -> (family_id, quant_label, done, total) | None`
+   (模块函数 + `LocalBridge.active_download()`)。`LocalBridge.__init__`
+   把 hub 的 `progress`/`finished` 转接到自己的同名信号(Qt 在 bridge
+   销毁时自动断开);worker 只向 hub 发信号,原先对已销毁 bridge 的
+   `_alive`/RuntimeError 兜底不再需要。`is_downloading()` 现在是
+   进程级判断,`cancel_download()` 可从任何 bridge 取消当前任务,
+   `start_download` 在已有任务时直接返回 False(每次一个任务;
+   原 `_ACTIVE_DOWNLOAD_PATHS` 集合被单任务快照取代)。
+   **LocalTab**:`_prefill_from_settings` 末尾检查 `active_download()`,
+   命中则选中对应量化档、显示进度条并回放快照(按钮经由
+   `is_downloading()` 自动进入「取消下载」态)。
+3. **翻译协调修复**:`TranslateBridge(..., retry_sleep=time.sleep)`;
+   web 服务(Google/百度/DeepL)的 `translate`/`translate_to` 调用统一
+   包上 `with_retry(RetryPolicy(max_retries=config.request.max_retries))`
+   (LLM 路径本就在 Translator 内部重试,不重复包装);配合核心侧
+   `WEB_TRANSLATE_TIMEOUT_SECONDS = 15.0`,卡住的请求 15 秒即进入重试
+   而不是干等 60 秒后直接失败。
+4. **提示词预设(官方指令)**:`LocalTab` 新增 `提示词预设` 表单行 —
+   `preset_combo`(QComboBox,userData 为 preset_id),仅当所选
+   family 在 `nlapt.local.presets` 有官方预设时显示(JoyCaption 12 项 /
+   ToriiGate 10 项),末项固定为「自定义(使用推理提示词)」
+   (`PRESET_CUSTOM`)。按 family 惰性填充(`_populate_presets`,
+   family 未变不重建),恢复持久化选择,未知/空值落到该 family 的
+   默认(第一个)预设;`persist()` 写 `prompt_preset`(combo 未填充时
+   保留存量值)。`make_local_vision_captioner` 的 llama 分支按
+   `resolve_preset(family_id, settings.prompt_preset)` 用预设的
+   system/user 覆盖传入提示词;`PRESET_CUSTOM` 沿用 设置 ▸ 提示词。
+   云端 LLM 引擎与 Florence 不受影响。

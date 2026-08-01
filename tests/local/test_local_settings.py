@@ -73,6 +73,32 @@ class TestRoundtrip:
         target.write_text('{"extra_dirs": "not-a-list"}', encoding="utf-8")
         assert load_local_settings(target).extra_dirs == ()
 
+    def test_florence_task_roundtrip(self, tmp_path: Path) -> None:
+        from nlapt.local.florence import TASK_ANALYZE
+
+        target = settings_file(tmp_path)
+        save_local_settings(target, LocalSettings(florence_task=TASK_ANALYZE))
+        assert load_local_settings(target).florence_task == TASK_ANALYZE
+
+    def test_florence_task_invalid_falls_back_to_default(
+        self, tmp_path: Path
+    ) -> None:
+        from nlapt.local.florence import DEFAULT_FLORENCE_TASK
+
+        target = settings_file(tmp_path)
+        target.write_text('{"florence_task": "<NOPE>"}', encoding="utf-8")
+        assert load_local_settings(target).florence_task == DEFAULT_FLORENCE_TASK
+
+    def test_prompt_preset_roundtrip(self, tmp_path: Path) -> None:
+        target = settings_file(tmp_path)
+        save_local_settings(target, LocalSettings(prompt_preset="Danbooru tag list"))
+        assert load_local_settings(target).prompt_preset == "Danbooru tag list"
+
+    def test_prompt_preset_defaults_to_empty(self, tmp_path: Path) -> None:
+        target = settings_file(tmp_path)
+        target.write_text("{}", encoding="utf-8")
+        assert load_local_settings(target).prompt_preset == ""
+
     def test_save_rejects_wrong_type(self, tmp_path: Path) -> None:
         with pytest.raises(StorageError):
             save_local_settings(settings_file(tmp_path), {"port": 1})  # type: ignore[arg-type]

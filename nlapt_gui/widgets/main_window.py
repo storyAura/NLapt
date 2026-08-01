@@ -57,6 +57,7 @@ from nlapt_gui.theme.manager import ThemeManager
 from nlapt_gui.theme.tokens import EDITOR_H_RANGE, MIN_WINDOW, ThemeTokens
 from nlapt_gui.translate_bridge import TranslateBridge
 from nlapt_gui.vision_bridge import VisionBridge
+from nlapt_gui.widgets.batch_progress_dialog import BatchProgressDialog
 from nlapt_gui.widgets.color_dialog import ColorSettingsDialog
 from nlapt_gui.widgets.editor_panel import EditorPanel
 from nlapt_gui.widgets.file_panel import FilePanel
@@ -221,6 +222,9 @@ class MainWindow(QWidget):
         self.toast_overlay = ToastOverlay(self, tokens=theme_manager.tokens)
         controller.toast_requested.connect(self.toast_overlay.show_toast)
 
+        # 推标进度窗口: self-wired to batch_started/progress/finished.
+        self.batch_progress_dialog = BatchProgressDialog(controller, parent=self)
+
         self.editor_panel.setFixedHeight(_clamp_editor_h(controller.settings.editor_h))
         self.splitter.editor_h_changed.connect(self._apply_editor_height)
 
@@ -228,6 +232,10 @@ class MainWindow(QWidget):
         controller.busy_changed.connect(self._on_busy_changed)
 
         self.file_panel.open_folder_requested.connect(self.pick_folder)
+        # 文件夹右键推标 -> batch captioning through the vision bridge.
+        self.file_panel.infer_requested.connect(
+            lambda keys, engine: self.vision_bridge.request_batch(tuple(keys), engine)
+        )
         self.title_bar.open_folder_requested.connect(self.pick_folder)
         self.title_bar.settings_requested.connect(self.tools_panel.open_settings_dialog)
         self.title_bar.colors_requested.connect(self.open_color_settings)

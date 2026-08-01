@@ -23,8 +23,9 @@ from dataclasses import dataclass
 from enum import Enum
 
 from nlapt.core.errors import ValidationError
-from nlapt.local.catalog import ModelFamily, QuantFile
+from nlapt.local.catalog import ENGINE_FLORENCE, ModelFamily, QuantFile
 from nlapt.local.hardware import HardwareInfo
+from nlapt.local.server import GPU_LAYERS_ALL
 
 OVERHEAD_BASE_BYTES = 600 * 1024 * 1024
 WEIGHTS_OVERHEAD_FACTOR = 0.05
@@ -32,6 +33,9 @@ VRAM_USABLE_SHARE = 0.92
 RAM_USABLE_SHARE = 0.70
 DEFAULT_CONTEXT_LENGTH = 4096
 MAX_CONTEXT_LENGTH = 1_048_576
+# Florence runs a fixed-shape pipeline (577 image tokens + ≤1024 generated);
+# the llama-server 上下文长度 setting does not apply to it.
+FLORENCE_CONTEXT_TOKENS = 1664
 
 
 class RunVerdict(str, Enum):
@@ -117,9 +121,11 @@ def estimate_memory(
 ) -> MemoryEstimate:
     """Heuristic memory footprint of ``quant`` at ``context_length`` tokens."""
     context = _validated_context(context_length)
+    if family.engine == ENGINE_FLORENCE:
+        context = FLORENCE_CONTEXT_TOKENS
     if quant.size_bytes <= 0:
         raise ValidationError(f"quant {quant.label!r} has no size information")
-    weights = quant.size_bytes
+    weights = quant.size_bytes + sum(extra.size_bytes for extra in family.extra_files)
     mmproj = family.mmproj_bytes if family.vision else 0
     kv_cache = family.kv_bytes_per_token * context
     overhead = OVERHEAD_BASE_BYTES + int(weights * WEIGHTS_OVERHEAD_FACTOR)
@@ -129,6 +135,48 @@ def estimate_memory(
         kv_cache_bytes=kv_cache,
         overhead_bytes=overhead,
     )
+
+
+def auto_gpu_layers(
+    family: ModelFamily,
+    quant: QuantFile,
+    hardware: HardwareInfo,
+    *,
+    context_length: int = DEFAULT_CONTEXT_LENGTH,
+    block_count: int | None = None,
+) -> int:
+    """The ``-ngl`` value that actually FITS the usable free VRAM (自动).
+
+    Blindly offloading everything OOM-kills llama-server on machines the
+    advisor itself graded as "needs RAM participation", so 自动 must mean
+    "as many layers as the budget allows":
+
+    * whole estimate fits the scaled free VRAM -> :data:`GPU_LAYERS_ALL`;
+    * no usable GPU -> 0 (CPU only);
+    * otherwise weights+kv are spread evenly over ``block_count`` layers,
+      mmproj + overhead are reserved on the GPU first, and the remaining
+      budget buys whole layers (clamped to [0, block_count]);
+    * unknown ``block_count`` while not fitting -> 0 (conservative: a slow
+      CPU run beats a crashed server).
+    """
+    estimate = estimate_memory(family, quant, context_length=context_length)
+    gpu = hardware.best_gpu()
+    if gpu is None:
+        return 0
+    usable_vram = (
+        gpu.vram_free_bytes if gpu.vram_free_bytes > 0 else gpu.vram_total_bytes
+    )
+    budget = int(usable_vram * VRAM_USABLE_SHARE)
+    if budget >= estimate.total_bytes:
+        return GPU_LAYERS_ALL
+    if block_count is None or block_count <= 0:
+        return 0
+    per_layer = (estimate.weights_bytes + estimate.kv_cache_bytes) / block_count
+    if per_layer <= 0:
+        return 0
+    reserved = estimate.mmproj_bytes + estimate.overhead_bytes
+    layers = int((budget - reserved) // per_layer)
+    return max(0, min(layers, block_count))
 
 
 def _grade_for(

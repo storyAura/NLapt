@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -12,6 +12,8 @@ from nlapt.local.catalog import (
     ALL_FAMILIES,
     ALL_SERIES,
     CATALOG_SNAPSHOT_DATE,
+    ENGINE_FLORENCE,
+    ENGINE_LLAMA,
     all_families,
     all_series,
     download_url,
@@ -24,6 +26,7 @@ from nlapt.local.catalog import (
     recommended_quant,
     repo_page_url,
 )
+from nlapt.local.florence import REQUIRED_FILES
 
 
 class TestCatalogIntegrity:
@@ -48,14 +51,36 @@ class TestCatalogIntegrity:
         for series in ALL_SERIES:
             assert families_for(series.series_id), series.series_id
 
+    def test_engines_are_known(self) -> None:
+        for family in ALL_FAMILIES:
+            assert family.engine in (ENGINE_LLAMA, ENGINE_FLORENCE), family.family_id
+
     def test_quants_have_positive_sizes_and_unique_labels(self) -> None:
         for family in ALL_FAMILIES:
             assert family.quants
             labels = [quant.label for quant in family.quants]
             assert len(labels) == len(set(labels))
-            for quant in family.quants:
+            suffixes = (
+                (".gguf",) if family.engine == ENGINE_LLAMA else (".onnx", ".json")
+            )
+            for quant in (*family.quants, *family.extra_files):
                 assert quant.size_bytes > 0
-                assert quant.filename.endswith(".gguf")
+                assert quant.filename.endswith(suffixes), quant.filename
+
+    def test_extra_files_only_on_florence_families(self) -> None:
+        for family in ALL_FAMILIES:
+            if family.engine == ENGINE_LLAMA:
+                assert family.extra_files == (), family.family_id
+
+    def test_florence_families_ship_the_engine_file_set(self) -> None:
+        florence = [f for f in ALL_FAMILIES if f.engine == ENGINE_FLORENCE]
+        assert florence  # the requested PromptGen model is present
+        for family in florence:
+            basenames = {
+                PurePosixPath(item.filename).name
+                for item in (*family.quants, *family.extra_files)
+            }
+            assert basenames == set(REQUIRED_FILES), family.family_id
 
     def test_exactly_one_recommended_quant_per_family(self) -> None:
         for family in ALL_FAMILIES:
@@ -64,8 +89,9 @@ class TestCatalogIntegrity:
             assert recommended_quant(family) == recommended[0]
 
     def test_vision_families_carry_mmproj(self) -> None:
+        # mmproj is a llama.cpp concept; Florence vision needs none.
         for family in ALL_FAMILIES:
-            if family.vision:
+            if family.vision and family.engine == ENGINE_LLAMA:
                 assert family.mmproj_filename.endswith(".gguf"), family.family_id
                 assert family.mmproj_bytes > 0
             else:
@@ -75,9 +101,9 @@ class TestCatalogIntegrity:
     def test_every_file_has_a_sha256_digest(self) -> None:
         hex64 = re.compile(r"[0-9a-f]{64}")
         for family in ALL_FAMILIES:
-            for quant in family.quants:
+            for quant in (*family.quants, *family.extra_files):
                 assert hex64.fullmatch(quant.sha256), (family.family_id, quant.label)
-            if family.vision:
+            if family.vision and family.engine == ENGINE_LLAMA:
                 assert hex64.fullmatch(family.mmproj_sha256), family.family_id
             else:
                 assert family.mmproj_sha256 == ""
@@ -98,6 +124,7 @@ class TestCatalogIntegrity:
         assert any(family.series_id == "gemma4-heretic" for family in ALL_FAMILIES)
         assert "toriigate-0.5" in ids
         assert "joycaption-beta-one" in ids
+        assert "florence2-promptgen-v2" in ids
 
 
 class TestLookups:

@@ -31,10 +31,14 @@ from typing import Any, Callable, Mapping, Protocol, runtime_checkable
 
 from nlapt.core.errors import LLMConfigError, LLMRequestError
 from nlapt.diagnostics import get_logger
-from nlapt.llm.base import DEFAULT_TIMEOUT_SECONDS, require_httpx
+from nlapt.llm.base import require_httpx
 from nlapt.llm.translate import Direction, TARGET_LANGS
 
 _LOGGER = get_logger(__name__)
+
+# Web translation endpoints answer in a couple of seconds when healthy; a
+# short per-attempt timeout + the caller's retry beats one 60 s hang.
+WEB_TRANSLATE_TIMEOUT_SECONDS = 15.0
 
 # -- provider identifiers ----------------------------------------------------
 PROVIDER_GOOGLE = "google"
@@ -109,7 +113,7 @@ class GoogleFreeProvider:
         self,
         *,
         transport: Any = None,
-        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        timeout: float = WEB_TRANSLATE_TIMEOUT_SECONDS,
     ) -> None:
         self._transport = transport
         self._timeout = timeout
@@ -172,7 +176,7 @@ class BaiduProvider:
         key: str,
         *,
         transport: Any = None,
-        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        timeout: float = WEB_TRANSLATE_TIMEOUT_SECONDS,
     ) -> None:
         appid = (appid or "").strip()
         key = (key or "").strip()
@@ -258,7 +262,7 @@ class DeepLProvider:
         *,
         endpoint: str = DEEPL_ENDPOINT,
         transport: Any = None,
-        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        timeout: float = WEB_TRANSLATE_TIMEOUT_SECONDS,
     ) -> None:
         key = (key or "").strip()
         if not key:

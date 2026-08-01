@@ -136,6 +136,26 @@ class TestOpenAIClient:
         with pytest.raises(LLMRequestError):
             client.complete(basic_request())
 
+    def test_content_filter_finish_reason_raises(self) -> None:
+        # Providers flag safety interception via finish_reason; the payload
+        # may carry a null/replaced message that must not mask the cause.
+        body = {
+            "choices": [
+                {"finish_reason": "content_filter", "message": {"content": None}}
+            ]
+        }
+        profile = make_profile("openai", "https://api.test/v1")
+        client = OpenAIClient(profile, transport=capture_transport([], json_body=body))
+        with pytest.raises(LLMRequestError) as excinfo:
+            client.complete(basic_request())
+        assert "内容安全拦截" in str(excinfo.value)
+
+    def test_normal_finish_reason_returns_text(self) -> None:
+        body = {"choices": [{"finish_reason": "stop", "message": {"content": "ok"}}]}
+        profile = make_profile("openai", "https://api.test/v1")
+        client = OpenAIClient(profile, transport=capture_transport([], json_body=body))
+        assert client.complete(basic_request()).text == "ok"
+
     def test_non_json_response_raises(self) -> None:
         captured: list[httpx.Request] = []
         profile = make_profile("openai", "https://api.test/v1")

@@ -72,6 +72,10 @@ AI_BATCH_KIND = "ai_batch"
 SESSION_PENDING_SOURCE = "session"
 # Batch operation name prefix for AI rewrite runs (also the pending source).
 REWRITE_OPERATION_PREFIX = "rewrite"
+# Batch operation name prefix for vision caption (推标) runs.
+CAPTION_OPERATION_PREFIX = "caption"
+# Item error when a captioner returns empty text (must never blank captions).
+EMPTY_CAPTION_ERROR = "empty caption from model"
 # Detail strings for batch item results.
 NO_CHANGE_DETAIL = "no change"
 # Max characters of suggestion text quoted in a batch item detail.
@@ -555,6 +559,76 @@ class NLaptApp:
             affected_keys=tuple(r.key for r in report.results if r.ok),
             snapshot=None,
             kind=AI_BATCH_KIND,
+        )
+        return report
+
+    def run_caption_batch(
+        self,
+        keys: Sequence[str],
+        caption_fn: Callable[[str, Path], str],
+        *,
+        description: str,
+        engine: str = "",
+        concurrency: int = 1,
+        controller: BatchController | None = None,
+        on_progress: ProgressCallback | None = None,
+    ) -> BatchReport:
+        """Batch 推标: caption every image and WRITE the results to disk.
+
+        Unlike :meth:`run_rewrite_batch` (pending suggestions) this replaces
+        caption bodies directly, so the run follows the destructive-batch
+        safety model: snapshot before executing, per-file save, one
+        ``kind="batch"`` oplog record for whole-batch rollback, and a resume
+        checkpoint keyed by ``engine`` + keys. ``caption_fn(key, image_path)``
+        runs concurrently (the slow LLM round-trips); store/index/disk
+        mutations are serialized under the app lock. An empty result marks
+        the item failed and leaves the caption untouched.
+        """
+        self._require_dataset()
+        if not callable(caption_fn):
+            raise ValidationError(
+                f"caption_fn must be callable, got {type(caption_fn).__name__}"
+            )
+        if not isinstance(description, str) or not description.strip():
+            raise ValidationError(
+                f"description must be a non-empty string, got {description!r}"
+            )
+        for key in keys:
+            self._require_file(key)
+        operation = f"{CAPTION_OPERATION_PREFIX}:{engine or description}"
+        checkpoint_id = make_checkpoint_id(operation, keys, engine)
+        changed: list[str] = []
+
+        def worker(key: str) -> BatchItemResult:
+            text = caption_fn(key, self._files[key].image_path).strip()
+            if not text:
+                return BatchItemResult(key=key, ok=False, error=EMPTY_CAPTION_ERROR)
+            with self._lock:
+                if self._store.get(key).text == text:
+                    return BatchItemResult(key=key, ok=True, detail=NO_CHANGE_DETAIL)
+                self._store.set_text(key, text)
+                self._push_undo(key, text)
+                self._index.update(key, text)
+                self.save(key)
+                changed.append(key)
+            return BatchItemResult(key=key, ok=True, detail=text[:DETAIL_TEXT_LIMIT])
+
+        assert self._engine is not None
+        report = self._engine.run(
+            operation=operation,
+            keys=keys,
+            worker=worker,
+            concurrency=concurrency,
+            controller=controller,
+            on_progress=on_progress,
+            take_snapshot=True,
+            checkpoint_id=checkpoint_id,
+        )
+        self.oplog.append(
+            description=description,
+            affected_keys=self._txt_keys(changed),
+            snapshot=report.snapshot,
+            kind=BATCH_KIND,
         )
         return report
 

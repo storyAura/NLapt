@@ -86,6 +86,10 @@ class TestFoldersAndFilter:
         assert controller.folder_of(K1) == FOLDER_ROOT_LABEL
         assert controller.folder_of(K3) == "10_concept"
 
+    def test_unlabeled_keys_filters_empty_captions(self, controller: AppController) -> None:
+        assert controller.unlabeled_keys(ALL_KEYS) == (K4,)
+        assert controller.unlabeled_keys((K1, K2)) == ()
+
     def test_filter_by_name(self, controller: AppController, qtbot) -> None:
         with qtbot.waitSignal(controller.filter_changed, timeout=1000):
             controller.set_filter("0003")
@@ -483,3 +487,89 @@ class TestClose:
         from nlapt_gui.settings import load_ui_settings
 
         assert load_ui_settings().view_mode == "list"
+
+
+class TestCaptionBatch:
+    """run_caption_batch: 推标 writes, history, progress, guards."""
+
+    def test_batch_writes_saves_and_records_history(
+        self, qtbot, controller, demo_dataset
+    ) -> None:
+        progress: list[tuple[int, int]] = []
+        controller.batch_progress.connect(
+            lambda _d, done, total: progress.append((done, total))
+        )
+        started: list[tuple[str, int]] = []
+        controller.batch_started.connect(lambda d, t: started.append((d, t)))
+        keys = ("0001.png", "0002.png")
+        with qtbot.waitSignal(controller.batch_finished, timeout=4000) as blocker:
+            assert controller.run_caption_batch(
+                keys,
+                lambda key, path: f"cap {key}",
+                description="推标(LLM) · 2 张",
+                history_label="推标(LLM)",
+                engine="llm",
+                concurrency=2,
+            )
+        report = blocker.args[1]
+        assert report.succeeded == 2 and report.failed == 0
+        for key in keys:
+            record = controller.record(key)
+            assert record.text == f"cap {key}"
+            assert not record.dirty  # batch saves to disk
+            assert controller.history.entries(key)[0].label == "推标(LLM)"
+        assert (demo_dataset / "0001.txt").read_text(encoding="utf-8") == "cap 0001.png"
+        assert progress and progress[-1] == (2, 2)
+        assert started == [("推标(LLM) · 2 张", 2)]
+
+    def test_failed_item_keeps_original_caption(self, qtbot, controller) -> None:
+        original = controller.record("0002.png").text
+
+        def caption(key, path):  # noqa: ANN001
+            if key == "0002.png":
+                raise RuntimeError("boom")
+            return "ok caption"
+
+        with qtbot.waitSignal(controller.batch_finished, timeout=4000) as blocker:
+            assert controller.run_caption_batch(
+                ("0001.png", "0002.png"),
+                caption,
+                description="推标(本地模型) · 2 张",
+                history_label="推标(本地)",
+            )
+        report = blocker.args[1]
+        assert report.failed == 1 and report.failed_keys == ("0002.png",)
+        assert controller.record("0002.png").text == original
+
+    def test_empty_keys_refused_with_toast(self, controller, toasts) -> None:
+        assert not controller.run_caption_batch(
+            (), lambda k, p: "x", description="d", history_label="h"
+        )
+        assert toasts  # 尚未选择任何图片
+
+    def test_busy_guard_refuses_second_batch(self, controller, toasts) -> None:
+        controller._batch_in_flight = True
+        try:
+            assert not controller.run_caption_batch(
+                ("0001.png",), lambda k, p: "x", description="d", history_label="h"
+            )
+        finally:
+            controller._batch_in_flight = False
+        assert any("正在处理" in text for text, _ in toasts)
+
+    def test_on_finished_hook_runs(self, qtbot, controller) -> None:
+        seen: list[object] = []
+        with qtbot.waitSignal(controller.batch_finished, timeout=4000):
+            controller.run_caption_batch(
+                ("0001.png",),
+                lambda key, path: "hooked",
+                description="d",
+                history_label="h",
+                on_finished=seen.append,
+            )
+        qtbot.waitUntil(lambda: bool(seen), timeout=2000)
+        assert seen[0] is not None
+
+    def test_batch_running_and_cancel_noop_when_idle(self, controller) -> None:
+        assert not controller.batch_running()
+        controller.cancel_batch()  # no controller -> silently does nothing

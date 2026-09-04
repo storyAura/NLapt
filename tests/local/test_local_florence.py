@@ -362,3 +362,25 @@ class TestPreprocess:
         assert pixels[0, 0, 0, 0] == pytest.approx((1.0 - 0.485) / 0.229, abs=1e-3)
         assert pixels[0, 1, 0, 0] == pytest.approx(-0.456 / 0.224, abs=1e-3)
         assert pixels[0, 2, 0, 0] == pytest.approx(-0.406 / 0.225, abs=1e-3)
+
+
+class TestOrtDllPreload:
+    def test_preload_calls_ort_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import nlapt.local.florence as florence
+
+        calls: list[dict[str, object]] = []
+
+        def fake_preload(**kwargs: object) -> None:
+            calls.append(kwargs)
+
+        monkeypatch.setattr(florence, "_ort_dlls_preloaded", False)
+        florence._preload_ort_dlls(type("Ort", (), {"preload_dlls": staticmethod(fake_preload)})())
+        florence._preload_ort_dlls(type("Ort", (), {"preload_dlls": staticmethod(fake_preload)})())
+        assert calls == [{"cuda": True, "cudnn": True, "directory": ""}]
+
+    def test_preload_without_api_is_noop(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import nlapt.local.florence as florence
+
+        monkeypatch.setattr(florence, "_ort_dlls_preloaded", False)
+        florence._preload_ort_dlls(type("Ort", (), {})())
+        assert florence._ort_dlls_preloaded is True

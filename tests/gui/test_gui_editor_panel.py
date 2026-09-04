@@ -34,18 +34,23 @@ class StubBridge(QObject):
     """Duck-typed TranslateBridge stand-in (request() + segment_ready)."""
 
     segment_ready = Signal(str, str, str, bool)
+    target_ready = Signal(str, str, str, str, bool)
     all_done = Signal(str, int, int)
 
     def __init__(self, *, configured: bool = True) -> None:
         super().__init__()
         self._configured = configured
         self.requests: list[tuple[str, str, bool]] = []
+        self.target_requests: list[tuple[str, str, str]] = []
 
     def configured(self) -> bool:
         return self._configured
 
     def request(self, key: str, text: str, *, fresh: bool = False) -> None:
         self.requests.append((key, text, fresh))
+
+    def request_to(self, key: str, text: str, target_lang: str) -> None:
+        self.target_requests.append((key, text, target_lang))
 
 
 def make_panel(qtbot, controller, bridge: object | None = None) -> EditorPanel:
@@ -87,7 +92,10 @@ class TestLayout:
     def test_caption_change_refreshes_info_and_block(self, qtbot, controller) -> None:
         panel = make_panel(qtbot, controller)
         controller.set_caption(KEY1, "a, b", "测试")
-        assert panel.char_info_text() == "4 字符 · 2 段"
+        assert panel.char_info_text() == controller.char_seg_info(KEY1)
+        assert "约 " in panel.char_info_text()
+        assert "tokens" in panel.char_info_text()
+        assert "词" in panel.char_info_text()
         chips = panel.blocks()[0].editor.chips()
         assert tuple(chip.chip_text for chip in chips) == ("a", "b")
 
@@ -202,6 +210,30 @@ class TestFloatingToolbar:
         controller.set_mode("text")
         assert panel.active_editor() is None
         assert not panel.toolbar.is_active()
+
+
+class TestInlineTranslation:
+    def test_quick_translate_docks_under_editor(self, qtbot, controller) -> None:
+        bridge = StubBridge()
+        panel = make_panel(qtbot, controller, bridge)
+        source = controller.record(KEY1).text.strip()
+        panel.caption_bar.quick_translate_btn.click()
+        assert bridge.target_requests == [(KEY1, source, "zh")]
+        bridge.target_ready.emit(KEY1, source, "zh", "中文译文", True)
+        assert panel.inline_translation.isVisible()
+        assert panel.inline_translation_text() == "中文译文"
+        assert controller.record(KEY1).text == source
+
+    def test_switching_file_clears_docked_translation(self, qtbot, controller) -> None:
+        bridge = StubBridge()
+        panel = make_panel(qtbot, controller, bridge)
+        source = controller.record(KEY1).text.strip()
+        panel.caption_bar.request_quick_translate()
+        bridge.target_ready.emit(KEY1, source, "zh", "中文译文", True)
+        assert panel.inline_translation_text() == "中文译文"
+        controller.set_current(KEY2)
+        assert panel.inline_translation_text() == ""
+        assert panel.inline_translation.isHidden()
 
 
 class TestTranslate:

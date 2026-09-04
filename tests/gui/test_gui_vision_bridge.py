@@ -60,6 +60,19 @@ def _app(*, vision_model: str, max_retries: int = 0) -> NLaptApp:
     return NLaptApp(config=config)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_idle_stopper(monkeypatch) -> None:
+    """Keep the process-wide idle stopper (real 30s timers) out of this module.
+
+    Tests that assert on stopper behavior patch get_idle_stopper again with
+    their own instance; everything else silently uses this inert one.
+    """
+    stopper, _timers = make_stopper(FakeServerManager())
+    monkeypatch.setattr(
+        "nlapt_gui.vision_bridge.get_idle_stopper", lambda: stopper
+    )
+
+
 @pytest.fixture()
 def vision_controller(qtbot, demo_dataset) -> Iterator[AppController]:
     _RESPONSES[:] = ["a fresh caption"]
@@ -237,13 +250,50 @@ class FakeServerManager:
         self.running = False
 
 
+class FakeTimer:
+    """Records the armed delay; fires only when the test says so."""
+
+    def __init__(self, delay: float, fn) -> None:  # noqa: ANN001
+        self.delay = delay
+        self.fn = fn
+        self.daemon = False
+        self.cancelled = False
+
+    def start(self) -> None:
+        pass
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+    def fire(self) -> None:
+        if not self.cancelled:
+            self.fn()
+
+
+def make_stopper(manager: FakeServerManager):
+    """(IdleServerStopper with fake timers, list of armed timers)."""
+    from nlapt_gui.local_bridge import IdleServerStopper
+
+    timers: list[FakeTimer] = []
+
+    def factory(delay: float, fn):  # noqa: ANN001
+        timer = FakeTimer(delay, fn)
+        timers.append(timer)
+        return timer
+
+    return IdleServerStopper(manager, timer_factory=factory), timers
+
+
 class TestRequestBatch:
-    def test_local_batch_writes_all_then_stops_started_server(
+    def test_local_batch_arms_idle_stop_instead_of_immediate_unload(
         self, qtbot, vision_controller, monkeypatch
     ) -> None:
+        from nlapt_gui.local_bridge import IDLE_STOP_DELAY_SECONDS
+
         manager = FakeServerManager(running=False)
+        stopper, timers = make_stopper(manager)
         monkeypatch.setattr(
-            "nlapt_gui.vision_bridge.get_server_manager", lambda: manager
+            "nlapt_gui.vision_bridge.get_idle_stopper", lambda: stopper
         )
         bridge = VisionBridge(
             vision_controller,
@@ -258,15 +308,21 @@ class TestRequestBatch:
         for key in keys:
             assert vision_controller.record(key).text.startswith("batch caption")
             assert vision_controller.history.entries(key)[0].label == "推标(本地模型)"
-        # 全部推理完再卸载: the batch started the server, so it stops it — once.
-        qtbot.waitUntil(lambda: manager.stop_calls == 1, timeout=2000)
+        # 推理完先不卸载: nothing stopped yet, the 30s idle timer is armed.
+        qtbot.waitUntil(lambda: stopper.pending(), timeout=2000)
+        assert manager.stop_calls == 0
+        assert timers[-1].delay == IDLE_STOP_DELAY_SECONDS
+        # Only the idle window elapsing actually unloads the model.
+        timers[-1].fire()
+        assert manager.stop_calls == 1
 
-    def test_local_batch_keeps_a_prestarted_server(
+    def test_new_batch_within_idle_window_keeps_model_loaded(
         self, qtbot, vision_controller, monkeypatch
     ) -> None:
-        manager = FakeServerManager(running=True)
+        manager = FakeServerManager(running=False)
+        stopper, timers = make_stopper(manager)
         monkeypatch.setattr(
-            "nlapt_gui.vision_bridge.get_server_manager", lambda: manager
+            "nlapt_gui.vision_bridge.get_idle_stopper", lambda: stopper
         )
         bridge = VisionBridge(
             vision_controller,
@@ -275,8 +331,33 @@ class TestRequestBatch:
         )
         with qtbot.waitSignal(vision_controller.batch_finished, timeout=4000):
             assert bridge.request_batch(("0001.png",), ENGINE_LOCAL)
-        qtbot.wait(50)  # give a wrong stop a chance to fire
+        qtbot.waitUntil(lambda: stopper.pending(), timeout=2000)
+        first_timer = timers[-1]
+        # 少数推理需要反复: the next run cancels the pending stop.
+        with qtbot.waitSignal(vision_controller.batch_finished, timeout=4000):
+            assert bridge.request_batch(("0002.png",), ENGINE_LOCAL)
+        assert first_timer.cancelled
+        first_timer.fire()  # a late fire of the cancelled timer is inert
         assert manager.stop_calls == 0
+
+    def test_local_batch_keeps_a_prestarted_server(
+        self, qtbot, vision_controller, monkeypatch
+    ) -> None:
+        manager = FakeServerManager(running=True)
+        stopper, timers = make_stopper(manager)
+        monkeypatch.setattr(
+            "nlapt_gui.vision_bridge.get_idle_stopper", lambda: stopper
+        )
+        bridge = VisionBridge(
+            vision_controller,
+            prompts=VisionPrompts(),
+            local_captioner_factory=lambda: (lambda path, system, user: "cap"),
+        )
+        with qtbot.waitSignal(vision_controller.batch_finished, timeout=4000):
+            assert bridge.request_batch(("0001.png",), ENGINE_LOCAL)
+        qtbot.wait(50)  # give a wrong stop/arm a chance to fire
+        assert manager.stop_calls == 0
+        assert not timers  # user-started server: no idle stop is ever armed
 
     def test_unready_engine_toasts_and_refuses(
         self, qtbot, vision_controller
@@ -292,3 +373,91 @@ class TestRequestBatch:
         bridge = VisionBridge(vision_controller, local_captioner_factory=broken)
         assert not bridge.request_batch(("0001.png",), ENGINE_LOCAL)
         assert any("未选择本地模型" in text for text, _ in toasts)
+
+
+class TestRequestCustom:
+    def test_three_concurrent_callbacks(self, qtbot, vision_controller) -> None:
+        _RESPONSES[:] = ["card-a", "card-b", "card-c"]
+        bridge = VisionBridge(vision_controller)
+        got: list[tuple[str, str, bool]] = []
+        bridge.custom_ready.connect(lambda rid, text, ok: got.append((rid, text, ok)))
+        for index in range(3):
+            assert bridge.request_custom(
+                f"card-{index}",
+                "0001.png",
+                ENGINE_LLM,
+                system="sys",
+                user_prompt=f"user-{index}",
+            )
+        qtbot.waitUntil(lambda: len(got) == 3, timeout=4000)
+        assert {item[0] for item in got} == {"card-0", "card-1", "card-2"}
+        assert all(ok for _rid, _text, ok in got)
+        assert all(text.startswith("card-") for _rid, text, _ok in got)
+
+    def test_unknown_key_fails_immediately(self, qtbot, vision_controller) -> None:
+        bridge = VisionBridge(vision_controller)
+        with qtbot.waitSignal(bridge.custom_ready, timeout=1000) as blocker:
+            assert not bridge.request_custom(
+                "card-0", "missing.png", ENGINE_LLM, system="", user_prompt="x"
+            )
+        assert blocker.args[0] == "card-0"
+        assert blocker.args[2] is False
+
+
+class TestRequestLayeredBatch:
+    def test_writes_card_blank_scene_and_history(
+        self, qtbot, vision_controller
+    ) -> None:
+        _RESPONSES[:] = ["scene paragraph"]
+        bridge = VisionBridge(vision_controller)
+        keys = ("0001.png", "0002.png")
+        with qtbot.waitSignal(vision_controller.batch_finished, timeout=4000):
+            assert bridge.request_layered_batch(
+                keys,
+                ENGINE_LLM,
+                card_text="locked card",
+                scene_system="scene-sys",
+                scene_user="scene-user",
+            )
+        for key in keys:
+            assert vision_controller.record(key).text == "locked card\n\nscene paragraph"
+            assert vision_controller.history.entries(key)[0].label == "分层推标"
+        request = _Recorder.last.requests[0]
+        assert request.system == "scene-sys"
+        assert request.messages[0].text == "scene-user"
+
+    def test_local_captioner_assembles(self, qtbot, vision_controller) -> None:
+        bridge = VisionBridge(
+            vision_controller,
+            local_captioner_factory=lambda: (
+                lambda path, system, user: f"{system}|{user}|{path.name}"
+            ),
+        )
+        with qtbot.waitSignal(vision_controller.batch_finished, timeout=4000):
+            assert bridge.request_layered_batch(
+                ("0001.png",),
+                ENGINE_LOCAL,
+                card_text="CARD",
+                scene_system="SS",
+                scene_user="SU",
+            )
+        assert vision_controller.record("0001.png").text == "CARD\n\nSS|SU|0001.png"
+
+
+class TestFlorenceGuard:
+    def test_empty_family_is_not_florence(self) -> None:
+        from nlapt_gui.vision_bridge import local_engine_is_florence
+
+        assert not local_engine_is_florence()
+
+    def test_florence_family_is_detected(self) -> None:
+        from nlapt.local.settings import LocalSettings, save_local_settings
+
+        from nlapt_gui.local_bridge import local_settings_path
+        from nlapt_gui.vision_bridge import local_engine_is_florence
+
+        save_local_settings(
+            local_settings_path(),
+            LocalSettings(family_id="florence2-promptgen-v2"),
+        )
+        assert local_engine_is_florence()

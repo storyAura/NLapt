@@ -12,8 +12,9 @@ image cell (这张图片, or 已选 + 全部 when it is part of a multi-selectio
 a folder header (此文件夹 / 此文件夹未标注 / 全部), or the ALL row and the
 根目录 group (全部 / 全部未标注 only). All state
 flows through :class:`AppController`; outward signals are
-``open_folder_requested`` and ``infer_requested(keys, engine)`` (the main
-window routes the latter into the vision bridge's batch entry point).
+``open_folder_requested``, ``infer_requested(keys, engine)`` and
+``layered_infer_requested(keys)`` (the main window routes the latter two
+into the vision bridge).
 """
 
 from __future__ import annotations
@@ -36,7 +37,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QMenu,
     QPushButton,
     QScrollArea,
     QVBoxLayout,
@@ -45,10 +45,17 @@ from PySide6.QtWidgets import (
 
 from nlapt.diagnostics import get_logger
 
-from nlapt_gui.controller import FOLDER_ROOT_LABEL, AppController
-from nlapt_gui.prompt_store import ENGINE_LLM, ENGINE_LOCAL
+from nlapt_gui import anim as ui_anim
+from nlapt_gui.controller import AppController
 from nlapt_gui.theme.tokens import ThemeTokens
 from nlapt_gui.widgets.dialogs import ask_confirm
+from nlapt_gui.widgets.file_panel_infer import (
+    CONFIRM_INFER_TEXT,
+    CONFIRM_INFER_TITLE,
+    ENGINE_CONFIRM_WORDS,
+    build_infer_actions,
+    popup_infer_menu,
+)
 from nlapt_gui.widgets.thumb_cells import (
     ListRow,
     ThumbCell,
@@ -62,16 +69,18 @@ from nlapt_gui.widgets.thumbnails import ThumbnailLoader
 
 _LOGGER = get_logger(__name__)
 
-PANEL_WIDTH = 300
+PANEL_WIDTH = 260
 HEADER_ICON_PX = 17
 TOOL_BUTTON_PX = 26
 TOOL_ICON_PX = 13
-SEARCH_HEIGHT = 29
-SEG_BUTTON_W = 27
-SEG_BUTTON_H = 22
+SEARCH_HEIGHT = 30
+SEG_BUTTON_W = 52
+SEG_BUTTON_H = 24
 GRID_GAP = 10
 LIST_GAP = 6
 GROUP_HEADER_H = 27
+HEADER_INSET = (6, 0, 6, 0)
+HEADER_GAP = 7
 BIG_THUMB_MIN = 150  # design: minmax(150px,1fr) in big mode
 ARROW_OPEN_DEG = 0.0
 ARROW_CLOSED_DEG = -90.0
@@ -92,31 +101,11 @@ TIP_OPEN_FOLDER = "打开文件夹"
 COUNT_FMT = "{n} 张"
 COUNT_FILTERED_FMT = "{k}/{n} 张"
 VIEW_TIPS = {"list": "详细列表", "mid": "中图网格", "big": "大图网格"}
-_VIEW_ICONS = {"list": "view_list", "mid": "view_mid", "big": "view_big"}
-
-# ALL row + folder checkbox + 推标 context menu strings.
+VIEW_LABELS = {"list": "列表", "mid": "中图", "big": "大图"}
+# ALL row + folder checkbox strings.
 TEXT_ALL_ROW = "ALL"
 TIP_FOLDER_CHECK = "选中 / 取消选中整个文件夹"
 TIP_ALL_CHECK = "选中 / 取消选中全部文件"
-MENU_INFER_FOLDER_LLM = "用 LLM 推理此文件夹({n} 张)"
-MENU_INFER_FOLDER_LOCAL = "用本地模型推理此文件夹({n} 张)"
-MENU_INFER_SELECTED_LLM = "用 LLM 推理已选({n} 张)"
-MENU_INFER_SELECTED_LOCAL = "用本地模型推理已选({n} 张)"
-MENU_INFER_ALL_LLM = "用 LLM 推理全部({n} 张)"
-MENU_INFER_ALL_LOCAL = "用本地模型推理全部({n} 张)"
-MENU_INFER_IMAGE_LLM = "用 LLM 推理这张图片"
-MENU_INFER_IMAGE_LOCAL = "用本地模型推理这张图片"
-MENU_INFER_FOLDER_UNLABELED_LLM = "用 LLM 推理此文件夹未标注({n} 张)"
-MENU_INFER_FOLDER_UNLABELED_LOCAL = "用本地模型推理此文件夹未标注({n} 张)"
-MENU_INFER_ALL_UNLABELED_LLM = "用 LLM 推理全部未标注({n} 张)"
-MENU_INFER_ALL_UNLABELED_LOCAL = "用本地模型推理全部未标注({n} 张)"
-MENU_CANCEL_INFER = "取消当前推标"
-CONFIRM_INFER_TITLE = "批量推标"
-CONFIRM_INFER_TEXT = (
-    "将用{word}为 {n} 张图片重新生成标注,覆盖现有内容。\n"
-    "执行前会自动备份,完成后可在 历史记录 面板整批回滚。"
-)
-ENGINE_CONFIRM_WORDS = {ENGINE_LLM: " LLM ", ENGINE_LOCAL: "本地模型"}
 
 # Selection coverage -> Qt check state (folder checkbox + ALL row).
 _COVERAGE_STATES = {
@@ -133,6 +122,7 @@ class _Arrow(QWidget):
         super().__init__(parent)
         self._panel = panel
         self._angle = ARROW_OPEN_DEG if open_ else ARROW_CLOSED_DEG
+        self._anim: QPropertyAnimation | None = None
         self.setFixedSize(12, 12)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
 
@@ -146,11 +136,18 @@ class _Arrow(QWidget):
     angle = Property(float, _get_angle, _set_angle)
 
     def animate_to(self, open_: bool) -> None:
-        anim = QPropertyAnimation(self, b"angle", self)
-        anim.setDuration(COLLAPSE_MS)
-        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        anim.setEndValue(ARROW_OPEN_DEG if open_ else ARROW_CLOSED_DEG)
-        anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
+        end = ARROW_OPEN_DEG if open_ else ARROW_CLOSED_DEG
+        ui_anim.stop_animation(self._anim)
+        self._anim = None
+        if not ui_anim.animations_enabled():
+            self._set_angle(end)
+            return
+        motion = QPropertyAnimation(self, b"angle", self)
+        motion.setDuration(COLLAPSE_MS)
+        motion.setEasingCurve(QEasingCurve.Type.OutCubic)
+        motion.setEndValue(end)
+        motion.start()
+        self._anim = motion
 
     def paintEvent(self, event: QPaintEvent) -> None:  # noqa: N802 - Qt override
         painter = QPainter(self)
@@ -225,8 +222,8 @@ class _FolderGroup(QWidget):
             lambda pos: panel.show_infer_menu(self.folder, self.header, pos)
         )
         header_lay = QHBoxLayout(self.header)
-        header_lay.setContentsMargins(6, 0, 6, 0)
-        header_lay.setSpacing(7)
+        header_lay.setContentsMargins(*HEADER_INSET)
+        header_lay.setSpacing(HEADER_GAP)
         # Folder multi-select checkbox (checkbox clicks never toggle collapse:
         # the checkbox consumes its own mouse events).
         self.check = QCheckBox(self.header)
@@ -285,22 +282,42 @@ class _FolderGroup(QWidget):
         if open_ == self._open:
             return
         self._open = open_
-        if not animate:
+        ui_anim.stop_animation(self._anim)
+        self._anim = None
+        visible = self._content.height()
+        if not animate or not ui_anim.animations_enabled():
             self._content.setMaximumHeight(_MAX_WIDGET_H if open_ else 0)
             self.arrow._set_angle(ARROW_OPEN_DEG if open_ else ARROW_CLOSED_DEG)
             return
         self.arrow.animate_to(open_)
-        if self._anim is not None:
-            self._anim.stop()
-        anim = QPropertyAnimation(self._content, b"maximumHeight", self)
-        anim.setDuration(COLLAPSE_MS)
-        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        anim.setStartValue(self._content.height())
-        anim.setEndValue(self._content.sizeHint().height() if open_ else 0)
+        # Pin max-height to the *visible* height first. After expand we lift
+        # it to QWIDGETSIZE_MAX; a 0→0 tween then leaves that sentinel in
+        # place and the folder looks stuck open.
+        if visible <= 0:
+            visible = max(self._content.sizeHint().height(), 0)
         if open_:
-            anim.finished.connect(lambda: self._content.setMaximumHeight(_MAX_WIDGET_H))
-        anim.start()
-        self._anim = anim
+            self._content.setMaximumHeight(_MAX_WIDGET_H)
+            target = max(self._content.sizeHint().height(), 1)
+            self._content.setMaximumHeight(visible)
+        elif visible <= 0:
+            self._content.setMaximumHeight(0)
+            return
+        else:
+            target = 0
+            self._content.setMaximumHeight(visible)
+        motion = QPropertyAnimation(self._content, b"maximumHeight", self)
+        motion.setDuration(COLLAPSE_MS)
+        motion.setEasingCurve(QEasingCurve.Type.OutCubic)
+        motion.setStartValue(visible)
+        motion.setEndValue(target)
+        if open_:
+            motion.finished.connect(self._unlock_content_height)
+        motion.start()
+        self._anim = motion
+
+    def _unlock_content_height(self) -> None:
+        if self._open:
+            self._content.setMaximumHeight(_MAX_WIDGET_H)
 
 
 class _AllRow(QWidget):
@@ -319,8 +336,8 @@ class _AllRow(QWidget):
             lambda pos: panel.show_infer_menu(None, self, pos)
         )
         row = QHBoxLayout(self)
-        row.setContentsMargins(6, 0, 6, 0)
-        row.setSpacing(7)
+        row.setContentsMargins(*HEADER_INSET)
+        row.setSpacing(HEADER_GAP)
         self.check = QCheckBox(self)
         self.check.setToolTip(TIP_ALL_CHECK)
         self.check.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -348,6 +365,8 @@ class FilePanel(QFrame):
     open_folder_requested = Signal()
     # Batch 推标 request: (keys tuple, engine "llm"|"local").
     infer_requested = Signal(object, str)
+    # 分层推标 wizard: keys tuple (engine is chosen inside the dialog).
+    layered_infer_requested = Signal(object)
 
     def __init__(
         self,
@@ -374,17 +393,22 @@ class FilePanel(QFrame):
         self._refresh_view_buttons()
         self._apply_icon_colors()
 
+    @property
+    def thumbnail_loader(self) -> ThumbnailLoader:
+        """Shared thumbnail loader (wizard preview; do not touch the FS)."""
+        return self._loader
+
     # -- construction ---------------------------------------------------------------
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # header: folder icon, dataset name + mono path, refresh / open buttons
+        # Compact dataset line: name + path + refresh / open (open also lives on the rail).
         header = QWidget(self)
         header_lay = QHBoxLayout(header)
-        header_lay.setContentsMargins(12, 12, 12, 10)
-        header_lay.setSpacing(9)
+        header_lay.setContentsMargins(12, 10, 12, 4)
+        header_lay.setSpacing(6)
         self._header_icon = QLabel(header)
         header_lay.addWidget(self._header_icon)
         names = QVBoxLayout()
@@ -415,7 +439,7 @@ class FilePanel(QFrame):
         # search input with magnifier icon
         search_row = QWidget(self)
         search_lay = QHBoxLayout(search_row)
-        search_lay.setContentsMargins(12, 0, 12, 8)
+        search_lay.setContentsMargins(12, 4, 12, 6)
         self.search_edit = QLineEdit(search_row)
         self.search_edit.setFixedHeight(SEARCH_HEIGHT)
         self.search_edit.setPlaceholderText(SEARCH_PLACEHOLDER)
@@ -429,7 +453,7 @@ class FilePanel(QFrame):
         search_lay.addWidget(self.search_edit)
         root.addWidget(search_row)
 
-        # view segmented | 全选 / 已选 n / 清除
+        # view segmented | 已选 n  (全选 / 清除 stay for the existing selection model)
         view_row = QWidget(self)
         view_lay = QHBoxLayout(view_row)
         view_lay.setContentsMargins(12, 0, 12, 8)
@@ -441,7 +465,7 @@ class FilePanel(QFrame):
         seg_lay.setSpacing(2)
         self.view_buttons: dict[str, QPushButton] = {}
         for mode in ("list", "mid", "big"):
-            btn = QPushButton(seg_bar)
+            btn = QPushButton(VIEW_LABELS[mode], seg_bar)
             btn.setProperty("seg", True)
             btn.setFixedSize(SEG_BUTTON_W, SEG_BUTTON_H)
             btn.setToolTip(VIEW_TIPS[mode])
@@ -474,7 +498,7 @@ class FilePanel(QFrame):
         self._groups_host = QWidget(self._scroll)
         self._groups_lay = QVBoxLayout(self._groups_host)
         self._groups_lay.setContentsMargins(12, 0, 12, 10)
-        self._groups_lay.setSpacing(4)
+        self._groups_lay.setSpacing(LIST_GAP)
         # ALL row on top of the folders (select everything / 推标全部).
         self.all_row = _AllRow(self, self._groups_host)
         self._groups_lay.addWidget(self.all_row)
@@ -613,88 +637,14 @@ class FilePanel(QFrame):
     def infer_menu_actions(
         self, folder: str | None, image: str | None = None
     ) -> list[tuple[str, object]]:
-        """(label, callable) entries for the 推标 menu (also the test seam).
-
-        Scoped to the right-click target: an image cell (``image``), a
-        folder header (``folder``), or the ALL row / 根目录 group (neither).
-        已选 entries only appear on a multi-selected image cell; 文件夹
-        entries only on non-root folder headers.
-        """
-        controller = self._controller
-        if controller.batch_running():
-            return [(MENU_CANCEL_INFER, controller.cancel_batch)]
-
-        def pair(
-            llm_label: str, local_label: str, keys: tuple[str, ...]
-        ) -> list[tuple[str, object]]:
-            n = len(keys)
-            return [
-                (llm_label.format(n=n), lambda: self._request_infer(keys, ENGINE_LLM)),
-                (local_label.format(n=n), lambda: self._request_infer(keys, ENGINE_LOCAL)),
-            ]
-
-        actions: list[tuple[str, object]] = []
-        if image is not None:
-            selected = controller.selected_keys()
-            if image in selected and len(selected) > 1:
-                actions += pair(MENU_INFER_SELECTED_LLM, MENU_INFER_SELECTED_LOCAL, selected)
-                actions += pair(MENU_INFER_ALL_LLM, MENU_INFER_ALL_LOCAL, controller.keys())
-            else:
-                actions += pair(MENU_INFER_IMAGE_LLM, MENU_INFER_IMAGE_LOCAL, (image,))
-            return actions
-
-        if folder is not None and folder != FOLDER_ROOT_LABEL:
-            keys = controller.folder_keys(folder)
-            if keys:
-                actions += pair(MENU_INFER_FOLDER_LLM, MENU_INFER_FOLDER_LOCAL, keys)
-                unlabeled = controller.unlabeled_keys(keys)
-                if unlabeled:
-                    actions += pair(
-                        MENU_INFER_FOLDER_UNLABELED_LLM,
-                        MENU_INFER_FOLDER_UNLABELED_LOCAL,
-                        unlabeled,
-                    )
-            every = controller.keys()
-            if every:
-                actions += pair(MENU_INFER_ALL_LLM, MENU_INFER_ALL_LOCAL, every)
-            return actions
-
-        every = controller.keys()
-        if every:
-            actions += pair(MENU_INFER_ALL_LLM, MENU_INFER_ALL_LOCAL, every)
-            unlabeled = controller.unlabeled_keys(every)
-            if unlabeled:
-                actions += pair(
-                    MENU_INFER_ALL_UNLABELED_LLM, MENU_INFER_ALL_UNLABELED_LOCAL, unlabeled
-                )
-        return actions
+        """(label, callable) entries for the 推标 menu (also the test seam)."""
+        return build_infer_actions(self, folder, image)
 
     def show_infer_menu(
         self, folder: str | None, widget: QWidget, pos: QPoint, image: str | None = None
     ) -> None:
         """Popup the 推标 menu for an image cell / folder header / the ALL row."""
-        actions = self.infer_menu_actions(folder, image)
-        if not actions:
-            return
-        menu = QMenu(self)
-        menu.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
-        previous_scope: object = None
-        for index, (label, handler) in enumerate(actions):
-            # Visual grouping: separator whenever the scope wording changes
-            # (spaces stripped so the LLM / 本地模型 variants pair up).
-            scope = (
-                label.split("(", 1)[0]
-                .replace("LLM", "")
-                .replace("本地模型", "")
-                .replace(" ", "")
-            )
-            if index and scope != previous_scope:
-                menu.addSeparator()
-            previous_scope = scope
-            menu.addAction(label).triggered.connect(
-                lambda _checked=False, run=handler: run()
-            )
-        menu.popup(widget.mapToGlobal(pos))
+        popup_infer_menu(self, folder, widget, pos, image)
 
     def _request_infer(self, keys: tuple[str, ...], engine: str) -> None:
         """Confirm (captions get overwritten) then hand off to the bridge."""
@@ -706,6 +656,10 @@ class FilePanel(QFrame):
         ):
             return
         self.infer_requested.emit(tuple(keys), engine)
+
+    def _request_layered(self, keys: tuple[str, ...]) -> None:
+        """Open the 分层推标 wizard (confirm lives on the last wizard page)."""
+        self.layered_infer_requested.emit(tuple(keys))
 
     def _toggle_folder(self, group: _FolderGroup) -> None:
         open_ = not group.is_open
@@ -754,8 +708,6 @@ class FilePanel(QFrame):
         for mode, btn in self.view_buttons.items():
             is_active = mode == active
             btn.setProperty("segActive", is_active)
-            color = self._tokens.accent if is_active else self._tokens.text2
-            btn.setIcon(make_icon(_VIEW_ICONS[mode], color, TOOL_ICON_PX))
             btn.style().unpolish(btn)
             btn.style().polish(btn)
 

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QPoint, Qt
+from PySide6.QtCore import QAbstractAnimation, QEvent, QPoint, Qt
 from PySide6.QtGui import QFocusEvent
 from PySide6.QtWidgets import QLabel, QPushButton
 
+from nlapt_gui import anim
 from nlapt_gui.widgets.chips_editor import (
     ADD_CHIP_TEXT,
     EMPTY_STATE_TEXT,
@@ -216,6 +217,25 @@ class TestReorder:
         editor.reorder(None, 2)
         editor.reorder(99, 0)
         assert controller.record(KEY).text == before
+
+    def test_reorder_flip_lands_on_layout(self, qtbot, controller) -> None:
+        editor = make_editor(qtbot, controller)
+        anim.set_animations_enabled(True)
+        try:
+            editor.reorder(0, 2)
+            editor.refresh()
+            motion = editor._reflow_anim
+            assert isinstance(motion, QAbstractAnimation)
+            motion.setCurrentTime(motion.duration())
+            assert [chip.chip_text for chip in editor.chips()] == list(
+                controller.segments(KEY)
+            )
+            if editor.layout() is not None:
+                editor.layout().activate()
+            finals = [chip.geometry() for chip in editor.chips()]
+            assert all(not rect.isEmpty() for rect in finals)
+        finally:
+            anim.set_animations_enabled(False)
 
 
 class TestToolbarActions:

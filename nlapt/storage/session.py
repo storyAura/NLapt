@@ -1,8 +1,9 @@
 """Crash-recovery session persistence (spec 12 reliability).
 
 ``SessionStore`` saves the volatile editing state (unsaved drafts, pending
-AI suggestions and per-file states) to ``.nlapt/session.json`` inside the
-dataset root, so an abnormal exit can be recovered on the next start.
+AI suggestions and per-file states) to ``session.json``. The default path
+is ``<root>/.nlapt/session.json``; pass ``state_dir`` to store it outside
+the dataset (the facade uses the per-user dataset state folder).
 Writes are atomic; corrupt files raise :class:`SessionError`.
 """
 
@@ -43,14 +44,20 @@ class SessionSnapshot:
 class SessionStore:
     """Persist/load a :class:`SessionSnapshot` under ``<root>/.nlapt/session.json``."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, state_dir: Path | None = None) -> None:
         base = Path(root)
         if not base.is_dir():
             raise ValidationError(f"session root is not a directory: {base}")
         if not base.is_absolute():
             base = base.absolute()
         self._root = base
-        self._path = base / SESSION_DIR_NAME / SESSION_FILE_NAME
+        if state_dir is None:
+            self._path = base / SESSION_DIR_NAME / SESSION_FILE_NAME
+        else:
+            dest = Path(state_dir)
+            if not dest.is_absolute():
+                dest = dest.absolute()
+            self._path = dest / SESSION_FILE_NAME
 
     def save(self, snapshot: SessionSnapshot) -> None:
         """Atomically write ``snapshot`` as UTF-8 JSON.
@@ -60,7 +67,7 @@ class SessionStore:
         """
         payload = _snapshot_to_payload(snapshot)
         try:
-            self._path.parent.mkdir(exist_ok=True)
+            self._path.parent.mkdir(parents=True, exist_ok=True)
             text = json.dumps(payload, ensure_ascii=False, indent=JSON_INDENT)
             atomic_write_text(self._path, text)
         except (OSError, StorageError) as exc:

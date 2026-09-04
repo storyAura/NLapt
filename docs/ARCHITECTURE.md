@@ -1075,3 +1075,139 @@ processes, injected clocks — no network, no real waits).
   intentionally have no entry; Florence keeps its own 指令模式.
 - `LocalSettings.prompt_preset: str = ""` — persisted preset id
   (round-tripped as-is; semantics live in `resolve_preset`).
+
+## v1.10 addendum — empty-completion guard, connection-test budget (additive)
+
+- `nlapt.llm.openai_client`: `_extract_text` raises
+  `LLMRequestError(MSG_EMPTY_COMPLETION)` (Chinese, includes the choice's
+  `finish_reason`) when `choices[0].message.content` is an empty/whitespace
+  string. HTTP-200-with-empty-content is what proxies under high
+  concurrency and thinking models with an exhausted output budget return;
+  as an `LLMRequestError` it is retryable under the spec-8 backoff instead
+  of surfacing as an empty caption / `LLMOutputError` (which never
+  retried). `nlapt.llm.ollama_client` gets the same guard (English
+  message). Anthropic already raised on empty content blocks.
+- `nlapt.llm.base`: `CONNECTION_TEST_MAX_TOKENS` raised 8 → 1024. Thinking
+  models spend completion tokens on hidden reasoning before the visible
+  reply; with an 8-token cap the test reply always came back empty, so
+  测试连接 always failed on such models. The prompt is unchanged.
+
+## v1.11 addendum — Florence PEFT LoRA merging (additive)
+
+- `nlapt/local/lora.py` (new): loads PEFT LoRA adapters and merges them
+  into the Florence ONNX weights at session-creation time — no `onnx`
+  package, no torch, nothing written back to disk. Public surface:
+  `ADAPTER_CONFIG_NAME`, `LoraModule(down, up, scale)` /
+  `LoraAdapter(path, modules)` / `MergeResult(initializers, matched)`
+  (frozen), `load_adapter(path) -> LoraAdapter` (parses the
+  `.safetensors` file — stdlib header walk, F32/F16/BF16 widened to
+  float32 — plus its REQUIRED sibling `adapter_config.json`; PEFT scale
+  `alpha / r` per module rank, rsLoRA `alpha / sqrt(r)`, DoRA rejected),
+  and `merge_into_onnx(path, adapter) -> MergeResult` (minimal protobuf
+  walk over the frozen ONNX field numbers collects every MatMul node and
+  initializer across nested subgraphs — the merged decoder hides both
+  KV-cache branches inside an `If`, sharing one weight set; node scope
+  paths, with repeated ModuleList scopes like `blocks.0/blocks.0.0`
+  collapsed, suffix-match the PEFT module names; merged weight is
+  `M + scale * down.T @ up.T`, dtype preserved). Typed failures
+  (`LocalInferenceError`, actionable Chinese): missing file / missing
+  config / corrupt file / DoRA / dimension mismatch (`MSG_LORA_MISMATCH`
+  names both shapes — a large-architecture LoRA on the base export) /
+  `MSG_LORA_NO_MATCH` when nothing matches at all.
+- `FlorenceEngine(files, *, session_factory=None, lora_path=None)`:
+  with a `lora_path`, `load()` merges every file's overrides and calls
+  the session factory as `factory(path, initializers)`; without one the
+  call stays unary, so existing factories keep working. `SessionFactory`
+  is now a Protocol with the optional `initializers` parameter. The
+  default factory feeds overrides through
+  `SessionOptions.add_initializer` and ties the `OrtValue` wrappers to
+  the session object (`nlapt_lora_keepalive`) — ORT keeps raw pointers
+  into them for the session's lifetime. A LoRA matching nothing anywhere
+  raises; partial matches log a warning; any load failure resets the
+  half-built session set.
+- `LocalSettings.florence_lora: str = ""` (selected `.safetensors` path)
+  and `LocalSettings.florence_loras: tuple[str, ...] = ()` (registered
+  files for the dropdown); junk values degrade to defaults on load.
+
+## v1.12 addendum — official Florence-2 families + curated LoRA catalog (additive)
+
+- Catalog: the Florence series (id `florence2-promptgen` unchanged, display
+  name now "Florence-2") gains the four official Microsoft exports by
+  onnx-community, all `ENGINE_FLORENCE`, fp32 file sets pinned from the HF
+  API (sizes + LFS sha256; the identical BART `tokenizer.json` is shared
+  via `_florence_tokenizer()`): `florence2-base-ft`, `florence2-large-ft`,
+  `florence2-base`, `florence2-large` (large ones: 0.77B,
+  `kv_bytes_per_token=98_304`). `ModelFamily.florence_tasks:
+  tuple[str, ...] = ()` — the 指令 tokens the family was trained on
+  (empty for llama families; enforced by tests). PromptGen keeps its 7
+  tokens; officials get the three standard caption tasks; large officials
+  additionally list `TASK_BAI_JSON` (= `<BAI_JSON>`, new in
+  `nlapt.local.florence`, passed through literally). The FIRST entry is
+  the fallback the captioner clamps to when the persisted task is not in
+  the set.
+- Curated LoRAs: `LoraEntry(lora_id, name, base_url, page_url, files,
+  compatible_family_ids, task, notes)` (frozen) + `ALL_LORAS` with
+  `bai-json-large` (silverlong's BAI_JSON PromptGen LoRA, two files
+  pinned with exact bytes + sha256, served from ModelScope — hence a full
+  `base_url` instead of a HF repo id). Helpers: `all_loras()`,
+  `find_lora(id)` (ValidationError on unknown), `loras_for_family(id)`,
+  `lora_dir(models_dir, entry)` (= `models_dir/loras/<lora_id>`, SAFE_ID
+  checked), `lora_file_path(...)`, `lora_adapter_path(...)` (the
+  .safetensors member), `lora_download_url(entry, file)`
+  (base_url + encoded filename). `LORA_DIR_NAME = "loras"`.
+- `nlapt.local.lora.merge_into_onnx` gained keyword `module_prefix: str
+  = ""`: candidate adapter modules are pre-filtered to that PEFT-tree
+  prefix. Needed because onnx-community's encoder export roots node
+  names at the submodule (bare `/layers.0/...`), where a suffix alone
+  matches both encoder and decoder layers; the engine passes
+  `florence.LORA_MODULE_PREFIXES[file]` per file (decoder/embed →
+  `language_model.`, encoder → `language_model.model.encoder.`, vision →
+  `vision_tower.`). Verified against the real exports: the BAI_JSON
+  adapter maps 241/241 modules on the large families.
+
+## v1.13 addendum — Florence CUDA/cuDNN DLL preload (additive)
+
+- `nlapt/local/florence.py::_preload_ort_dlls(ort)` (idempotent): before the
+  default session factory creates an `InferenceSession`, call
+  `onnxruntime.preload_dlls(cuda=True, cudnn=True, directory="")` when the
+  attribute exists. Prefer `nvidia-*` pip site-packages
+  (`pip install onnxruntime-gpu[cuda,cudnn]`) over PATH/PyTorch layouts so a
+  missing `cudnn64_9.dll` no longer surfaces as a mid-run
+  `NOT_IMPLEMENTED` Conv failure. Failures are swallowed — CPU EP remains
+  usable without GPU runtime DLLs.
+
+## v1.14 addendum — dataset zip export (additive)
+
+- `nlapt/storage/export.py::export_dataset_zip(root, dest, files) -> int`:
+  stream each scanned `ImageFile` (image + existing same-stem txt) into a
+  zip via a temp file in `dest.parent`, then `os.replace`. Datasets can be
+  large — do not buffer the archive in memory the way snapshot zips do.
+  `.backups` / `.nlapt` are excluded because they are never in the scanned
+  file list. Returns the number of archive members written. Empty `files`
+  raises `ValidationError`; missing parent directory raises `StorageError`.
+- `NLaptApp.export_dataset(dest) -> int`: thin wrapper that requires an
+  open dataset and forwards `self._files` to `export_dataset_zip`.
+- GUI redo is **not** `NLaptApp.redo`: the editor undo model is the
+  `FileHistory` cursor (`step_older` / `step_newer`).
+
+## v1.15 addendum — dataset state lives under the per-user data dir
+
+Snapshots, crash-recovery session, and batch checkpoints no longer write
+into the dataset root. `NLaptApp.open_dataset` places them at
+`app_state_dir()/datasets/<sha1(normcase(resolve(root)))>/`:
+
+- `backups/` — `SnapshotManager(..., backup_dir=...)`
+- `session.json` / `checkpoints.json` — `SessionStore` / `CheckpointStore`
+  `(..., state_dir=...)`
+
+`SnapshotManager` / `SessionStore` / `CheckpointStore` keep their default
+in-dataset paths (`.backups/`, `.nlapt/`) when the new kwargs are omitted,
+so existing unit tests stay hermetic. On open, `migrate_legacy_dataset_state`
+best-effort moves leftover `<root>/.backups` and `<root>/.nlapt` into the
+new location and removes the old directories. Scanner/export still prune
+those names.
+
+`nlapt.storage.paths.app_state_dir` is the single resolver
+(`NLAPT_DATA_DIR` / `%APPDATA%/NLapt` / `~/.config/nlapt`).
+`nlapt_gui.resources.app_data_dir` delegates to it.
+

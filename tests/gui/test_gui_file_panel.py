@@ -9,11 +9,13 @@ import pytest
 from PySide6.QtCore import QPoint, Qt
 
 import nlapt_gui.widgets as widgets_pkg
+from nlapt_gui import anim
 from nlapt_gui.controller import FOLDER_ROOT_LABEL, AppController
 from nlapt_gui.theme.tokens import THEMES
 from nlapt_gui.widgets.file_panel import (
     TEXT_NO_MATCH,
     TEXT_SELECT_ALL,
+    _MAX_WIDGET_H,
     FilePanel,
 )
 from nlapt_gui.widgets.thumb_cells import ListRow, ThumbCell
@@ -92,6 +94,82 @@ class TestFolderGroups:
         qtbot.mouseClick(group.header, Qt.MouseButton.LeftButton)
         assert group.is_open
         assert controller.settings.folder_open[FOLDER_ROOT_LABEL] is True
+
+    def test_collapse_animation_jumps_to_end(
+        self, qtbot, panel: FilePanel, controller: AppController
+    ) -> None:
+        group = panel.folder_group(FOLDER_ROOT_LABEL)
+        assert group is not None and group.is_open
+        anim.set_animations_enabled(True)
+        try:
+            group.set_open(False, animate=True)
+            motion = group._anim
+            assert motion is not None
+            motion.setCurrentTime(motion.duration())
+            assert not group.is_open
+            assert group._content.maximumHeight() == 0
+            group.set_open(True, animate=True)
+            motion = group._anim
+            assert motion is not None
+            motion.setCurrentTime(motion.duration())
+            assert group.is_open
+            assert group._content.maximumHeight() == _MAX_WIDGET_H
+            group.set_open(False, animate=True)
+            assert group._content.maximumHeight() < _MAX_WIDGET_H
+            motion = group._anim
+            if motion is not None:
+                motion.setCurrentTime(motion.duration())
+            assert not group.is_open
+            assert group._content.maximumHeight() == 0
+        finally:
+            anim.set_animations_enabled(False)
+
+    def test_header_click_can_collapse_after_expand(
+        self, qtbot, panel: FilePanel, controller: AppController
+    ) -> None:
+        group = panel.folder_group(FOLDER_ROOT_LABEL)
+        assert group is not None and group.is_open
+        anim.set_animations_enabled(True)
+        try:
+            qtbot.mouseClick(group.header, Qt.MouseButton.LeftButton)
+            if group._anim is not None:
+                group._anim.setCurrentTime(group._anim.duration())
+            assert not group.is_open
+            assert group._content.maximumHeight() == 0
+            qtbot.mouseClick(group.header, Qt.MouseButton.LeftButton)
+            if group._anim is not None:
+                group._anim.setCurrentTime(group._anim.duration())
+            assert group.is_open
+            qtbot.mouseClick(group.header, Qt.MouseButton.LeftButton)
+            if group._anim is not None:
+                group._anim.setCurrentTime(group._anim.duration())
+            assert not group.is_open
+            assert group._content.maximumHeight() == 0
+            assert controller.settings.folder_open[FOLDER_ROOT_LABEL] is False
+        finally:
+            anim.set_animations_enabled(False)
+
+    def test_retoggle_after_arrow_animation_finishes(
+        self, qtbot, panel: FilePanel
+    ) -> None:
+        group = panel.folder_group(FOLDER_ROOT_LABEL)
+        assert group is not None
+        anim.set_animations_enabled(True)
+        try:
+            group.set_open(False, animate=True)
+            if group.arrow._anim is not None:
+                group.arrow._anim.setCurrentTime(group.arrow._anim.duration())
+            if group._anim is not None:
+                group._anim.setCurrentTime(group._anim.duration())
+            group.set_open(True, animate=True)
+            if group.arrow._anim is not None:
+                group.arrow._anim.setCurrentTime(group.arrow._anim.duration())
+            if group._anim is not None:
+                group._anim.setCurrentTime(group._anim.duration())
+            group.set_open(False, animate=True)
+            assert not group.is_open
+        finally:
+            anim.set_animations_enabled(False)
 
 
 class TestClickSemantics:
@@ -279,6 +357,9 @@ class TestInferMenu:
         labels = [label for label, _run in panel.infer_menu_actions("10_concept")]
         assert "用 LLM 推理此文件夹(2 张)" in labels
         assert "用本地模型推理此文件夹(2 张)" in labels
+        assert "分层推标此文件夹(2 张)" in labels
+        assert "分层推标此文件夹未标注(1 张)" in labels
+        assert "分层推标全部(4 张)" in labels
         assert "用 LLM 推理此文件夹未标注(1 张)" in labels
         assert "用本地模型推理此文件夹未标注(1 张)" in labels
         assert "用 LLM 推理全部(4 张)" in labels
@@ -310,7 +391,11 @@ class TestInferMenu:
         self, panel: FilePanel, controller: AppController
     ) -> None:
         labels = [label for label, _run in panel.infer_menu_actions(None, image=K1)]
-        assert labels == ["用 LLM 推理这张图片", "用本地模型推理这张图片"]
+        assert labels == [
+            "用 LLM 推理这张图片",
+            "用本地模型推理这张图片",
+            "分层推标这张图片",
+        ]
 
     def test_image_menu_multiselect_adds_selected_and_all(
         self, panel: FilePanel, controller: AppController
@@ -331,7 +416,11 @@ class TestInferMenu:
         controller.toggle_selected(K1)
         controller.toggle_selected(K2)
         labels = [label for label, _run in panel.infer_menu_actions(None, image=K3)]
-        assert labels == ["用 LLM 推理这张图片", "用本地模型推理这张图片"]
+        assert labels == [
+            "用 LLM 推理这张图片",
+            "用本地模型推理这张图片",
+            "分层推标这张图片",
+        ]
 
     def test_image_action_infers_single_key(
         self, qtbot, panel: FilePanel, controller: AppController, monkeypatch
@@ -345,6 +434,23 @@ class TestInferMenu:
         )
         dict(panel.infer_menu_actions(None, image=K2))["用 LLM 推理这张图片"]()
         assert received == [((K2,), "llm")]
+
+    def test_layered_action_emits_without_confirm(
+        self, qtbot, panel: FilePanel, controller: AppController, monkeypatch
+    ) -> None:
+        import nlapt_gui.widgets.file_panel as fp_module
+
+        confirms: list[object] = []
+        monkeypatch.setattr(
+            fp_module, "ask_confirm", lambda *a, **k: confirms.append(True) or True
+        )
+        received: list[tuple[str, ...]] = []
+        panel.layered_infer_requested.connect(
+            lambda keys: received.append(tuple(keys))
+        )
+        dict(panel.infer_menu_actions(None, image=K2))["分层推标这张图片"]()
+        assert received == [(K2,)]
+        assert confirms == []
 
     def test_unlabeled_action_targets_only_unlabeled(
         self, qtbot, panel: FilePanel, controller: AppController, monkeypatch

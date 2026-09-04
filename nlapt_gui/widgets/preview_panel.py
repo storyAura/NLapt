@@ -1,12 +1,13 @@
-"""Middle column 预览与编辑 header bar + single/multi image preview.
+"""Middle column 预览与编辑 info bar + single/multi image preview.
 
-Header (46px): mono filename, real image-meta pill, 未保存 pill, multi
-compare pill, undo / prev / next / position, 复制 / 保存 / 全部保存.
-Preview: single image with fit-or-percent zoom and a floating zoom pill,
-or a 2x2 compare grid of the first four selected images with an 编辑中
-badge and an overflow pill. A thin :class:`SplitterHandle` is provided for
-the main window to mount between this panel and the editor area; it emits
-``editor_h_changed`` while dragging and persists ``editor_h`` on release.
+Header (46px): filename, format pill, dim / size / mtime, 未保存 pill,
+multi compare pill, prev / next / position, and the frameless ─ □ ×
+controls. Preview: single image with fit-or-percent zoom and a floating
+zoom pill, or a 2x2 compare grid of the first four selected images with
+an 编辑中 badge and an overflow pill. A thin :class:`SplitterHandle` is
+provided for the main window to mount between this panel and the editor
+area; it emits ``editor_h_changed`` while dragging and persists
+``editor_h`` on release.
 """
 
 from __future__ import annotations
@@ -56,6 +57,7 @@ from shiboken6 import isValid
 from nlapt.core.errors import NLaptError
 from nlapt.diagnostics import get_logger
 
+from nlapt_gui import anim
 from nlapt_gui.controller import AppController, MULTI_PREVIEW_LIMIT
 from nlapt_gui.theme.tokens import EDITOR_H_RANGE, ZOOM_RANGE, ZOOM_STEP, ThemeTokens, accent_soft
 from nlapt_gui.widgets.thumb_cells import (
@@ -66,13 +68,20 @@ from nlapt_gui.widgets.thumb_cells import (
     tokens_for_settings,
     ui_font,
 )
+from nlapt_gui.widgets.window_chrome import (
+    KIND_CLOSE,
+    KIND_MAX,
+    KIND_MIN,
+    WindowButton,
+    WindowDragHelper,
+    wire_window_buttons,
+)
 from nlapt_gui.workers import run_async
 
 _LOGGER = get_logger(__name__)
 
 HEADER_H = 46
 NAV_BUTTON_PX = 28
-ACTION_BUTTON_H = 29
 POS_MIN_W = 44
 DIVIDER_H = 18
 PREVIEW_PAD = 22
@@ -102,12 +111,8 @@ GRIP_W = 44
 GRIP_H = 3
 
 # Exact strings from the design.
-TIP_UNDO = "撤销 (Ctrl+Z)"
 TIP_PREV = "上一张 (Alt+↑)"
 TIP_NEXT = "下一张 (Alt+↓)"
-TEXT_COPY = "复制"
-TEXT_SAVE = "保存"
-TEXT_SAVE_ALL = "全部保存"
 TEXT_DIRTY = "未保存"
 TEXT_EDITING = "编辑中"
 TEXT_FIT = "适应"
@@ -176,18 +181,21 @@ class _SingleView(QWidget):
         """
         if not self.isVisible():
             return
+        if not anim.animations_enabled():
+            self.finish_image_fade()
+            return
         if self._fade_anim is not None:
             self._fade_anim.stop()
         self._fade_alpha = float(IMAGE_FADE_FROM)
-        anim = QVariantAnimation(self)
-        anim.setStartValue(float(IMAGE_FADE_FROM))
-        anim.setEndValue(1.0)
-        anim.setDuration(IMAGE_FADE_MS)
-        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        anim.valueChanged.connect(self._on_fade_value)
-        anim.finished.connect(self.finish_image_fade)
-        self._fade_anim = anim
-        anim.start()
+        fade = QVariantAnimation(self)
+        fade.setStartValue(float(IMAGE_FADE_FROM))
+        fade.setEndValue(1.0)
+        fade.setDuration(IMAGE_FADE_MS)
+        fade.setEasingCurve(QEasingCurve.Type.OutCubic)
+        fade.valueChanged.connect(self._on_fade_value)
+        fade.finished.connect(self.finish_image_fade)
+        self._fade_anim = fade
+        fade.start()
 
     def _on_fade_value(self, value: object) -> None:
         self._fade_alpha = float(value)  # type: ignore[arg-type]
@@ -459,6 +467,36 @@ class _MultiCell(QWidget):
         painter.end()
 
 
+class _InfoBar(QFrame):
+    """46px preview header: empty space drags the frameless window."""
+
+    def __init__(self, panel: "PreviewPanel") -> None:
+        super().__init__(panel)
+        self._drag = WindowDragHelper(self)
+
+    def _on_empty(self, event: QMouseEvent) -> bool:
+        return self.childAt(event.position().toPoint()) is None
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self._drag.press(event, self._on_empty(event)):
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self._drag.move(event):
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        self._drag.release()
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self._drag.double_click(event, self._on_empty(event)):
+            return
+        super().mouseDoubleClickEvent(event)
+
+
 class PreviewPanel(QFrame):
     """Preview-only middle widget (editor area is mounted by the integrator)."""
 
@@ -489,19 +527,32 @@ class PreviewPanel(QFrame):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        header = QFrame(self)
+        self.header = _InfoBar(self)
+        header = self.header
         header.setProperty("panel", True)
         header.setFixedHeight(HEADER_H)
         bar = QHBoxLayout(header)
-        bar.setContentsMargins(14, 0, 14, 0)
+        bar.setContentsMargins(14, 0, 0, 0)
         bar.setSpacing(10)
         self.name_label = QLabel(header)
-        self.name_label.setFont(mono_font(13, QFont.Weight.DemiBold))
+        self.name_label.setFont(mono_font(12.5, QFont.Weight.DemiBold))
         bar.addWidget(self.name_label)
         self.meta_pill = QLabel(header)
         self.meta_pill.setProperty("pill", True)
         self.meta_pill.setProperty("mono", True)
         bar.addWidget(self.meta_pill)
+        self.dim_label = QLabel(header)
+        self.dim_label.setProperty("muted", True)
+        self.dim_label.setFont(ui_font(11))
+        bar.addWidget(self.dim_label)
+        self.size_label = QLabel(header)
+        self.size_label.setProperty("muted", True)
+        self.size_label.setFont(ui_font(11))
+        bar.addWidget(self.size_label)
+        self.mtime_label = QLabel(header)
+        self.mtime_label.setProperty("muted", True)
+        self.mtime_label.setFont(ui_font(11))
+        bar.addWidget(self.mtime_label)
         self.dirty_pill = QLabel(TEXT_DIRTY, header)
         self.dirty_pill.setProperty("pill", "warn")
         self.dirty_pill.hide()
@@ -511,9 +562,6 @@ class PreviewPanel(QFrame):
         self.multi_pill.hide()
         bar.addWidget(self.multi_pill)
         bar.addStretch(1)
-        self.undo_button = self._nav_button(header, TIP_UNDO, self.controller.undo_current)
-        bar.addWidget(self.undo_button)
-        bar.addWidget(self._divider(header))
         self.prev_button = self._nav_button(header, TIP_PREV, lambda: self.controller.nav(-1))
         bar.addWidget(self.prev_button)
         self.pos_label = QLabel(header)
@@ -524,25 +572,13 @@ class PreviewPanel(QFrame):
         bar.addWidget(self.pos_label)
         self.next_button = self._nav_button(header, TIP_NEXT, lambda: self.controller.nav(1))
         bar.addWidget(self.next_button)
-        bar.addWidget(self._divider(header))
-        self.copy_button = QPushButton(TEXT_COPY, header)
-        self.copy_button.setProperty("variant", "outline")
-        self.copy_button.setFixedHeight(ACTION_BUTTON_H)
-        self.copy_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.copy_button.clicked.connect(self.controller.copy_caption)
-        bar.addWidget(self.copy_button)
-        self.save_button = QPushButton(TEXT_SAVE, header)
-        self.save_button.setProperty("variant", "accent")
-        self.save_button.setFixedHeight(ACTION_BUTTON_H)
-        self.save_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.save_button.clicked.connect(self.controller.save_current)
-        bar.addWidget(self.save_button)
-        self.save_all_button = QPushButton(TEXT_SAVE_ALL, header)
-        self.save_all_button.setProperty("variant", "outline")
-        self.save_all_button.setFixedHeight(ACTION_BUTTON_H)
-        self.save_all_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.save_all_button.clicked.connect(self.controller.save_all)
-        bar.addWidget(self.save_all_button)
+        tokens = self._tokens
+        self.min_button = WindowButton(KIND_MIN, tokens, header)
+        self.max_button = WindowButton(KIND_MAX, tokens, header)
+        self.close_button = WindowButton(KIND_CLOSE, tokens, header)
+        wire_window_buttons(self.min_button, self.max_button, self.close_button, self)
+        for button in (self.min_button, self.max_button, self.close_button):
+            bar.addWidget(button)
         root.addWidget(header)
 
         divider = QFrame(self)
@@ -640,17 +676,16 @@ class PreviewPanel(QFrame):
     def apply_tokens(self, tokens: ThemeTokens) -> None:
         self._tokens = tokens
         self._apply_icon_colors()
+        for button in (self.min_button, self.max_button, self.close_button):
+            button.set_tokens(tokens)
         self.single_view.update()
         for cell in self._multi_cells:
             cell.update()
 
     def _apply_icon_colors(self) -> None:
         t = self._tokens
-        self.undo_button.setIcon(make_icon("undo", t.text2, 15))
         self.prev_button.setIcon(make_icon("chevron_left", t.text2, 14))
         self.next_button.setIcon(make_icon("chevron_right", t.text2, 14))
-        self.copy_button.setIcon(make_icon("copy", t.text2, 12))
-        self.save_button.setIcon(make_icon("save", t.onaccent, 13))
         self.zoom_pill.setStyleSheet(
             f"QFrame#zoomPill {{ background: {t.surface}; border: 1px solid {t.bd};"
             f" border-radius: 9px; }}"
@@ -813,6 +848,7 @@ class PreviewPanel(QFrame):
         self._epoch += 1
         self._pix_cache.clear()
         self._loading.clear()
+        self.single_view.set_pixmap(None)
         self._refresh_all()
 
     def _on_current_changed(self, _key: str) -> None:
@@ -821,7 +857,9 @@ class PreviewPanel(QFrame):
         # Each new image starts at 适应 (fit), mirroring the prototype's pick().
         self._set_zoom(None)
         key = self.controller.current_key
-        self.single_view.set_pixmap(self._pix_cache.get(key) if key else None)
+        cached = self._pix_cache.get(key) if key else None
+        if cached is not None or not key:
+            self.single_view.set_pixmap(cached)
         self._sync_single_size()
         if key:
             self._ensure_image(key)
@@ -853,14 +891,25 @@ class PreviewPanel(QFrame):
             self.name_label.setText("")
             self.meta_pill.setText("")
             self.meta_pill.hide()
+            self.dim_label.setText("")
+            self.size_label.setText("")
+            self.mtime_label.setText("")
             self.dirty_pill.hide()
             return
         self.name_label.setText(key.rsplit("/", 1)[-1])
         try:
-            self.meta_pill.setText(controller.image_meta(key))
+            self.meta_pill.setText(controller.image_format(key))
             self.meta_pill.show()
+            meta = controller.image_meta(key)
+            parts = [part.strip() for part in meta.split("·")]
+            self.dim_label.setText(parts[0] if parts else "")
+            self.size_label.setText(parts[-1] if len(parts) > 2 else "")
+            self.mtime_label.setText(controller.image_modified_label(key))
         except NLaptError:
             self.meta_pill.hide()
+            self.dim_label.setText("")
+            self.size_label.setText("")
+            self.mtime_label.setText("")
         self.dirty_pill.setVisible(controller.record(key).dirty)
 
     def _refresh_mode(self) -> None:
@@ -910,9 +959,8 @@ class PreviewPanel(QFrame):
         return "multi" if self._stack.currentIndex() == 1 else "single"
 
     def set_busy(self, busy: bool) -> None:
-        """Disable the save buttons while a batch/save is in flight."""
-        self.save_button.setEnabled(not busy)
-        self.save_all_button.setEnabled(not busy)
+        """Kept for the main-window busy hook; save now lives on the rail."""
+        del busy
 
     # -- overlays --------------------------------------------------------------------------
     def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # noqa: N802

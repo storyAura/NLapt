@@ -54,6 +54,10 @@ class LocalSettings:
     quant_label: str = ""  # last selected quant label
     # Instruction (指令) used by Florence-2 PromptGen families.
     florence_task: str = DEFAULT_FLORENCE_TASK
+    # PEFT LoRA merged into the Florence engine ("" = none) and the
+    # user-registered LoRA files offered in the 设置 dropdown.
+    florence_lora: str = ""
+    florence_loras: tuple[str, ...] = ()
     # Official prompt preset id for caption-specialist GGUF families
     # (nlapt.local.presets). "" = the family's default preset; the
     # PRESET_CUSTOM sentinel opts out into the free-form 推理提示词.
@@ -67,6 +71,15 @@ class LocalSettings:
 def _valid_task(value: object) -> str:
     """Coerce a stored Florence 指令 to a known token; fall back to default."""
     return value if value in FLORENCE_TASK_TOKENS else DEFAULT_FLORENCE_TASK
+
+
+def _str_tuple(value: object) -> tuple[str, ...]:
+    """Coerce a stored list to a tuple of non-empty stripped strings."""
+    if not isinstance(value, list):
+        return ()
+    return tuple(
+        str(item).strip() for item in value if isinstance(item, str) and item.strip()
+    )
 
 
 def _clamp(value: object, default: int, bounds: tuple[int, int]) -> int:
@@ -91,19 +104,9 @@ def load_local_settings(path: Path) -> LocalSettings:
     if not isinstance(raw, dict):
         _LOGGER.warning("local settings %s is not an object; using defaults", path)
         return LocalSettings()
-    raw_extra = raw.get("extra_dirs", [])
-    extra_dirs = (
-        tuple(
-            str(item).strip()
-            for item in raw_extra
-            if isinstance(item, str) and str(item).strip()
-        )
-        if isinstance(raw_extra, list)
-        else ()
-    )
     return LocalSettings(
         models_dir=str(raw.get("models_dir", "")),
-        extra_dirs=extra_dirs,
+        extra_dirs=_str_tuple(raw.get("extra_dirs", [])),
         server_path=str(raw.get("server_path", "")),
         port=_clamp(raw.get("port", DEFAULT_PORT), DEFAULT_PORT, PORT_RANGE),
         context_length=_clamp(
@@ -123,6 +126,8 @@ def load_local_settings(path: Path) -> LocalSettings:
         family_id=str(raw.get("family_id", "")),
         quant_label=str(raw.get("quant_label", "")),
         florence_task=_valid_task(raw.get("florence_task", DEFAULT_FLORENCE_TASK)),
+        florence_lora=str(raw.get("florence_lora", "")),
+        florence_loras=_str_tuple(raw.get("florence_loras", [])),
         prompt_preset=str(raw.get("prompt_preset", "")),
     )
 

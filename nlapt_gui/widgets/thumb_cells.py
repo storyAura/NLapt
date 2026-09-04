@@ -255,16 +255,81 @@ def _paint_view_big(p: QPainter, color: QColor) -> None:
     p.drawRoundedRect(QRectF(3.0, 3.0, 10.0, 10.0), 1.5, 1.5)
 
 
+def _paint_save_all(p: QPainter, color: QColor) -> None:
+    _paint_save(p, color)
+    p.setPen(_pen(color, 1.4))
+    p.drawLine(QPointF(6.5, 10.8), QPointF(9.5, 10.8))
+
+
+def _paint_export(p: QPainter, color: QColor) -> None:
+    p.setPen(_pen(color, 1.5))
+    p.drawLine(QPointF(8.0, 2.5), QPointF(8.0, 10.0))
+    p.drawLine(QPointF(5.0, 5.5), QPointF(8.0, 2.5))
+    p.drawLine(QPointF(11.0, 5.5), QPointF(8.0, 2.5))
+    p.drawLine(QPointF(3.0, 12.5), QPointF(13.0, 12.5))
+    p.drawLine(QPointF(3.0, 12.5), QPointF(3.0, 10.0))
+    p.drawLine(QPointF(13.0, 12.5), QPointF(13.0, 10.0))
+
+
+def _paint_redo(p: QPainter, color: QColor) -> None:
+    p.setPen(_pen(color, 1.5))
+    path = QPainterPath(QPointF(13.5, 6.5))
+    path.lineTo(6.5, 6.5)
+    path.arcTo(QRectF(2.5, 6.5, 8.0, 8.0), 90.0, 180.0)
+    path.lineTo(10.0, 14.5)
+    p.drawPath(path)
+    p.drawLine(QPointF(10.5, 3.5), QPointF(13.5, 6.5))
+    p.drawLine(QPointF(13.5, 6.5), QPointF(10.5, 9.5))
+
+
+def _paint_tools(p: QPainter, color: QColor) -> None:
+    p.setPen(_pen(color, 1.5))
+    p.drawRoundedRect(QRectF(2.5, 7.2, 11.0, 3.6), 1.2, 1.2)
+    p.drawLine(QPointF(5.5, 7.2), QPointF(5.5, 4.0))
+    p.drawLine(QPointF(5.5, 10.8), QPointF(5.5, 13.5))
+    p.drawLine(QPointF(10.5, 7.2), QPointF(10.5, 4.0))
+    p.drawLine(QPointF(10.5, 10.8), QPointF(10.5, 13.5))
+
+
+def _paint_settings(p: QPainter, color: QColor) -> None:
+    p.setPen(_pen(color, 1.5))
+    p.drawEllipse(QRectF(5.2, 5.2, 5.6, 5.6))
+    p.drawEllipse(QRectF(2.2, 2.2, 11.6, 11.6))
+
+
+def _paint_theme(p: QPainter, color: QColor) -> None:
+    p.setPen(_pen(color, 1.5))
+    p.drawEllipse(QRectF(4.5, 4.5, 7.0, 7.0))
+    rays = (
+        (8.0, 1.4, 8.0, 2.8),
+        (8.0, 13.2, 8.0, 14.6),
+        (1.4, 8.0, 2.8, 8.0),
+        (13.2, 8.0, 14.6, 8.0),
+        (3.3, 3.3, 4.3, 4.3),
+        (11.7, 11.7, 12.7, 12.7),
+        (11.7, 3.3, 12.7, 4.3),
+        (3.3, 11.7, 4.3, 12.7),
+    )
+    for x1, y1, x2, y2 in rays:
+        p.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+
+
 _ICON_PAINTERS: dict[str, Callable[[QPainter, QColor], None]] = {
     "folder": _paint_folder,
     "folder_open": _paint_folder_open,
     "refresh": _paint_refresh,
     "search": _paint_search,
     "undo": _paint_undo,
+    "redo": _paint_redo,
     "chevron_left": _paint_chevron_left,
     "chevron_right": _paint_chevron_right,
     "copy": _paint_copy,
     "save": _paint_save,
+    "save_all": _paint_save_all,
+    "export": _paint_export,
+    "tools": _paint_tools,
+    "settings": _paint_settings,
+    "theme": _paint_theme,
     "view_list": _paint_view_list,
     "view_mid": _paint_view_mid,
     "view_big": _paint_view_big,

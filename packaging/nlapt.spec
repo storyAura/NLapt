@@ -41,11 +41,15 @@ HIDDEN_IMPORTS = [
     "httpx",
     "PIL.Image",
     # Florence-2 ONNX engine deps, imported lazily inside functions.
+    # CPU EP only — GPU extras are pruned after Analysis (see _prune_analysis).
     "onnxruntime",
     "numpy",
 ]
 
 # Modules that must never ship in the bundle.
+# A global site-packages with torch / paddle / onnxruntime-gpu would otherwise
+# be pulled in through onnxruntime.training / onnxruntime.transformers hooks
+# and balloon a ~350 MB CPU build past 2 GB.
 EXCLUDES = [
     "tests",
     "docs",
@@ -55,7 +59,97 @@ EXCLUDES = [
     "tkinter",
     "PyQt5",
     "PyQt6",
+    "torch",
+    "torchvision",
+    "torchaudio",
+    "paddle",
+    "paddlex",
+    "paddleocr",
+    "bitsandbytes",
+    "cv2",
+    "scipy",
+    "sklearn",
+    "transformers",
+    "tokenizers",
+    "timm",
+    "pandas",
+    "matplotlib",
+    "av",
+    "altair",
+    "hf_xet",
+    "curl_cffi",
+    "pytorch_lightning",
+    "torchmetrics",
+    "open_clip",
+    "open_clip_torch",
+    "onnxruntime.training",
+    "onnxruntime.transformers",
 ]
+
+# Drop leftover CUDA / GPU-provider binaries even when a GPU wheel is installed.
+_DROP_BINARY_MARKERS = (
+    "onnxruntime_providers_cuda",
+    "onnxruntime_providers_tensorrt",
+    "cublas",
+    "cudnn",
+    "cufft",
+    "curand",
+    "cusparse",
+    "nvrtc",
+    "cudart",
+)
+_DROP_DATA_PREFIXES = tuple(
+    name + "/"
+    for name in (
+        "torch",
+        "torchvision",
+        "torchaudio",
+        "paddle",
+        "paddlex",
+        "paddleocr",
+        "bitsandbytes",
+        "cv2",
+        "scipy",
+        "sklearn",
+        "transformers",
+        "tokenizers",
+        "timm",
+        "pandas",
+        "matplotlib",
+        "av",
+        "altair",
+        "hf_xet",
+        "curl_cffi",
+        "pytorch_lightning",
+        "torchmetrics",
+        "open_clip",
+    )
+)
+
+
+def _toc_name(entry) -> str:
+    name = entry[0] if isinstance(entry, (tuple, list)) else str(entry)
+    return str(name).replace("\\", "/")
+
+
+def _drop_binary(entry) -> bool:
+    lowered = _toc_name(entry).lower()
+    base = lowered.rsplit("/", 1)[-1]
+    return any(marker in base for marker in _DROP_BINARY_MARKERS)
+
+
+def _drop_data(entry) -> bool:
+    lowered = _toc_name(entry).lower()
+    if any(lowered.startswith(prefix) for prefix in _DROP_DATA_PREFIXES):
+        return True
+    return _drop_binary(entry)
+
+
+def _prune_analysis(analysis) -> None:
+    """Strip GPU/CUDA leftovers the onnxruntime hook may still collect."""
+    analysis.binaries = [item for item in analysis.binaries if not _drop_binary(item)]
+    analysis.datas = [item for item in analysis.datas if not _drop_data(item)]
+
 
 a = Analysis(  # noqa: F821 - injected by PyInstaller
     [ENTRY_SCRIPT],
@@ -70,6 +164,7 @@ a = Analysis(  # noqa: F821 - injected by PyInstaller
     excludes=EXCLUDES,
     noarchive=False,
 )
+_prune_analysis(a)
 
 pyz = PYZ(a.pure)  # noqa: F821 - injected by PyInstaller
 

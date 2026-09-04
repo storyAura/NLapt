@@ -34,7 +34,10 @@ DEFAULT_MAX_TOKENS = 1024
 DEFAULT_TIMEOUT_SECONDS = 60.0
 
 CONNECTION_TEST_PROMPT = "Reply with the single word: ok"
-CONNECTION_TEST_MAX_TOKENS = 8
+# Thinking models spend output tokens on hidden reasoning BEFORE the visible
+# reply; a tiny cap (this was 8) made the test always come back empty and
+# therefore always fail on such models. Keep enough budget for the thinking.
+CONNECTION_TEST_MAX_TOKENS = 1024
 
 HTTPX_MISSING_MESSAGE = (
     "The 'httpx' package is required for LLM HTTP clients. "

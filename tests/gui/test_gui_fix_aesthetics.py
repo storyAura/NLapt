@@ -17,7 +17,7 @@ from typing import Iterator
 from urllib.parse import quote
 
 import pytest
-from PySide6.QtCore import QAbstractAnimation
+from PySide6.QtCore import QAbstractAnimation, QPropertyAnimation, QRect
 from PySide6.QtWidgets import QComboBox, QWidget
 
 from nlapt_gui import anim
@@ -162,6 +162,63 @@ class TestAnimHelpers:
         assert isinstance(animation, QAbstractAnimation)
         animation.setCurrentTime(animation.duration())
         assert widget.graphicsEffect().opacity() == pytest.approx(1.0)
+        widget.deleteLater()
+
+    def test_slide_geometry_disabled_jumps_to_end(self, qapp) -> None:
+        anim.set_animations_enabled(False)
+        widget = QWidget()
+        widget.setGeometry(0, 0, 40, 80)
+        end = QRect(100, 0, 40, 80)
+        result = anim.slide_geometry(widget, QRect(200, 0, 40, 80), end)
+        assert result is None
+        assert widget.geometry() == end
+        widget.deleteLater()
+
+    def test_animate_reflow_disabled_jumps_to_end(self, qapp) -> None:
+        anim.set_animations_enabled(False)
+        widget = QWidget()
+        widget.setGeometry(0, 0, 40, 20)
+        end = QRect(80, 10, 40, 20)
+        result = anim.animate_reflow([(widget, QRect(0, 0, 40, 20), end)])
+        assert result is None
+        assert widget.geometry() == end
+        widget.deleteLater()
+
+    def test_animate_reflow_enabled_returns_group(self, qapp) -> None:
+        anim.set_animations_enabled(True)
+        widget = QWidget()
+        widget.show()
+        start = QRect(0, 0, 40, 20)
+        end = QRect(80, 10, 40, 20)
+        motion = anim.animate_reflow([(widget, start, end)], ms=80)
+        assert isinstance(motion, QAbstractAnimation)
+        motion.setCurrentTime(motion.duration())
+        assert widget.geometry() == end
+        widget.deleteLater()
+
+    def test_slide_geometry_enabled_returns_animation(self, qapp) -> None:
+        anim.set_animations_enabled(True)
+        widget = QWidget()
+        widget.show()
+        start = QRect(200, 0, 40, 80)
+        end = QRect(100, 0, 40, 80)
+        animation = anim.slide_geometry(widget, start, end, ms=120)
+        assert isinstance(animation, QAbstractAnimation)
+        animation.setCurrentTime(animation.duration())
+        assert widget.geometry() == end
+        widget.deleteLater()
+
+    def test_stop_animation_ignores_already_deleted(self, qapp) -> None:
+        anim.set_animations_enabled(True)
+        widget = QWidget()
+        motion = QPropertyAnimation(widget, b"windowOpacity", widget)
+        motion.setDuration(40)
+        motion.setStartValue(1.0)
+        motion.setEndValue(0.4)
+        motion.start(QAbstractAnimation.DeletionPolicy.DeleteWhenStopped)
+        motion.setCurrentTime(motion.duration())
+        anim.stop_animation(motion)
+        anim.finish_animation(motion)
         widget.deleteLater()
 
 

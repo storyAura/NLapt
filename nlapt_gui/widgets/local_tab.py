@@ -1,45 +1,20 @@
 """设置 ▸ 本地推理 tab: catalog tree, run grades, downloads, server.
 
-Landscape composition (用户要求 横构图): the catalog tree fills the left
-side; the right side stacks the selection detail, the action buttons, the
-runtime settings (下载目录 / 复用目录 / llama-server / 上下文 / GPU 层 /
-线程 / 并发 / 端口) and the hint. Per-quant「能否运行」is a plain
-five-level Chinese grade from :class:`nlapt.local.advisor.RunGrade`
-(轻松运行 / 流畅运行 / 可以运行 / 勉强能跑 / 跑不动).
-
-Model files download into the primary 下载目录 (default: inside the app,
-``models/``) and are FOUND in the primary + any 复用目录, so models already
-downloaded by other tools are reused instead of re-downloaded.
-
-All slow work goes through :class:`nlapt_gui.local_bridge.LocalBridge`.
-Like the settings dialog that hosts it, this tab is part of the sanctioned
-exception that may write the core config directly (设为当前模型 registers a
-``local`` OpenAI-compatible profile pointing at the llama-server).
+Landscape layout: catalog tree on the left, carded controls on the right.
+Per-quant「能否运行」is a five-level Chinese grade from
+:class:`nlapt.local.advisor.RunGrade`. Slow work goes through
+:class:`nlapt_gui.local_bridge.LocalBridge`. This tab may write the core
+config (设为当前模型 registers a ``local`` OpenAI-compatible profile).
 """
 
 from __future__ import annotations
 
 from dataclasses import replace as _dc_replace
+from pathlib import Path
 
 from PySide6.QtCore import Qt, QThreadPool, QUrl
 from PySide6.QtGui import QDesktopServices, QShowEvent
-from PySide6.QtWidgets import (
-    QComboBox,
-    QFileDialog,
-    QFormLayout,
-    QHBoxLayout,
-    QHeaderView,
-    QLabel,
-    QLineEdit,
-    QListWidget,
-    QProgressBar,
-    QPushButton,
-    QSpinBox,
-    QTreeWidget,
-    QTreeWidgetItem,
-    QVBoxLayout,
-    QWidget,
-)
+from PySide6.QtWidgets import QFileDialog, QTreeWidgetItem, QWidget
 
 from nlapt.core.config import LLMProfile, load_config, save_config
 from nlapt.core.errors import NLaptError, StorageError, ValidationError
@@ -50,30 +25,21 @@ from nlapt.local.catalog import (
     ENGINE_FLORENCE,
     ModelFamily,
     QuantFile,
-    all_series,
-    families_for,
     find_family,
+    find_lora,
     find_quant,
     repo_page_url,
 )
-from nlapt.local.florence import FLORENCE_TASK_LABELS
 from nlapt.local.hardware import HardwareInfo, format_bytes
 from nlapt.local.presets import PRESET_CUSTOM, presets_for
-from nlapt.local.server import base_url as local_base_url
-from nlapt.local.settings import (
-    CONTEXT_RANGE,
-    GPU_LAYERS_RANGE,
-    PARALLEL_RANGE,
-    PORT_RANGE,
-    THREADS_RANGE,
-)
-
 from nlapt.local.runtime import LLAMA_CPP_TAG
+from nlapt.local.server import base_url as local_base_url
 
 from nlapt_gui.controller import AppController, TOAST_ERR, TOAST_OK, TOAST_WARN
 from nlapt_gui.local_bridge import (
     DOWNLOAD_CANCELLED,
     DOWNLOAD_OK,
+    LORA_FAMILY_PREFIX,
     SERVER_ERROR,
     SERVER_RUNNING,
     SERVER_STARTING,
@@ -90,6 +56,8 @@ LOCAL_API_TYPE = "openai"
 
 ROLE_FAMILY = Qt.ItemDataRole.UserRole
 ROLE_QUANT = Qt.ItemDataRole.UserRole + 1
+# LoRA combo: item data = safetensors path; this role = curated lora_id.
+ROLE_LORA_ID = Qt.ItemDataRole.UserRole + 2
 
 # Landscape sizing: tree left, controls right.
 LOCAL_TAB_MIN_W = 840
@@ -169,6 +137,17 @@ TIP_FLORENCE_TASK = (
     "Florence-2 PromptGen 由内置指令驱动(不使用推理提示词):"
     "选择输出标签、各级标题或构图分析"
 )
+LABEL_FLORENCE_LORA = "LoRA"
+LORA_NONE_LABEL = "不使用 LoRA"
+TIP_FLORENCE_LORA = (
+    "推理时把 PEFT LoRA(safetensors,同目录需有 adapter_config.json)"
+    "合并进模型;仅支持与当前模型同架构训练的 LoRA"
+)
+CAPTION_PICK_LORA = "选择 LoRA 文件(同目录需有 adapter_config.json)"
+FILTER_LORA = "LoRA 权重 (*.safetensors);;所有文件 (*)"
+BTN_DOWNLOAD_LORA = "下载"
+LORA_MISSING_SUFFIX = "(未下载)"
+TOAST_LORA_OK = "已就绪 LoRA:{name}"
 LABEL_PROMPT_PRESET = "提示词预设"
 PRESET_CUSTOM_LABEL = "自定义(使用推理提示词)"
 TIP_PROMPT_PRESET = (
@@ -181,13 +160,6 @@ LABEL_EXTRA_DIRS = "复用目录(也在这些目录中查找已下载的模型)"
 BTN_ADD_DIR = "添加"
 BTN_REMOVE_DIR = "移除"
 CAPTION_PICK_EXTRA_DIR = "选择复用模型目录"
-SERVER_HINT = (
-    "本地服务基于 llama.cpp 的 llama-server:程序自带完整推理能力,"
-    "首次下载模型 / 启动服务时会自动获取官方运行时(上方留空即用自动版本,"
-    "也可手动指定可执行文件)。模型就绪后,编辑区与文件夹右键的「本地推理」"
-    "可直接使用;「设为当前模型」额外把翻译 / 重译也切到本地模型。"
-    "Florence-2 PromptGen 模型例外:免服务、免运行时,按「指令模式」直接打标。"
-)
 TOAST_SELECT_QUANT = "请先在列表中选择一个量化档"
 TOAST_DOWNLOAD_BUSY = "已有下载任务正在进行"
 TOAST_DOWNLOAD_OK = "已就绪 {name} · {quant}"
@@ -205,12 +177,14 @@ DOWNLOAD_FORMAT = "{done} / {total}"
 
 FILTER_EXECUTABLE = "可执行文件 (*.exe);;所有文件 (*)"
 
-
-def _format_downloads(count: int) -> str:
-    """Compact Chinese download count: 1_491_605 -> '149.2 万'."""
-    if count >= 10_000:
-        return f"{count / 10_000:.1f} 万"
-    return str(count)
+from nlapt_gui.widgets.local_tab_sections import (  # noqa: E402
+    build_local_tab_ui,
+    populate_catalog_tree,
+    quant_items,
+    rebuild_lora_combo,
+    rebuild_task_combo,
+    refresh_lora_buttons,
+)
 
 
 class LocalTab(QWidget):
@@ -240,217 +214,10 @@ class LocalTab(QWidget):
 
     # -- construction ------------------------------------------------------------------
     def _build_ui(self) -> None:
-        self.setMinimumSize(LOCAL_TAB_MIN_W, LOCAL_TAB_MIN_H)
-        self.hw_label = QLabel(HW_DETECTING, self)
-        self.hw_label.setTextFormat(Qt.TextFormat.RichText)
-        self.hw_label.setWordWrap(True)
-        self.detect_button = QPushButton(BTN_DETECT, self)
-        self.detect_button.setProperty("variant", "outline")
-        hw_row = QHBoxLayout()
-        hw_row.addWidget(self.hw_label, 1)
-        hw_row.addWidget(self.detect_button, 0, Qt.AlignmentFlag.AlignTop)
-
-        # -- left: catalog tree -------------------------------------------------------
-        self.tree = QTreeWidget(self)
-        self.tree.setColumnCount(4)
-        self.tree.setHeaderLabels([COL_MODEL, COL_SIZE, COL_DOWNLOADS, COL_GRADE])
-        self.tree.setMinimumWidth(TREE_MIN_W)
-        self.tree.setRootIsDecorated(True)
-        header = self.tree.header()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for column in (1, 2, 3):
-            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
-
-        self.catalog_hint = QLabel(CATALOG_HINT, self)
-        self.catalog_hint.setProperty("muted", True)
-        self.catalog_hint.setWordWrap(True)
-
-        left_pane = QVBoxLayout()
-        left_pane.setSpacing(6)
-        left_pane.addWidget(self.tree, 1)
-        left_pane.addWidget(self.catalog_hint)
-
-        # -- right: detail, actions, runtime settings ---------------------------------
-        self.detail_label = QLabel(DETAIL_EMPTY, self)
-        self.detail_label.setTextFormat(Qt.TextFormat.RichText)
-        self.detail_label.setProperty("muted", True)
-        self.detail_label.setWordWrap(True)
-
-        self.download_button = QPushButton(BTN_DOWNLOAD, self)
-        self.download_button.setProperty("variant", "accent")
-        self.page_button = QPushButton(BTN_PAGE, self)
-        self.page_button.setProperty("variant", "ghost")
-        action_row_top = QHBoxLayout()
-        action_row_top.addWidget(self.download_button)
-        action_row_top.addWidget(self.page_button)
-        action_row_top.addStretch(1)
-        self.server_button = QPushButton(BTN_SERVER_START, self)
-        self.server_button.setProperty("variant", "outline")
-        self.apply_button = QPushButton(BTN_APPLY, self)
-        self.apply_button.setProperty("variant", "outline")
-        action_row_bottom = QHBoxLayout()
-        action_row_bottom.addWidget(self.server_button)
-        action_row_bottom.addWidget(self.apply_button)
-        action_row_bottom.addStretch(1)
-
-        self.progress = QProgressBar(self)
-        self.progress.setVisible(False)
-        self.server_status = QLabel(SERVER_STATUS_STOPPED, self)
-        self.server_status.setProperty("muted", True)
-        self.server_status.setWordWrap(True)
-
-        self.models_dir_edit = QLineEdit(self)
-        self.models_dir_browse = QPushButton(BTN_BROWSE, self)
-        self.models_dir_browse.setProperty("variant", "ghost")
-        models_dir_row = QHBoxLayout()
-        models_dir_row.addWidget(self.models_dir_edit, 1)
-        models_dir_row.addWidget(self.models_dir_browse)
-        self.server_path_edit = QLineEdit(self)
-        self.server_path_browse = QPushButton(BTN_BROWSE, self)
-        self.server_path_browse.setProperty("variant", "ghost")
-        server_path_row = QHBoxLayout()
-        server_path_row.addWidget(self.server_path_edit, 1)
-        server_path_row.addWidget(self.server_path_browse)
-
-        self.context_spin = QSpinBox(self)
-        self.context_spin.setRange(*CONTEXT_RANGE)
-        self.context_spin.setSingleStep(CONTEXT_STEP)
-        self.gpu_layers_spin = QSpinBox(self)
-        self.gpu_layers_spin.setRange(*GPU_LAYERS_RANGE)
-        self.gpu_layers_spin.setSpecialValueText(SPECIAL_GPU_AUTO)
-        self.threads_spin = QSpinBox(self)
-        self.threads_spin.setRange(*THREADS_RANGE)
-        self.threads_spin.setSpecialValueText(SPECIAL_THREADS_AUTO)
-        self.parallel_spin = QSpinBox(self)
-        self.parallel_spin.setRange(*PARALLEL_RANGE)
-        self.port_spin = QSpinBox(self)
-        self.port_spin.setRange(*PORT_RANGE)
-
-        self.florence_task_combo = QComboBox(self)
-        for token, label in FLORENCE_TASK_LABELS.items():
-            self.florence_task_combo.addItem(label, token)
-        self.florence_task_combo.setToolTip(TIP_FLORENCE_TASK)
-
-        # 提示词预设 row: only shown for caption specialists with official
-        # presets (JoyCaption / ToriiGate); populated per selected family.
-        self.preset_combo = QComboBox(self)
-        self.preset_combo.setToolTip(TIP_PROMPT_PRESET)
-        self._preset_family_id = ""
-
-        form = QFormLayout()
-        form.setVerticalSpacing(6)
-        # 指令模式 row: only meaningful (and only shown) for Florence models.
-        form.addRow(LABEL_FLORENCE_TASK, self.florence_task_combo)
-        form.addRow(LABEL_PROMPT_PRESET, self.preset_combo)
-        self._form = form
-        form.setRowVisible(self.florence_task_combo, False)
-        form.setRowVisible(self.preset_combo, False)
-        form.addRow(LABEL_MODELS_DIR, models_dir_row)
-        form.addRow(LABEL_SERVER_PATH, server_path_row)
-        form.addRow(LABEL_CONTEXT, self.context_spin)
-        form.addRow(LABEL_GPU_LAYERS, self.gpu_layers_spin)
-        form.addRow(LABEL_THREADS, self.threads_spin)
-        form.addRow(LABEL_PARALLEL, self.parallel_spin)
-        form.addRow(LABEL_PORT, self.port_spin)
-
-        self.extra_dirs_label = QLabel(LABEL_EXTRA_DIRS, self)
-        self.extra_dirs_label.setProperty("muted", True)
-        self.extra_dirs_label.setWordWrap(True)
-        self.extra_dirs_list = QListWidget(self)
-        self.extra_dirs_list.setFixedHeight(EXTRA_DIRS_LIST_H)
-        self.extra_add_button = QPushButton(BTN_ADD_DIR, self)
-        self.extra_add_button.setProperty("variant", "ghost")
-        self.extra_remove_button = QPushButton(BTN_REMOVE_DIR, self)
-        self.extra_remove_button.setProperty("variant", "ghost")
-        extra_buttons = QVBoxLayout()
-        extra_buttons.setSpacing(4)
-        extra_buttons.addWidget(self.extra_add_button)
-        extra_buttons.addWidget(self.extra_remove_button)
-        extra_buttons.addStretch(1)
-        extra_row = QHBoxLayout()
-        extra_row.addWidget(self.extra_dirs_list, 1)
-        extra_row.addLayout(extra_buttons)
-
-        self.server_hint = QLabel(SERVER_HINT, self)
-        self.server_hint.setProperty("muted", True)
-        self.server_hint.setWordWrap(True)
-
-        right_pane = QVBoxLayout()
-        right_pane.setSpacing(8)
-        right_pane.addWidget(self.detail_label)
-        right_pane.addLayout(action_row_top)
-        right_pane.addLayout(action_row_bottom)
-        right_pane.addWidget(self.progress)
-        right_pane.addWidget(self.server_status)
-        right_pane.addLayout(form)
-        right_pane.addWidget(self.extra_dirs_label)
-        right_pane.addLayout(extra_row)
-        right_pane.addWidget(self.server_hint)
-        right_pane.addStretch(1)
-        right_holder = QWidget(self)
-        right_holder.setMinimumWidth(RIGHT_PANE_MIN_W)
-        right_holder.setLayout(right_pane)
-
-        body = QHBoxLayout()
-        body.setSpacing(12)
-        body.addLayout(left_pane, 3)
-        body.addWidget(right_holder, 2)
-
-        column = QVBoxLayout(self)
-        column.setSpacing(8)
-        column.addLayout(hw_row)
-        column.addLayout(body, 1)
+        build_local_tab_ui(self)
 
     def _populate_tree(self) -> None:
-        self.tree.clear()
-        for series in all_series():
-            series_item = QTreeWidgetItem([series.name, "", "", ""])
-            series_item.setToolTip(0, series.description)
-            series_item.setFlags(series_item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
-            self._embolden(series_item, 0)
-            self.tree.addTopLevelItem(series_item)
-            for family in families_for(series.series_id):
-                name = f"{family.name} · {family.params_label}"
-                if family.vision:
-                    name = f"{name} · {TAG_VISION}"
-                family_item = QTreeWidgetItem(
-                    [name, "", _format_downloads(family.downloads), ""]
-                )
-                tooltip = family.notes or family.name
-                family_item.setToolTip(
-                    0, f"{tooltip}\n{family.repo_id} · {family.license}"
-                )
-                family_item.setFlags(
-                    family_item.flags() & ~Qt.ItemFlag.ItemIsSelectable
-                )
-                family_item.setData(0, ROLE_FAMILY, family.family_id)
-                self._embolden(family_item, 0)
-                series_item.addChild(family_item)
-                extras_bytes = sum(extra.size_bytes for extra in family.extra_files)
-                for quant in family.quants:
-                    label = quant.label
-                    if quant.recommended:
-                        label = f"{label}  {TAG_RECOMMENDED}"
-                    quant_item = QTreeWidgetItem(
-                        [
-                            label,
-                            format_bytes(quant.size_bytes + extras_bytes),
-                            "",
-                            GRADE_TEXT[RunGrade.UNKNOWN],
-                        ]
-                    )
-                    quant_item.setData(0, ROLE_FAMILY, family.family_id)
-                    quant_item.setData(0, ROLE_QUANT, quant.label)
-                    self._embolden(quant_item, 3)
-                    family_item.addChild(quant_item)
-            series_item.setExpanded(True)
-
-    @staticmethod
-    def _embolden(item: QTreeWidgetItem, column: int) -> None:
-        """Bold one cell (重要字眼需要明显 — names and grades stand out)."""
-        font = item.font(column)
-        font.setBold(True)
-        item.setFont(column, font)
+        populate_catalog_tree(self)
 
     def _connect(self) -> None:
         self.detect_button.clicked.connect(self.refresh_hardware)
@@ -466,6 +233,10 @@ class LocalTab(QWidget):
         self.server_path_browse.clicked.connect(self._browse_server_path)
         self.extra_add_button.clicked.connect(self._add_extra_dir)
         self.extra_remove_button.clicked.connect(self._remove_extra_dir)
+        self.lora_add_button.clicked.connect(self._add_lora)
+        self.lora_remove_button.clicked.connect(self._remove_lora)
+        self.lora_download_button.clicked.connect(self._on_lora_download_clicked)
+        self.florence_lora_combo.currentIndexChanged.connect(self._on_lora_changed)
         bridge = self.bridge
         bridge.hardware_ready.connect(self._on_hardware_ready)
         bridge.download_progress.connect(self._on_download_progress)
@@ -483,6 +254,17 @@ class LocalTab(QWidget):
         task_index = self.florence_task_combo.findData(settings.florence_task)
         if task_index >= 0:
             self.florence_task_combo.setCurrentIndex(task_index)
+        # LoRAs: user-registered files (persisted) + the current pick. A
+        # selected path outside the list (e.g. a curated LoRA) stays
+        # selectable as a plain entry until a family rebuild re-labels it.
+        self._user_loras = list(settings.florence_loras)
+        self._rebuild_lora_combo(None)
+        selected_lora = settings.florence_lora
+        lora_index = self.florence_lora_combo.findData(selected_lora)
+        if selected_lora and lora_index < 0:
+            self.florence_lora_combo.addItem(Path(selected_lora).stem, selected_lora)
+            lora_index = self.florence_lora_combo.count() - 1
+        self.florence_lora_combo.setCurrentIndex(max(lora_index, 0))
         self.context_spin.setValue(settings.context_length)
         self.gpu_layers_spin.setValue(settings.gpu_layers)
         self.threads_spin.setValue(settings.threads)
@@ -550,6 +332,8 @@ class LocalTab(QWidget):
                 family_id=selection[0].family_id if selection else "",
                 quant_label=selection[1].label if selection else "",
                 florence_task=self.florence_task_combo.currentData(),
+                florence_lora=self.florence_lora_combo.currentData() or "",
+                florence_loras=self._florence_loras(),
                 prompt_preset=self._current_preset_choice(),
             )
         except NLaptError as exc:
@@ -561,6 +345,70 @@ class LocalTab(QWidget):
             self.extra_dirs_list.item(i).text()
             for i in range(self.extra_dirs_list.count())
         )
+
+    def _florence_loras(self) -> tuple[str, ...]:
+        """User-registered LoRA paths (curated entries live in the catalog)."""
+        return tuple(self._user_loras)
+
+    def _current_family(self) -> ModelFamily | None:
+        selection = self.current_selection()
+        return selection[0] if selection is not None else None
+
+    def _add_lora(self) -> None:
+        chosen, _selected_filter = QFileDialog.getOpenFileName(
+            self, CAPTION_PICK_LORA, "", FILTER_LORA
+        )
+        if not chosen:
+            return
+        if chosen not in self._user_loras:
+            self._user_loras.append(chosen)
+        self._rebuild_lora_combo(self._current_family())
+        index = self.florence_lora_combo.findData(chosen)
+        self.florence_lora_combo.setCurrentIndex(max(index, 0))
+
+    def _remove_lora(self) -> None:
+        """Drop the selected USER LoRA (curated entries are not removable)."""
+        combo = self.florence_lora_combo
+        index = combo.currentIndex()
+        if index <= 0 or combo.itemData(index, ROLE_LORA_ID):
+            return
+        path = combo.itemData(index)
+        if path in self._user_loras:
+            self._user_loras.remove(path)
+        combo.removeItem(index)
+
+    def _rebuild_lora_combo(self, family: ModelFamily | None) -> None:
+        rebuild_lora_combo(self, family)
+
+    def _rebuild_task_combo(self, family: ModelFamily) -> None:
+        rebuild_task_combo(self, family)
+
+    def _refresh_lora_buttons(self) -> None:
+        refresh_lora_buttons(self)
+
+    def _on_lora_changed(self, _index: int) -> None:
+        """Curated pick: surface the download button + jump to its 指令."""
+        self._refresh_lora_buttons()
+        combo = self.florence_lora_combo
+        lora_id = combo.itemData(combo.currentIndex(), ROLE_LORA_ID)
+        if not lora_id:
+            return
+        entry = find_lora(str(lora_id))
+        task_index = self.florence_task_combo.findData(entry.task)
+        if entry.task and task_index >= 0:
+            self.florence_task_combo.setCurrentIndex(task_index)
+
+    def _on_lora_download_clicked(self) -> None:
+        combo = self.florence_lora_combo
+        lora_id = combo.itemData(combo.currentIndex(), ROLE_LORA_ID)
+        if not lora_id:
+            return
+        if not self.bridge.start_lora_download(str(lora_id)):
+            self._toast(TOAST_DOWNLOAD_BUSY, TOAST_WARN)
+            return
+        self.progress.setVisible(True)
+        self.progress.setRange(0, 0)
+        self._refresh_lora_buttons()
 
     # -- selection ---------------------------------------------------------------------
     def current_selection(self) -> tuple[ModelFamily, QuantFile] | None:
@@ -576,15 +424,7 @@ class LocalTab(QWidget):
         return family, find_quant(family, str(quant_label))
 
     def _quant_items(self) -> tuple[QTreeWidgetItem, ...]:
-        items: list[QTreeWidgetItem] = []
-        for series_index in range(self.tree.topLevelItemCount()):
-            series_item = self.tree.topLevelItem(series_index)
-            for family_index in range(series_item.childCount()):
-                family_item = series_item.child(family_index)
-                items.extend(
-                    family_item.child(i) for i in range(family_item.childCount())
-                )
-        return tuple(items)
+        return quant_items(self)
 
     # -- grades ------------------------------------------------------------------------
     def _estimate_context(self) -> int:
@@ -656,6 +496,7 @@ class LocalTab(QWidget):
             self.server_button.setEnabled(self.bridge.server_running())
             self.apply_button.setEnabled(False)
             self._form.setRowVisible(self.florence_task_combo, False)
+            self._form.setRowVisible(self.florence_lora_holder, False)
             self._form.setRowVisible(self.preset_combo, False)
             return
         family, quant = selection
@@ -704,6 +545,10 @@ class LocalTab(QWidget):
         self.page_button.setEnabled(True)
         is_florence = family.engine == ENGINE_FLORENCE
         self._form.setRowVisible(self.florence_task_combo, is_florence)
+        self._form.setRowVisible(self.florence_lora_holder, is_florence)
+        if is_florence:
+            self._rebuild_task_combo(family)
+            self._rebuild_lora_combo(family)
         has_presets = bool(presets_for(family.family_id))
         self._form.setRowVisible(self.preset_combo, has_presets)
         if has_presets:
@@ -785,6 +630,14 @@ class LocalTab(QWidget):
     ) -> None:
         self.progress.setVisible(False)
         if status == DOWNLOAD_OK:
+            if family_id.startswith(LORA_FAMILY_PREFIX):
+                try:
+                    name = find_lora(family_id[len(LORA_FAMILY_PREFIX) :]).name
+                except NLaptError:
+                    name = family_id
+                self._toast(TOAST_LORA_OK.format(name=name), TOAST_OK)
+                self._refresh_selection_ui()
+                return
             try:
                 family = find_family(family_id)
                 name = family.name

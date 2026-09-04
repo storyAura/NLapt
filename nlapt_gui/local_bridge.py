@@ -34,21 +34,28 @@ from nlapt.core.errors import DownloadCancelledError, LocalInferenceError, NLapt
 from nlapt.diagnostics import get_logger
 from nlapt.llm.base import LLMMessage, LLMRequest, create_client
 from nlapt.llm.cleaning import clean_llm_output, ensure_not_refusal
+from nlapt.llm.retry import RetryPolicy, with_retry
 from nlapt.llm.vision import prepare_image
 from nlapt.local.advisor import auto_gpu_layers
 from nlapt.local.catalog import (
     ENGINE_FLORENCE,
+    LoraEntry,
     ModelFamily,
     QuantFile,
     download_url,
     find_family,
+    find_lora,
     find_quant,
+    lora_adapter_path,
+    lora_download_url,
+    lora_file_path,
     mmproj_path,
     quant_path,
 )
 from nlapt.local.download import download_file
 from nlapt.local.florence import FlorenceEngine
 from nlapt.local.gguf import read_block_count
+from nlapt.local.lora import MSG_LORA_FILE_MISSING
 from nlapt.local.hardware import HardwareInfo, detect_hardware
 from nlapt.local.presets import resolve_preset
 from nlapt.local.runtime import (
@@ -97,6 +104,9 @@ DOWNLOAD_OK = "ok"
 DOWNLOAD_CANCELLED = "cancelled"
 DOWNLOAD_ERROR = "error"
 
+# family_id sentinel prefix in download-hub signals for curated LoRAs.
+LORA_FAMILY_PREFIX = "lora:"
+
 _SHARED_MANAGER: LocalServerManager | None = None
 
 
@@ -107,6 +117,108 @@ def get_server_manager() -> LocalServerManager:
         _SHARED_MANAGER = LocalServerManager()
         atexit.register(_SHARED_MANAGER.stop)
     return _SHARED_MANAGER
+
+
+# -- idle auto-stop (推理完先不卸载,空闲 30 秒后再卸载) -----------------------------
+# Inference that started the server used to stop it the moment it finished;
+# repeated runs then reloaded multi-GB weights every time. The stop is now
+# armed on an idle timer: any new local request cancels it, and only a full
+# idle window actually unloads the model. Servers the USER started
+# (启动本地服务) are never auto-stopped.
+IDLE_STOP_DELAY_SECONDS = 30.0
+
+
+class IdleServerStopper:
+    """Delays the post-inference llama-server stop by an idle window.
+
+    ``note_request``/``note_finished`` bracket every local inference run
+    (single request or whole batch). The timer only arms once no run is in
+    flight AND the server was loaded by inference (not by the user), and any
+    new run cancels it — so back-to-back runs keep the model warm.
+    ``timer_factory`` is injectable so tests never wait.
+    """
+
+    def __init__(
+        self,
+        manager: LocalServerManager,
+        *,
+        delay: float = IDLE_STOP_DELAY_SECONDS,
+        timer_factory: Callable[[float, Callable[[], None]], threading.Timer] = threading.Timer,
+    ) -> None:
+        self._manager = manager
+        self._delay = delay
+        self._timer_factory = timer_factory
+        self._lock = threading.Lock()
+        self._timer: threading.Timer | None = None
+        self._active = 0
+        self._auto_started = False
+
+    def note_request(self) -> None:
+        """A local inference run is starting: cancel any pending stop.
+
+        When the server is not running yet, the coming run is the one that
+        loads the model — remember that so only inference-loaded servers get
+        idle-stopped.
+        """
+        with self._lock:
+            self._cancel_locked()
+            if self._active == 0 and not self._manager.is_running():
+                self._auto_started = True
+            self._active += 1
+
+    def note_finished(self) -> None:
+        """A run ended: arm the idle stop once nothing else is in flight."""
+        with self._lock:
+            self._active = max(0, self._active - 1)
+            if self._active > 0 or not self._auto_started:
+                return
+            self._cancel_locked()
+            timer = self._timer_factory(self._delay, self._fire)
+            timer.daemon = True  # never delay interpreter exit by the window
+            timer.start()
+            self._timer = timer
+
+    def note_user_control(self) -> None:
+        """The user started/stopped the server manually: no auto stop."""
+        with self._lock:
+            self._cancel_locked()
+            self._auto_started = False
+
+    def pending(self) -> bool:
+        """Whether an idle stop is currently armed (tests/diagnostics)."""
+        with self._lock:
+            return self._timer is not None
+
+    def _cancel_locked(self) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+
+    def _fire(self) -> None:
+        with self._lock:
+            self._timer = None
+            if self._active > 0:
+                return  # a run raced in; it re-arms on finish
+            self._auto_started = False
+        try:
+            if self._manager.is_running():
+                _LOGGER.info(
+                    "stopping llama-server after %.0fs idle", self._delay
+                )
+            self._manager.stop()
+        except Exception:  # timer thread: never let a stop failure propagate
+            _LOGGER.exception("idle llama-server stop failed")
+
+
+_IDLE_STOPPER: IdleServerStopper | None = None
+
+
+def get_idle_stopper() -> IdleServerStopper:
+    """Process-wide idle stopper bound to the shared server manager."""
+    global _IDLE_STOPPER
+    if _IDLE_STOPPER is None:
+        _IDLE_STOPPER = IdleServerStopper(get_server_manager())
+    return _IDLE_STOPPER
 
 
 # -- process-wide download state ----------------------------------------------------
@@ -248,6 +360,20 @@ def is_downloaded_in(
         return True
     mmproj = find_mmproj_file_in(settings, family)
     return mmproj is not None and complete(mmproj, family.mmproj_bytes)
+
+
+def is_lora_downloaded_in(settings: LocalSettings, entry: LoraEntry) -> bool:
+    """Whether every file of a curated LoRA exists at its expected size.
+
+    LoRAs live in the PRIMARY dir only (they are small; the reuse-dirs
+    machinery exists for multi-GB model files).
+    """
+    base = models_dir_for(settings)
+    for file in entry.files:
+        path = lora_file_path(base, entry, file)
+        if not path.is_file() or path.stat().st_size != file.size_bytes:
+            return False
+    return True
 
 
 # -- llama.cpp runtime resolution ---------------------------------------------------
@@ -425,18 +551,30 @@ def florence_files_for(
     return files
 
 
-def get_florence_engine(files: dict[str, Path]) -> FlorenceEngine:
+def get_florence_engine(
+    files: dict[str, Path], lora_path: Path | None = None
+) -> FlorenceEngine:
     """Process-wide Florence engine for ``files`` (replaced when they change).
 
     Keeping one engine alive between requests is the Florence version of
-    加载一次,推理全部 — sessions stay in memory until the file set changes
-    or the process exits.
+    加载一次,推理全部 — sessions stay in memory until the file set OR the
+    LoRA selection changes (a retrained LoRA file counts as a change:
+    the key includes its mtime + size) or the process exits.
     """
     global _FLORENCE_ENGINE, _FLORENCE_KEY
-    key = tuple(sorted((name, str(path)) for name, path in files.items()))
+    lora_token = ""
+    if lora_path is not None:
+        try:
+            stat = lora_path.stat()
+            lora_token = f"{lora_path}|{stat.st_mtime_ns}|{stat.st_size}"
+        except OSError:
+            lora_token = str(lora_path)
+    key = tuple(
+        sorted((name, str(path)) for name, path in files.items())
+    ) + (("__lora__", lora_token),)
     with _FLORENCE_LOCK:
         if _FLORENCE_ENGINE is None or _FLORENCE_KEY != key:
-            _FLORENCE_ENGINE = FlorenceEngine(files)
+            _FLORENCE_ENGINE = FlorenceEngine(files, lora_path=lora_path)
             _FLORENCE_KEY = key
         return _FLORENCE_ENGINE
 
@@ -465,10 +603,18 @@ def make_local_vision_captioner(
     settings = load_local_settings(local_settings_path())
 
     if family.engine == ENGINE_FLORENCE:
+        lora_text = settings.florence_lora.strip()
+        lora_path = Path(lora_text) if lora_text else None
+        if lora_path is not None and not lora_path.is_file():
+            raise LocalInferenceError(MSG_LORA_FILE_MISSING.format(path=lora_path))
         engine = get_florence_engine(
-            florence_files_for(settings, family, target.quant)
+            florence_files_for(settings, family, target.quant), lora_path
         )
         task = settings.florence_task
+        # Official Florence-2 knows none of the PromptGen 指令 — clamp a
+        # persisted task the selected family was never trained on.
+        if family.florence_tasks and task not in family.florence_tasks:
+            task = family.florence_tasks[0]
 
         def florence_caption(image_path: Path, system: str, user_prompt: str) -> str:
             return engine.caption(image_path, task)
@@ -501,7 +647,10 @@ def make_local_vision_captioner(
             max_tokens=profile.max_tokens,
             timeout=LOCAL_VISION_TIMEOUT_SECONDS,
         )
-        return ensure_not_refusal(clean_llm_output(client.complete(request).text))
+        # Transient failures (busy slots, empty completions under load)
+        # back off and retry like the cloud path does.
+        response = with_retry(lambda: client.complete(request), RetryPolicy())
+        return ensure_not_refusal(clean_llm_output(response.text))
 
     return caption
 
@@ -584,6 +733,14 @@ class LocalBridge(QObject):
     def is_downloaded(self, family: ModelFamily, quant: QuantFile) -> bool:
         """Whether a complete quant (and mmproj, for vision) exists in any dir."""
         return is_downloaded_in(self._settings, family, quant)
+
+    def lora_adapter_file(self, entry: LoraEntry) -> Path:
+        """Local safetensors path of a curated LoRA (primary dir)."""
+        return lora_adapter_path(self.models_dir(), entry)
+
+    def is_lora_downloaded(self, entry: LoraEntry) -> bool:
+        """Whether every file of a curated LoRA exists at its pinned size."""
+        return is_lora_downloaded_in(self._settings, entry)
 
     # -- hardware ----------------------------------------------------------------------
     @property
@@ -675,6 +832,40 @@ class LocalBridge(QObject):
             # Everything already available (possibly from a reuse dir).
             self.download_finished.emit(family_id, quant_label, DOWNLOAD_OK, "")
             return True
+        return self._launch_jobs(family_id, quant_label, jobs, runtime_asset)
+
+    def start_lora_download(self, lora_id: str) -> bool:
+        """Download a curated LoRA's files (resumable). False when busy.
+
+        Broadcast identity on the shared hub is ``lora:<lora_id>`` with an
+        empty quant label — the same one-at-a-time pipeline as models.
+        """
+        if self.is_downloading():
+            return False
+        entry = find_lora(lora_id)
+        base = self.models_dir()
+        jobs: list[tuple[str, Path, int, str]] = []
+        for file in entry.files:
+            dest = lora_file_path(base, entry, file)
+            if dest.is_file() and dest.stat().st_size == file.size_bytes:
+                continue
+            jobs.append(
+                (lora_download_url(entry, file), dest, file.size_bytes, file.sha256)
+            )
+        family_key = LORA_FAMILY_PREFIX + entry.lora_id
+        if not jobs:
+            self.download_finished.emit(family_key, "", DOWNLOAD_OK, "")
+            return True
+        return self._launch_jobs(family_key, "", jobs, None)
+
+    def _launch_jobs(
+        self,
+        family_id: str,
+        quant_label: str,
+        jobs: list[tuple[str, Path, int, str]],
+        runtime_asset: RuntimeAsset | None,
+    ) -> bool:
+        """Run download jobs on the pool under the process-wide single slot."""
         total_bytes = sum(expected for _url, _dest, expected, _sha in jobs)
         if runtime_asset is not None:
             total_bytes += runtime_asset.size_bytes
@@ -799,6 +990,8 @@ class LocalBridge(QObject):
         family = find_family(family_id)
         quant = find_quant(family, quant_label)
         spec = self.build_server_spec(family, quant)
+        # Explicit user start: this server must never be idle-stopped.
+        get_idle_stopper().note_user_control()
         self.server_changed.emit(SERVER_STARTING, "")
 
         def work() -> str:
@@ -817,6 +1010,7 @@ class LocalBridge(QObject):
 
     def stop_server(self) -> None:
         """Async llama-server stop; emits ``server_changed('stopped', '')``."""
+        get_idle_stopper().note_user_control()
 
         def done(_result: Any) -> None:
             if _alive(self):

@@ -110,7 +110,7 @@ class TestIssue4HelpMenu:
         assert captured
         title, body = captured[0]
         assert title == ACTION_GUIDE
-        for token in ("左栏", "中栏", "右栏", "胶囊", "分句", "文本", "快照"):
+        for token in ("图标轨", "文件栏", "预览", "胶囊", "分句", "文本", "快照"):
             assert token in body
 
     def test_about_handler_is_richer(self, qtbot, title_bar, monkeypatch) -> None:

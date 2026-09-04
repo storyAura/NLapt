@@ -14,7 +14,7 @@ to the main window through signals.
 
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QPoint, QPointF, Qt, Signal
 from PySide6.QtGui import (
     QAction,
     QActionGroup,
@@ -26,13 +26,11 @@ from PySide6.QtGui import (
     QPen,
 )
 from PySide6.QtWidgets import (
-    QApplication,
     QFrame,
     QHBoxLayout,
     QLabel,
     QMenu,
     QPushButton,
-    QVBoxLayout,
     QWidget,
 )
 
@@ -42,26 +40,30 @@ from nlapt_gui import __version__
 from nlapt_gui.controller import AppController
 from nlapt_gui.theme.logo import LogoWidget
 from nlapt_gui.theme.manager import ThemeManager
-from nlapt_gui.theme.tokens import (
-    MONO_STACK,
-    THEMES,
-    ThemeTokens,
-    WINDOWS_CLOSE_HOVER,
-    WINDOWS_CLOSE_HOVER_FG,
-)
+from nlapt_gui.theme.tokens import MONO_STACK, THEMES, ThemeTokens
 from nlapt_gui.widgets.dialogs import show_message
+from nlapt_gui.widgets.window_chrome import (
+    KIND_CLOSE,
+    KIND_MAX,
+    KIND_MIN,
+    THEME_POPUP_W,
+    ThemePopup,
+    WindowButton,
+    WindowDragHelper,
+    toggle_window_max_restore,
+    wire_window_buttons,
+)
+
+# Test / import compatibility: the painted control used to live here.
+_WindowButton = WindowButton
 
 _LOGGER = get_logger(__name__)
 
 # -- geometry from the design -----------------------------------------------------
 TITLE_BAR_HEIGHT = 40
 LOGO_PX = 22
-WIN_BUTTON_W = 44
 THEME_BUTTON_H = 28
 DIVIDER_H = 18
-THEME_POPUP_W = 230
-SWATCH_PX = 13
-GLYPH_PX = 10
 
 # -- exact UI strings ---------------------------------------------------------------
 APP_NAME = "NLapt"
@@ -93,12 +95,12 @@ ACTION_ABOUT = "关于"
 ABOUT_TITLE = "关于 NLapt"
 GUIDE_TITLE = "使用说明"
 GUIDE_TEXT = (
-    "NLapt 采用三栏工作流:\n\n"
-    "左栏 — 文件列表与多选:浏览数据集,支持 Shift 范围选、"
-    "Alt 取消选,对多张图片批量操作。\n\n"
-    "中栏 — 预览 + 编辑:图片预览与三种编辑模式"
-    "(胶囊 / 分句 / 文本),悬浮工具栏可分段 / 插入 / 翻译 / 重译。\n\n"
-    "右栏 — 修改工具:查找替换、前缀 / 后缀、翻译对照、历史记录。\n\n"
+    "NLapt 采用轨 + 文件 + 预览编辑的工作流:\n\n"
+    "左侧图标轨 — 打开文件夹、保存、导出、撤销 / 重做、主题与设置。"
+    "「修改工具」从轨上抽出查找替换、前缀 / 后缀、翻译对照、历史记录。\n\n"
+    "文件栏 — 浏览数据集,支持 Shift 范围选、Alt 取消选,右键批量推标。\n\n"
+    "预览 + 编辑 — 图片预览与三种编辑模式(胶囊 / 分句 / 文本),"
+    "悬浮工具栏可分段 / 插入 / 翻译 / 重译。\n\n"
     "保存与快照:标注仅在显式「保存 / 全部保存」时写入 .txt 文件;"
     "批量操作会自动创建快照,未保存的草稿在崩溃后可恢复。"
 )
@@ -106,11 +108,9 @@ ABOUT_TEXT = (
     f"{APP_NAME}\n"
     f"{VERSION_LABEL}\n\n"
     "面向自然语言标注(caption)处理的桌面编辑工具。\n"
-    "在三栏界面中高效编辑、批量修改并翻译图像标注,\n"
+    "在轨 + 两栏界面中高效编辑、批量修改并翻译图像标注,\n"
     "兼容 kohya 等「图片 + 同名 .txt」数据集格式。"
 )
-POPUP_TITLE = "界面主题"
-POPUP_CUSTOM_COLORS = "自定义色彩…"
 VIEW_MODE_LABELS: tuple[tuple[str, str], ...] = (
     ("list", "列表视图"),
     ("mid", "网格视图"),
@@ -119,11 +119,6 @@ VIEW_MODE_LABELS: tuple[tuple[str, str], ...] = (
 
 # Title bar left inset aligned with the panel headers below (16px grid).
 BAR_LEFT_INSET = 16
-
-# Window-control glyph kinds.
-KIND_MIN = "min"
-KIND_MAX = "max"
-KIND_CLOSE = "close"
 
 _MONO_FAMILY = ", ".join(f'"{name}"' for name in MONO_STACK)
 
@@ -164,222 +159,6 @@ class _PaletteIcon(QWidget):
         painter.end()
 
 
-class _WindowButton(QWidget):
-    """44px min/max/close button with a painted 10x10 glyph.
-
-    Painted (not QSS-styled) so the close button can swap to the
-    Windows-native hover red with a light glyph, per the design.
-    """
-
-    clicked = Signal()
-
-    def __init__(
-        self, kind: str, tokens: ThemeTokens, parent: QWidget | None = None
-    ) -> None:
-        super().__init__(parent)
-        self.kind = kind
-        self._tokens = tokens
-        self._hover = False
-        self.setFixedWidth(WIN_BUTTON_W)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
-
-    def set_tokens(self, tokens: ThemeTokens) -> None:
-        self._tokens = tokens
-        self.update()
-
-    def event(self, ev: QEvent) -> bool:  # noqa: N802 - Qt override
-        if ev.type() == QEvent.Type.HoverEnter:
-            self._hover = True
-            self.update()
-        elif ev.type() == QEvent.Type.HoverLeave:
-            self._hover = False
-            self.update()
-        return super().event(ev)
-
-    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt override
-        # Accept the press so it does not bubble to TitleBar.mousePressEvent,
-        # which would otherwise start a system move and swallow the click's
-        # release (leaving the window control unclickable on Windows).
-        if event.button() == Qt.MouseButton.LeftButton:
-            event.accept()
-            return
-        super().mousePressEvent(event)
-
-    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt override
-        if event.button() == Qt.MouseButton.LeftButton and self.rect().contains(
-            event.position().toPoint()
-        ):
-            self.clicked.emit()
-            event.accept()
-            return
-        super().mouseReleaseEvent(event)
-
-    def paintEvent(self, event: QPaintEvent) -> None:  # noqa: N802 - Qt override
-        painter = QPainter(self)
-        tokens = self._tokens
-        if self._hover:
-            bg = WINDOWS_CLOSE_HOVER if self.kind == KIND_CLOSE else tokens.surface2
-            painter.fillRect(self.rect(), QColor(bg))
-            glyph = WINDOWS_CLOSE_HOVER_FG if self.kind == KIND_CLOSE else tokens.text
-        else:
-            glyph = tokens.text2
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(QPen(QColor(glyph), 1))
-        left = (self.width() - GLYPH_PX) / 2.0
-        top = (self.height() - GLYPH_PX) / 2.0
-        if self.kind == KIND_MIN:
-            mid = top + GLYPH_PX / 2.0
-            painter.drawLine(QPointF(left, mid), QPointF(left + GLYPH_PX, mid))
-        elif self.kind == KIND_MAX:
-            painter.drawRect(QRectF(left + 0.5, top + 0.5, GLYPH_PX - 1, GLYPH_PX - 1))
-        else:
-            painter.drawLine(QPointF(left, top), QPointF(left + GLYPH_PX, top + GLYPH_PX))
-            painter.drawLine(QPointF(left + GLYPH_PX, top), QPointF(left, top + GLYPH_PX))
-        painter.end()
-
-
-class _CheckMark(QWidget):
-    """13px accent check for the active theme row."""
-
-    def __init__(self, tokens: ThemeTokens, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self._tokens = tokens
-        self.setFixedSize(SWATCH_PX, SWATCH_PX)
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-
-    def paintEvent(self, event: QPaintEvent) -> None:  # noqa: N802 - Qt override
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        pen = QPen(QColor(self._tokens.accent), 2)
-        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-        painter.setPen(pen)
-        scale = self.width() / 14.0
-        path = QPainterPath(QPointF(2.5 * scale, 7.5 * scale))
-        path.lineTo(QPointF(5.5 * scale, 10.5 * scale))
-        path.lineTo(QPointF(11.5 * scale, 3.5 * scale))
-        painter.drawPath(path)
-        painter.end()
-
-
-class _ThemeRow(QFrame):
-    """One clickable theme row: three swatch dots + name + optional check."""
-
-    picked = Signal(str)
-
-    def __init__(
-        self,
-        theme_name: str,
-        active: bool,
-        tokens: ThemeTokens,
-        parent: QWidget | None = None,
-    ) -> None:
-        super().__init__(parent)
-        self.theme_name = theme_name
-        self.setProperty("themeRow", True)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        base = THEMES[theme_name]
-        row = QHBoxLayout(self)
-        row.setContentsMargins(10, 7, 10, 7)
-        row.setSpacing(9)
-        swatches = QHBoxLayout()
-        swatches.setSpacing(3)
-        for color, bordered in ((base.bg, True), (base.surface, True), (base.accent, False)):
-            dot = QLabel(self)
-            dot.setFixedSize(SWATCH_PX, SWATCH_PX)
-            border = f" border: 1px solid {tokens.bd2};" if bordered else ""
-            dot.setStyleSheet(
-                f"background: {color}; border-radius: {SWATCH_PX // 2}px;{border}"
-            )
-            swatches.addWidget(dot)
-        row.addLayout(swatches)
-        name = QLabel(theme_name, self)
-        name.setStyleSheet(f"font-size: 12.5px; color: {tokens.text}; background: transparent;")
-        row.addWidget(name, 1)
-        if active:
-            row.addWidget(_CheckMark(tokens, self))
-
-    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt override
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.picked.emit(self.theme_name)
-            event.accept()
-            return
-        super().mouseReleaseEvent(event)
-
-
-class ThemePopup(QFrame):
-    """230px theme picker card (design 主题弹层), shown as a Qt popup."""
-
-    theme_picked = Signal(str)
-    colors_requested = Signal()
-
-    def __init__(self, active_theme: str, tokens: ThemeTokens, parent: QWidget | None = None) -> None:
-        super().__init__(
-            parent, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint
-        )
-        self.setFixedWidth(THEME_POPUP_W)
-        self.setStyleSheet(
-            f"""
-            ThemePopup {{
-                background: {tokens.surface};
-                border: 1px solid {tokens.bd};
-                border-radius: 10px;
-            }}
-            QFrame[themeRow="true"] {{ border-radius: 7px; background: transparent; }}
-            QFrame[themeRow="true"]:hover {{ background: {tokens.surface2}; }}
-            QPushButton[popupAction="true"] {{
-                background: transparent;
-                color: {tokens.text2};
-                border: none;
-                border-radius: 7px;
-                padding: 7px 10px;
-                font-size: 12px;
-                text-align: left;
-            }}
-            QPushButton[popupAction="true"]:hover {{
-                background: {tokens.surface2};
-                color: {tokens.text};
-            }}
-            """
-        )
-        column = QVBoxLayout(self)
-        column.setContentsMargins(6, 6, 6, 6)
-        column.setSpacing(0)
-        title = QLabel(POPUP_TITLE, self)
-        title.setStyleSheet(
-            f"font-size: 11px; font-weight: 600; color: {tokens.text3};"
-            " padding: 6px 10px 8px; letter-spacing: 0.4px; background: transparent;"
-        )
-        column.addWidget(title)
-        self._rows: list[_ThemeRow] = []
-        for name in THEMES:
-            row = _ThemeRow(name, name == active_theme, tokens, self)
-            row.picked.connect(self._on_pick)
-            column.addWidget(row)
-            self._rows.append(row)
-        divider = QFrame(self)
-        divider.setFixedHeight(1)
-        divider.setStyleSheet(f"background: {tokens.bd}; margin: 5px 6px;")
-        column.addWidget(divider)
-        self.colors_button = QPushButton(POPUP_CUSTOM_COLORS, self)
-        self.colors_button.setProperty("popupAction", True)
-        self.colors_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.colors_button.clicked.connect(self._on_colors)
-        column.addWidget(self.colors_button)
-
-    def rows(self) -> tuple[_ThemeRow, ...]:
-        return tuple(self._rows)
-
-    def _on_pick(self, name: str) -> None:
-        self.theme_picked.emit(name)
-        self.close()
-
-    def _on_colors(self) -> None:
-        self.colors_requested.emit()
-        self.close()
-
-
 class TitleBar(QFrame):
     """The frameless window's 40px title strip."""
 
@@ -397,7 +176,7 @@ class TitleBar(QFrame):
         self._controller = controller
         self._manager = theme_manager
         self._popup: ThemePopup | None = None
-        self._press_pos: QPoint | None = None
+        self._drag = WindowDragHelper(self)
         self.setFixedHeight(TITLE_BAR_HEIGHT)
         self._build()
         self._build_menus()
@@ -460,12 +239,10 @@ class TitleBar(QFrame):
         row.addWidget(self.divider)
         row.addSpacing(8)
         tokens = self._manager.tokens
-        self.min_button = _WindowButton(KIND_MIN, tokens, self)
-        self.max_button = _WindowButton(KIND_MAX, tokens, self)
-        self.close_button = _WindowButton(KIND_CLOSE, tokens, self)
-        self.min_button.clicked.connect(self._minimize)
-        self.max_button.clicked.connect(self.toggle_max_restore)
-        self.close_button.clicked.connect(lambda: self.window().close())
+        self.min_button = WindowButton(KIND_MIN, tokens, self)
+        self.max_button = WindowButton(KIND_MAX, tokens, self)
+        self.close_button = WindowButton(KIND_CLOSE, tokens, self)
+        wire_window_buttons(self.min_button, self.max_button, self.close_button, self)
         for button in (self.min_button, self.max_button, self.close_button):
             row.addWidget(button)
 
@@ -656,25 +433,9 @@ class TitleBar(QFrame):
         self._manager.apply(name)
 
     # -- window controls / drag ---------------------------------------------------------
-    def _minimize(self) -> None:
-        self.window().showMinimized()
-
     def toggle_max_restore(self) -> None:
         """Delegate to the main window's animated toggle (fullscreen-safe)."""
-        window = self.window()
-        toggle = getattr(window, "toggle_max_restore", None)
-        if window is not self and callable(toggle):
-            toggle()
-            return
-        # Fallback (bar hosted standalone, e.g. in tests): raw state check
-        # that also recovers from a stuck FULLSCREEN state.
-        zoomed = window.windowState() & (
-            Qt.WindowState.WindowMaximized | Qt.WindowState.WindowFullScreen
-        )
-        if zoomed:
-            window.showNormal()
-        else:
-            window.showMaximized()
+        toggle_window_max_restore(self)
 
     def show_guide(self) -> None:
         """Explain the three-column workflow and the save/snapshot model."""
@@ -688,44 +449,20 @@ class TitleBar(QFrame):
         return self.childAt(event.position().toPoint()) is None
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt override
-        # Record the press; the system move starts only after a real drag.
-        # Starting it on the bare press entered the OS modal move loop and
-        # swallowed the double-click's second press, making 双击还原 flaky.
-        if event.button() == Qt.MouseButton.LeftButton and self._on_empty_bar(event):
-            self._press_pos = event.globalPosition().toPoint()
-            event.accept()
+        if self._drag.press(event, self._on_empty_bar(event)):
             return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt override
-        if (
-            self._press_pos is not None
-            and event.buttons() & Qt.MouseButton.LeftButton
-            and (event.globalPosition().toPoint() - self._press_pos).manhattanLength()
-            >= QApplication.startDragDistance()
-        ):
-            self._press_pos = None
-            window = self.window()
-            if window.windowState() & (
-                Qt.WindowState.WindowMaximized | Qt.WindowState.WindowFullScreen
-            ):
-                # Dragging a zoomed window un-zooms it first (Windows behavior).
-                window.showNormal()
-            handle = window.windowHandle()
-            if handle is not None:
-                handle.startSystemMove()
-            event.accept()
+        if self._drag.move(event):
             return
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt override
-        self._press_pos = None
+        self._drag.release()
         super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt override
-        if event.button() == Qt.MouseButton.LeftButton and self._on_empty_bar(event):
-            self._press_pos = None
-            self.toggle_max_restore()
-            event.accept()
+        if self._drag.double_click(event, self._on_empty_bar(event)):
             return
         super().mouseDoubleClickEvent(event)

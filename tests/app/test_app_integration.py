@@ -27,6 +27,8 @@ from nlapt.llm.rewrite import RewriteService, RewriteSpec, RewriteType
 from nlapt.ops.find_replace import FindReplaceOperation, FindReplaceSpec
 from nlapt.workflow.diff import DiffOp
 
+from nlapt.storage.paths import STATE_BACKUPS_DIR_NAME, dataset_state_dir
+
 from tests.app.conftest import CAPTION_A, CAPTION_B
 
 UTF8 = "utf-8"
@@ -86,7 +88,8 @@ class TestP0Loop:
         assert report.status is BatchStatus.COMPLETED
         assert report.failed == 0
         assert report.snapshot is not None  # automatic pre-execution snapshot
-        assert (dataset_root / ".backups").is_dir()
+        assert (dataset_state_dir(dataset_root) / STATE_BACKUPS_DIR_NAME).is_dir()
+        assert not (dataset_root / ".backups").exists()
         assert any(evt.name == EVT_SNAPSHOT_CREATED for evt in events)
         assert any(evt.name == EVT_BATCH_FINISHED for evt in events)
 

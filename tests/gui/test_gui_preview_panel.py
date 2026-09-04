@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 from PySide6.QtCore import QEvent, QPointF, Qt
-from PySide6.QtGui import QGuiApplication, QMouseEvent
+from PySide6.QtGui import QMouseEvent
 
 from nlapt.app import NLaptApp
 
@@ -47,19 +47,18 @@ def _mouse_event(kind: QEvent.Type, global_y: float, button, buttons) -> QMouseE
 class TestHeader:
     def test_name_meta_and_pos(self, panel: PreviewPanel, controller) -> None:
         assert panel.name_label.text() == "0001.png"
-        assert panel.meta_pill.text() == controller.image_meta(K1)
-        assert "PNG" in panel.meta_pill.text()
+        assert panel.meta_pill.text() == "PNG"
+        assert "×" in panel.dim_label.text()
+        assert panel.size_label.text()
+        assert panel.mtime_label.text().startswith("修改于 ")
         assert panel.pos_label.text() == "1 / 4"
 
     def test_tooltips_and_texts(self, panel: PreviewPanel) -> None:
-        assert panel.undo_button.toolTip() == "撤销 (Ctrl+Z)"
         assert panel.prev_button.toolTip() == "上一张 (Alt+↑)"
         assert panel.next_button.toolTip() == "下一张 (Alt+↓)"
-        assert panel.copy_button.text() == "复制"
-        assert panel.save_button.text() == "保存"
-        assert panel.save_all_button.text() == "全部保存"
-        assert panel.save_button.property("variant") == "accent"
-        assert panel.save_all_button.property("variant") == "outline"
+        assert panel.min_button is not None
+        assert panel.max_button is not None
+        assert panel.close_button is not None
 
     def test_dirty_pill_follows_dirty_state(self, qtbot, panel, controller) -> None:
         assert not panel.dirty_pill.isVisible()
@@ -67,7 +66,7 @@ class TestHeader:
         assert panel.dirty_pill.isVisible()
         assert panel.dirty_pill.text() == "未保存"
         with qtbot.waitSignal(controller.files_saved, timeout=2000):
-            qtbot.mouseClick(panel.save_button, Qt.MouseButton.LeftButton)
+            controller.save_current()
         assert not panel.dirty_pill.isVisible()
 
     def test_nav_buttons_and_pos_label(self, qtbot, panel, controller) -> None:
@@ -78,26 +77,6 @@ class TestHeader:
         qtbot.mouseClick(panel.prev_button, Qt.MouseButton.LeftButton)
         assert controller.current_key == K1
         assert panel.pos_label.text() == "1 / 4"
-
-    def test_copy_button_copies_caption(self, qtbot, panel, controller, toasts) -> None:
-        qtbot.mouseClick(panel.copy_button, Qt.MouseButton.LeftButton)
-        assert QGuiApplication.clipboard().text() == controller.record(K1).text
-        assert ("已复制标注文本", "ok") in toasts
-
-    def test_undo_button(self, qtbot, panel, controller, toasts) -> None:
-        original = controller.record(K1).text
-        controller.set_caption(K1, "changed", "test")
-        qtbot.mouseClick(panel.undo_button, Qt.MouseButton.LeftButton)
-        assert controller.record(K1).text == original
-        assert ("已撤销", "info") in toasts
-
-    def test_save_all_button(self, qtbot, panel, controller) -> None:
-        controller.set_caption(K1, "one", "test")
-        controller.set_caption(K2, "two", "test")
-        with qtbot.waitSignal(controller.files_saved, timeout=2000) as blocker:
-            qtbot.mouseClick(panel.save_all_button, Qt.MouseButton.LeftButton)
-        assert set(blocker.args[0]) == {K1, K2}
-
 
 class TestZoom:
     def test_default_is_fit(self, panel: PreviewPanel) -> None:
@@ -284,3 +263,16 @@ class TestTheme:
         panel.apply_tokens(THEMES["墨黑"])
         assert panel.current_tokens().name == "墨黑"
         assert not panel.grab().isNull()
+
+
+class TestKeepPreviousImage:
+    def test_uncached_switch_keeps_old_pixmap(self, qtbot, panel, controller) -> None:
+        qtbot.waitUntil(lambda: panel.pixmap_for(K1) is not None, timeout=2000)
+        first = panel.single_view._pixmap
+        assert first is not None
+        panel._pix_cache.pop(K2, None)
+        panel._loading.discard(K2)
+        controller.set_current(K2)
+        assert panel.single_view._pixmap is first
+        qtbot.waitUntil(lambda: panel.pixmap_for(K2) is not None, timeout=2000)
+        assert panel.single_view._pixmap is panel._pix_cache[K2]

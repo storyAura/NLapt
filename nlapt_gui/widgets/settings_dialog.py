@@ -18,6 +18,7 @@ test through the core config/client APIs directly.
 
 from __future__ import annotations
 
+import time
 from dataclasses import replace as _dc_replace
 from typing import Callable, Sequence
 
@@ -73,6 +74,8 @@ DEFAULT_API_TYPES: tuple[str, ...] = ("openai", "anthropic", "ollama")
 DIALOG_WIDTH = 480
 DIALOG_MIN_HEIGHT = 460
 SECTION_GAP = 10
+FORM_LABEL_MIN_W = 88
+FORM_V_GAP = 8
 DIVIDER_H = 1
 CONCURRENCY_RANGE = (1, 32)
 
@@ -96,7 +99,7 @@ BUTTON_FETCH_MODELS = "获取模型"
 BUTTON_TEST = "测试连接"
 BUTTON_SAVE = "保存"
 BUTTON_CANCEL = "取消"
-TOAST_TEST_OK = "连接成功"
+TOAST_TEST_OK = "连接成功({seconds:.1f} 秒)"
 TOAST_TEST_FAIL = "连接失败: {message}"
 TOAST_SAVED = "设置已保存"
 TOAST_NEED_BASE_URL = "请填写 Base URL"
@@ -191,6 +194,17 @@ class SettingsDialog(CenteredDialog):
         self._on_unified_toggled()
 
     # -- tab construction --------------------------------------------------------------
+    @staticmethod
+    def _tune_form(form: QFormLayout) -> None:
+        form.setHorizontalSpacing(SECTION_GAP)
+        form.setVerticalSpacing(FORM_V_GAP)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        for row in range(form.rowCount()):
+            item = form.itemAt(row, QFormLayout.ItemRole.LabelRole)
+            widget = item.widget() if item is not None else None
+            if isinstance(widget, QLabel):
+                widget.setMinimumWidth(FORM_LABEL_MIN_W)
+
     def _build_translate_tab(self) -> QWidget:
         tab = QWidget(self)
         self.provider = QComboBox(tab)
@@ -222,6 +236,7 @@ class SettingsDialog(CenteredDialog):
         tr_form.addRow(self._baidu_appid_label, self.baidu_appid)
         tr_form.addRow(self._baidu_key_label, self.baidu_key)
         tr_form.addRow(self._deepl_key_label, self.deepl_key)
+        self._tune_form(tr_form)
 
         note = QLabel(TR_NOTE, tab)
         note.setProperty("muted", True)
@@ -262,6 +277,7 @@ class SettingsDialog(CenteredDialog):
         self._vision_model_label = QLabel(LABEL_VISION_MODEL, tab)
         form.addRow(self._text_model_label, self.text_model)
         form.addRow(self._vision_model_label, self.vision_model)
+        self._tune_form(form)
 
         self.model_hint = QLabel(HINT_SEPARATE, tab)
         self.model_hint.setProperty("muted", True)
@@ -282,6 +298,7 @@ class SettingsDialog(CenteredDialog):
         )
         request_form = QFormLayout()
         request_form.addRow(LABEL_CONCURRENCY, self.concurrency_spin)
+        self._tune_form(request_form)
 
         self.fetch_models_button = QPushButton(BUTTON_FETCH_MODELS, tab)
         self.fetch_models_button.setProperty("variant", "outline")
@@ -344,12 +361,15 @@ class SettingsDialog(CenteredDialog):
             return
         self.test_button.setEnabled(False)
 
-        def probe() -> bool:
-            return create_client(profile).test_connection(profile.text_model)
+        def probe() -> float:
+            started = time.monotonic()
+            create_client(profile).test_connection(profile.text_model)
+            return time.monotonic() - started
 
-        def done(_ok: object) -> None:
+        def done(elapsed: object) -> None:
             self.test_button.setEnabled(True)
-            self._toast(TOAST_TEST_OK, TOAST_OK)
+            seconds = elapsed if isinstance(elapsed, float) else 0.0
+            self._toast(TOAST_TEST_OK.format(seconds=seconds), TOAST_OK)
 
         def failed(message: str) -> None:
             self.test_button.setEnabled(True)

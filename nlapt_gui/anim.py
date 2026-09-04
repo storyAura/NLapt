@@ -18,6 +18,8 @@ wait is ever required.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
+
 from PySide6.QtCore import (
     QAbstractAnimation,
     QEasingCurve,
@@ -26,10 +28,12 @@ from PySide6.QtCore import (
     QRect,
 )
 from PySide6.QtWidgets import QGraphicsOpacityEffect, QWidget
+from shiboken6 import isValid
 
 # Default durations (milliseconds) tuned to feel like the prototype's springs.
 FADE_MS = 180
 POP_MS = 260
+SLIDE_MS = 200
 
 # Module-level master switch. Tests flip this to ``False`` so helpers no-op
 # instantly and assert end-state without sleeping.
@@ -132,3 +136,113 @@ def pop_in(widget: QWidget, ms: int = POP_MS) -> QAbstractAnimation | None:
     group.addAnimation(scale)
     group.start(QAbstractAnimation.DeletionPolicy.DeleteWhenStopped)
     return group
+
+
+def slide_geometry(
+    widget: QWidget,
+    start: QRect,
+    end: QRect,
+    ms: int = SLIDE_MS,
+) -> QPropertyAnimation | None:
+    """Slide ``widget`` from ``start`` to ``end`` geometry.
+
+    Skip-safe: when animations are disabled the widget is moved to ``end``
+    synchronously and this returns ``None``. Callers that keep a reference
+    may jump a running animation to the end via ``setCurrentTime(duration)``.
+    """
+    if widget is None:
+        return None
+    if not ANIMATIONS_ENABLED:
+        widget.setGeometry(end)
+        return None
+    widget.setGeometry(start)
+    animation = QPropertyAnimation(widget, b"geometry", widget)
+    animation.setDuration(max(0, ms))
+    animation.setStartValue(QRect(start))
+    animation.setEndValue(QRect(end))
+    animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+    animation.start(QAbstractAnimation.DeletionPolicy.DeleteWhenStopped)
+    return animation
+
+
+def snapshot_named_rects(
+    items: Sequence[tuple[str, QWidget]],
+) -> dict[str, QRect]:
+    """Record each named widget's current geometry (copied ``QRect``s)."""
+    result: dict[str, QRect] = {}
+    for key, widget in items:
+        if widget is not None:
+            result[key] = QRect(widget.geometry())
+    return result
+
+
+def animate_reflow(
+    moves: Sequence[tuple[QWidget, QRect, QRect]],
+    ms: int = SLIDE_MS,
+) -> QParallelAnimationGroup | None:
+    """Slide many widgets from start to end rects in parallel.
+
+    Skip-safe: when animations are disabled every widget is moved to its
+    end rect synchronously and this returns ``None``.
+    """
+    if not moves:
+        return None
+    if not ANIMATIONS_ENABLED:
+        for widget, _start, end in moves:
+            if widget is not None:
+                widget.setGeometry(end)
+        return None
+    group = QParallelAnimationGroup()
+    for widget, start, end in moves:
+        if widget is None or start == end:
+            continue
+        widget.setGeometry(start)
+        slide = QPropertyAnimation(widget, b"geometry", widget)
+        slide.setDuration(max(0, ms))
+        slide.setStartValue(QRect(start))
+        slide.setEndValue(QRect(end))
+        slide.setEasingCurve(QEasingCurve.Type.OutCubic)
+        group.addAnimation(slide)
+    if group.animationCount() == 0:
+        return None
+    group.start(QAbstractAnimation.DeletionPolicy.DeleteWhenStopped)
+    return group
+
+
+def flip_reflow(
+    items: Sequence[tuple[str, QWidget]],
+    previous: Mapping[str, QRect],
+    *,
+    pop: QWidget | None = None,
+    ms: int = SLIDE_MS,
+) -> QAbstractAnimation | None:
+    """FLIP unmatched-by-identity widgets from ``previous`` rects to now.
+
+    ``pop`` is excluded from the slide and given :func:`pop_in` instead.
+    """
+    moves: list[tuple[QWidget, QRect, QRect]] = []
+    for key, widget in items:
+        start = previous.get(key)
+        if widget is None or start is None or widget is pop:
+            continue
+        end = widget.geometry()
+        if start != end and not start.isEmpty() and not end.isEmpty():
+            moves.append((widget, start, end))
+    group = animate_reflow(moves, ms)
+    if pop is not None:
+        pop_in(pop)
+    return group
+
+
+def finish_animation(animation: QAbstractAnimation | None) -> None:
+    """Jump a running animation to its end state (no-op when ``None``)."""
+    if animation is None or not isValid(animation):
+        return
+    animation.setCurrentTime(animation.duration())
+
+
+def stop_animation(animation: QAbstractAnimation | None) -> None:
+    """Stop a held animation; no-op when missing or already deleted."""
+    if animation is None or not isValid(animation):
+        return
+    animation.stop()

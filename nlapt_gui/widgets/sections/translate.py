@@ -1,10 +1,17 @@
-"""翻译对照 section - per-segment LLM translation rows + swap buttons.
+"""翻译对照 section - per-segment / whole-text LLM translation + swap.
 
 Driven by :class:`TranslateBridge` (real LLM through the controller's active
-profile). Each row shows the source segment over its translation; the swap
-button replaces the segment with the translation. 中文全部转为英文 translates
-every CJK segment of the current file and applies the successes. When no LLM
-profile is configured the section shows a guided state with a 打开设置 link.
+profile). Two compare modes (对照方式 segmented bar):
+
+- 分段 (default): one row per comma segment, the swap button replaces that
+  segment. Long natural-language captions read badly here — commas cut
+  sentences apart and each shard is translated without context.
+- 整段: the WHOLE caption is one row translated as a single unit (matching
+  the editor's 文本 view); the swap button replaces the entire caption.
+
+中文全部转为英文 follows the same mode: per CJK segment in 分段, one
+whole-text translation per file in 整段. When no LLM profile is configured
+the section shows a guided state with a 打开设置 link.
 """
 
 from __future__ import annotations
@@ -26,7 +33,12 @@ from nlapt.diagnostics import get_logger
 
 from nlapt_gui.controller import AppController, TOAST_ERR, TOAST_INFO, TOAST_OK, TOAST_WARN
 from nlapt_gui.translate_bridge import NOTE_UNCONFIGURED, TranslateBridge, has_cjk
-from nlapt_gui.widgets.tools_panel import ScopeSelector, repolish, resolve_tokens
+from nlapt_gui.widgets.tools_panel import (
+    ScopeSelector,
+    SegmentedBar,
+    repolish,
+    resolve_tokens,
+)
 
 _LOGGER = get_logger(__name__)
 
@@ -34,6 +46,16 @@ _LOGGER = get_logger(__name__)
 BUTTON_ALL_EN = "中文全部转为英文"
 BUTTON_ALL_EN_BUSY = "翻译中 {i}/{n}"
 LABEL_SCOPE_CAPTION = "应用范围"
+# 对照方式: per-segment rows vs the whole caption as one unit.
+MODE_SEGMENTS = "segments"
+MODE_WHOLE = "whole"
+LABEL_MODE_CAPTION = "对照方式"
+LABEL_MODE_SEGMENTS = "分段"
+LABEL_MODE_WHOLE = "整段"
+TIP_MODE_BAR = (
+    "分段:按逗号分段逐条对照翻译;整段:整篇标注作为一个整体翻译,"
+    "长句描述更通顺,替换时替换整篇"
+)
 LINK_OPEN_SETTINGS = "打开设置"
 HINT_UNCONFIGURED = "未配置翻译 API"
 TOOLTIP_SWAP = "用译文替换原文"
@@ -88,6 +110,7 @@ class TranslateSection(QWidget):
         self.bridge = bridge if bridge is not None else TranslateBridge(controller, parent=self)
         self._rows: list[_Row] = []
         self._results: dict[str, str] = {}  # source text -> translated text
+        self._whole = False  # 对照方式: False=分段 rows, True=整段 caption
         self._batch_active = False
         self._batch_key: str | None = None
         # Scope batch state (指定范围翻译): remaining keys + aggregate counters.
@@ -132,6 +155,23 @@ class TranslateSection(QWidget):
         hint_layout.addWidget(self.settings_link)
         hint_layout.addStretch(1)
 
+        # 对照方式 row: 分段 / 整段 segmented switch above the rows.
+        mode_caption = QLabel(LABEL_MODE_CAPTION, self)
+        mode_caption.setProperty("muted", True)
+        mode_caption.setStyleSheet("font-size: 10.5px;")
+        self.mode_bar = SegmentedBar(
+            ((MODE_SEGMENTS, LABEL_MODE_SEGMENTS), (MODE_WHOLE, LABEL_MODE_WHOLE)),
+            current=MODE_SEGMENTS,
+            parent=self,
+        )
+        self.mode_bar.setToolTip(TIP_MODE_BAR)
+        self.mode_bar.changed.connect(self._on_mode_changed)
+        mode_row = QHBoxLayout()
+        mode_row.setContentsMargins(0, 0, 0, 0)
+        mode_row.setSpacing(8)
+        mode_row.addWidget(mode_caption)
+        mode_row.addWidget(self.mode_bar, 1)
+
         tokens = resolve_tokens(controller.settings)
         self.all_en_button = QPushButton(BUTTON_ALL_EN, self)
         self.all_en_button.setObjectName("allEnButton")
@@ -155,6 +195,7 @@ class TranslateSection(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(*_CONTENT_MARGINS)
         layout.setSpacing(_CONTENT_GAP)
+        layout.addLayout(mode_row)
         layout.addWidget(scroll)
         layout.addWidget(self.hint_row)
         layout.addWidget(scope_caption)
@@ -173,6 +214,22 @@ class TranslateSection(QWidget):
         """Current row view-states (for tests and the owning panel)."""
         return tuple(self._rows)
 
+    @property
+    def whole_mode(self) -> bool:
+        """Whether 整段对照 is active (whole caption as one unit)."""
+        return self._whole
+
+    def _on_mode_changed(self, option_id: str) -> None:
+        self._whole = option_id == MODE_WHOLE
+        self.refresh()
+
+    def _sources_for(self, key: str) -> tuple[str, ...]:
+        """The compare units of one file under the active 对照方式."""
+        if not self._whole:
+            return self._controller.segments(key)
+        text = self._controller.record(key).text
+        return (text,) if text.strip() else ()
+
     def set_live(self, live: bool) -> None:
         """Enable/disable auto-translation (driven by the card's open state).
 
@@ -186,31 +243,38 @@ class TranslateSection(QWidget):
             self.refresh()
 
     def refresh(self) -> None:
-        """Rebuild rows from the current file's segments; request dsts when live."""
+        """Rebuild rows for the active 对照方式; request dsts when live."""
         self._clear_rows()
         key = self._controller.current_key
-        segments = self._controller.segments(key) if key else ()
+        sources = self._sources_for(key) if key else ()
         configured = self.bridge.configured()
         self.hint_row.setVisible(not configured)
-        self.all_en_button.setEnabled(configured and bool(segments))
-        for index, segment in enumerate(segments):
-            row = self._build_row(index, segment, configured=configured)
+        self.all_en_button.setEnabled(configured and bool(sources))
+        for index, source in enumerate(sources):
+            row = self._build_row(index, source, configured=configured)
             self._rows.append(row)
             self._rows_layout.insertWidget(self._rows_layout.count() - 1, row.frame)
         # Only reach the LLM when the card is actually visible (self._live);
-        # already-cached segments render from _results without a request.
+        # already-cached sources render from _results without a request.
         if configured and key is not None and self._live:
-            for segment in segments:
-                if segment not in self._results:
-                    self.bridge.request(key, segment)
+            for source in sources:
+                if source not in self._results:
+                    self.bridge.request(key, source)
 
     def swap_segment(self, index: int) -> None:
-        """Replace segment ``index`` with its ready translation."""
+        """Replace the row's unit (segment, or整段 the whole caption)."""
         key = self._controller.current_key
         if key is None or not 0 <= index < len(self._rows):
             return
         row = self._rows[index]
         if not row.ready or not row.result:
+            return
+        if self._whole:
+            if self._controller.record(key).text != row.source:
+                _LOGGER.warning("caption changed under whole swap; ignoring")
+                return
+            self._controller.set_caption(key, row.result, LABEL_SWAP)
+            self._controller.toast_requested.emit(TOAST_SWAPPED, TOAST_INFO)
             return
         segments = list(self._controller.segments(key))
         if index >= len(segments) or segments[index] != row.source:
@@ -221,12 +285,13 @@ class TranslateSection(QWidget):
         self._controller.toast_requested.emit(TOAST_SWAPPED, TOAST_INFO)
 
     def translate_all_to_english(self) -> None:
-        """Translate every CJK segment of the files in the selected scope.
+        """Translate every CJK unit of the files in the selected scope.
 
         指定范围翻译: scope 当前/选中/全部 comes from the section's
         :class:`ScopeSelector`; files are processed one by one (the bridge's
         text-hash cache dedupes repeated tags across files) and each file's
-        replacements are committed as its batch completes.
+        replacements are committed as its batch completes. Under 整段对照
+        the unit is the whole caption (one translation per file).
         """
         if self._batch_active or self._batch_queue:
             return  # a scope batch is already running
@@ -234,7 +299,7 @@ class TranslateSection(QWidget):
         keys = [
             key
             for key in scope_keys
-            if any(has_cjk(segment) for segment in self._controller.segments(key))
+            if any(has_cjk(source) for source in self._sources_for(key))
         ]
         if not keys:
             no_cjk = TOAST_NO_CJK if self.scope.scope == "current" else TOAST_SCOPE_NO_CJK
@@ -245,6 +310,8 @@ class TranslateSection(QWidget):
         self._batch_changed = 0
         self._batch_failed = 0
         self.all_en_button.setEnabled(False)
+        # Mode switches mid-batch would commit under the wrong unit shape.
+        self.mode_bar.setEnabled(False)
         self._start_next_in_scope()
 
     def _start_next_in_scope(self) -> None:
@@ -255,7 +322,7 @@ class TranslateSection(QWidget):
         self.all_en_button.setText(
             BUTTON_ALL_EN_BUSY.format(i=done, n=self._batch_total)
         )
-        self.bridge.translate_all_cjk(key, self._controller.segments(key))
+        self.bridge.translate_all_cjk(key, self._sources_for(key))
 
     # -- internals ----------------------------------------------------------------------
     def _on_caption_changed(self, key: str) -> None:
@@ -286,14 +353,7 @@ class TranslateSection(QWidget):
         self._batch_key = None
         # Commit against the batch's OWN key, not the current one: the user may
         # have navigated away while the translations were in flight.
-        segments = self._controller.segments(key)
-        replaced = [
-            self._results.get(segment, segment) if has_cjk(segment) else segment
-            for segment in segments
-        ]
-        changed = sum(1 for old, new in zip(segments, replaced) if old != new)
-        if changed:
-            self._controller.commit_segments(key, replaced, LABEL_ALL_EN)
+        changed = self._commit_results(key)
         self._batch_changed += changed
         self._batch_failed += failed
         if self._batch_queue and self._batch_queue[0] == key:
@@ -301,9 +361,10 @@ class TranslateSection(QWidget):
         if self._batch_queue:
             self._start_next_in_scope()
             return
-        # Scope finished: restore the button and report the aggregate result.
+        # Scope finished: restore the controls and report the aggregate result.
         self.all_en_button.setText(BUTTON_ALL_EN)
         self.all_en_button.setEnabled(True)
+        self.mode_bar.setEnabled(True)
         total_changed = self._batch_changed
         total_failed = self._batch_failed
         if total_failed == 0 and total_changed > 0:
@@ -319,6 +380,27 @@ class TranslateSection(QWidget):
             self._controller.toast_requested.emit(
                 TOAST_ALL_EN_FAILED.format(n=total_failed), TOAST_ERR
             )
+
+    def _commit_results(self, key: str) -> int:
+        """Apply cached translations to one file; returns changed-unit count."""
+        if self._whole:
+            text = self._controller.record(key).text
+            if not has_cjk(text):
+                return 0
+            replacement = self._results.get(text)
+            if replacement is None or replacement == text:
+                return 0
+            self._controller.set_caption(key, replacement, LABEL_ALL_EN)
+            return 1
+        segments = self._controller.segments(key)
+        replaced = [
+            self._results.get(segment, segment) if has_cjk(segment) else segment
+            for segment in segments
+        ]
+        changed = sum(1 for old, new in zip(segments, replaced) if old != new)
+        if changed:
+            self._controller.commit_segments(key, replaced, LABEL_ALL_EN)
+        return changed
 
     def _build_row(self, index: int, segment: str, *, configured: bool) -> _Row:
         tokens = resolve_tokens(self._controller.settings)

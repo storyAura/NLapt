@@ -150,6 +150,19 @@ class TestOpenAIClient:
             client.complete(basic_request())
         assert "内容安全拦截" in str(excinfo.value)
 
+    @pytest.mark.parametrize("empty", ["", "   \n"])
+    def test_empty_completion_raises_retryable_error(self, empty: str) -> None:
+        """HTTP-200 empty content (高并发 / 思考模型) must be retryable, not ''."""
+        body = {"choices": [{"finish_reason": "length", "message": {"content": empty}}]}
+        client = OpenAIClient(
+            make_profile("openai", "https://api.example.com/v1"),
+            transport=capture_transport([], json_body=body),
+        )
+        with pytest.raises(LLMRequestError) as excinfo:
+            client.complete(basic_request())
+        assert "空回复" in str(excinfo.value)
+        assert "length" in str(excinfo.value)
+
     def test_normal_finish_reason_returns_text(self) -> None:
         body = {"choices": [{"finish_reason": "stop", "message": {"content": "ok"}}]}
         profile = make_profile("openai", "https://api.test/v1")
@@ -305,6 +318,15 @@ class TestOllamaClient:
         profile = make_profile("ollama", "http://localhost:11434")
         client = OllamaClient(
             profile, transport=capture_transport(captured, json_body={"message": {}})
+        )
+        with pytest.raises(LLMRequestError):
+            client.complete(basic_request())
+
+    def test_empty_content_raises_retryable_error(self) -> None:
+        profile = make_profile("ollama", "http://localhost:11434")
+        client = OllamaClient(
+            profile,
+            transport=capture_transport([], json_body={"message": {"content": ""}}),
         )
         with pytest.raises(LLMRequestError):
             client.complete(basic_request())

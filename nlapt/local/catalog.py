@@ -33,9 +33,19 @@ from pathlib import Path, PurePosixPath
 from urllib.parse import quote
 
 from nlapt.core.errors import ValidationError
+from nlapt.local.florence import (
+    TASK_ANALYZE,
+    TASK_BAI_JSON,
+    TASK_CAPTION,
+    TASK_DETAILED_CAPTION,
+    TASK_GENERATE_TAGS,
+    TASK_MIXED_CAPTION,
+    TASK_MIXED_CAPTION_PLUS,
+    TASK_MORE_DETAILED_CAPTION,
+)
 
 # Date the download counts / file listings were captured from huggingface.co.
-CATALOG_SNAPSHOT_DATE = "2026-07-29"
+CATALOG_SNAPSHOT_DATE = "2026-08-01"
 # Base pattern for direct file downloads from a public HuggingFace repo.
 HF_RESOLVE_BASE = "https://huggingface.co/{repo_id}/resolve/main/{path}"
 # Base pattern for a repo's human-readable page.
@@ -91,6 +101,31 @@ class ModelFamily:
     # Additional required files beside the quant (ENGINE_FLORENCE: the
     # sibling ONNX parts + tokenizer). Downloaded/verified like quants.
     extra_files: tuple[QuantFile, ...] = ()
+    # ENGINE_FLORENCE only: the 指令 tokens this family was trained on
+    # (official Florence-2 knows none of the PromptGen additions). The
+    # first entry is the fallback when the persisted task is unsupported.
+    florence_tasks: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class LoraEntry:
+    """A curated downloadable PEFT LoRA for Florence families (内置 LoRA).
+
+    ``files`` are downloaded into ``models_dir/loras/<lora_id>/`` and
+    verified exactly like quants; ``base_url`` is the directory URL the
+    filenames are appended to (kept as a full URL: the pinned LoRA lives
+    on ModelScope, not HuggingFace). ``task`` is the 指令 the LoRA was
+    trained for — the UI switches to it on selection.
+    """
+
+    lora_id: str
+    name: str
+    base_url: str
+    page_url: str
+    files: tuple[QuantFile, ...]
+    compatible_family_ids: tuple[str, ...]
+    task: str = ""
+    notes: str = ""
 
 
 @dataclass(frozen=True)
@@ -131,11 +166,11 @@ ALL_SERIES: tuple[ModelSeries, ...] = (
     ),
     ModelSeries(
         series_id=SERIES_FLORENCE,
-        name="Florence-2 PromptGen",
+        name="Florence-2",
         description=(
-            "MiaoshouAI 基于微软 Florence-2 微调的轻量打标模型(约 1G 显存),"
-            "通过内置指令输出 danbooru 标签 / 各级标题 / 构图分析,"
-            "免 llama-server,推理时自动加载。"
+            "微软 Florence-2 轻量视觉模型系列(0.23B/0.77B)及社区打标微调版"
+            "PromptGen,通过内置指令输出标签 / 各级标题 / 构图分析,"
+            "免 llama-server,推理时自动加载;large 档可搭配内置 LoRA。"
         ),
     ),
 )
@@ -157,6 +192,35 @@ def _q(
         sha256=sha256,
         recommended=recommended,
     )
+
+
+# The 指令 sets Florence families were trained on (first = fallback).
+PROMPTGEN_TASKS: tuple[str, ...] = (
+    TASK_GENERATE_TAGS,
+    TASK_CAPTION,
+    TASK_DETAILED_CAPTION,
+    TASK_MORE_DETAILED_CAPTION,
+    TASK_ANALYZE,
+    TASK_MIXED_CAPTION,
+    TASK_MIXED_CAPTION_PLUS,
+)
+OFFICIAL_TASKS: tuple[str, ...] = (
+    TASK_MORE_DETAILED_CAPTION,
+    TASK_DETAILED_CAPTION,
+    TASK_CAPTION,
+)
+# large-arch officials additionally accept the BAI_JSON LoRA's 指令.
+OFFICIAL_LARGE_TASKS: tuple[str, ...] = OFFICIAL_TASKS + (TASK_BAI_JSON,)
+
+# Every official Florence-2 export ships the identical BART tokenizer
+# (verified byte-identical across all four onnx-community repos).
+_FLORENCE_TOKENIZER_SHA256 = (
+    "d69dcdb2323e124ac4f800cb9863ddccea0d7bb11e16125e8df3bd60f2f8aeac"
+)
+
+
+def _florence_tokenizer() -> QuantFile:
+    return _q("tokenizer", "tokenizer.json", 2_297_961, _FLORENCE_TOKENIZER_SHA256)
 
 
 ALL_FAMILIES: tuple[ModelFamily, ...] = (
@@ -594,17 +658,239 @@ ALL_FAMILIES: tuple[ModelFamily, ...] = (
                 173_380_907,
                 "3243b162d86802e572969581362b3efeba8329dbb8da1e2ff4fb053913e6c2df",
             ),
+            _florence_tokenizer(),
+        ),
+        florence_tasks=PROMPTGEN_TASKS,
+    ),
+    # -- official Microsoft Florence-2 exports (onnx-community, fp32) --------------
+    ModelFamily(
+        family_id="florence2-base-ft",
+        series_id=SERIES_FLORENCE,
+        name="Florence-2 base-ft(官方)",
+        repo_id="onnx-community/Florence-2-base-ft",
+        downloads=3_634,
+        params_label="0.23B",
+        vision=True,
+        kv_bytes_per_token=36_864,  # fp32 K+V of the 6-layer BART decoder
+        quants=(
             _q(
-                "tokenizer",
-                "tokenizer.json",
-                2_297_961,
-                "d69dcdb2323e124ac4f800cb9863ddccea0d7bb11e16125e8df3bd60f2f8aeac",
+                "ONNX",
+                "onnx/decoder_model_merged.onnx",
+                388_421_753,
+                "5207affad8815294233b8679ee9ecb614906f819a1890d95a01b9ca68c392a79",
+                recommended=True,
             ),
         ),
+        license="MIT",
+        notes="微软官方 base 任务微调版 · 标准标题三档指令",
+        engine=ENGINE_FLORENCE,
+        extra_files=(
+            _q(
+                "vision_encoder",
+                "onnx/vision_encoder.onnx",
+                366_549_825,
+                "d67258cdfdebfa21285dad9e7bd4bd99725236d0aaef9e474a1b24a6ec471351",
+            ),
+            _q(
+                "embed_tokens",
+                "onnx/embed_tokens.onnx",
+                157_560_044,
+                "90cae3deb6406938c676a35b5246db02b478c9cc8cf93508361be80c05babf95",
+            ),
+            _q(
+                "encoder_model",
+                "onnx/encoder_model.onnx",
+                173_380_723,
+                "cb0bccc232c64290397f5e1235eb3e1fa6ccf8c5afed9216480ee4eed80737fc",
+            ),
+            _florence_tokenizer(),
+        ),
+        florence_tasks=OFFICIAL_TASKS,
+    ),
+    ModelFamily(
+        family_id="florence2-large-ft",
+        series_id=SERIES_FLORENCE,
+        name="Florence-2 large-ft(官方)",
+        repo_id="onnx-community/Florence-2-large-ft",
+        downloads=1_088,
+        params_label="0.77B",
+        vision=True,
+        kv_bytes_per_token=98_304,  # fp32 K+V of the 12-layer 1024-dim decoder
+        quants=(
+            _q(
+                "ONNX",
+                "onnx/decoder_model_merged.onnx",
+                1_021_996_421,
+                "a35016ed99f4260f584bdef0602617cf344dafe8d72631d2a7e5933f105f4ea6",
+                recommended=True,
+            ),
+        ),
+        license="MIT",
+        notes="微软官方 large 任务微调版 · 标准标题三档指令",
+        engine=ENGINE_FLORENCE,
+        extra_files=(
+            _q(
+                "vision_encoder",
+                "onnx/vision_encoder.onnx",
+                1_453_500_335,
+                "cbe2b9e3bfd5f00f9c135c3c48e4e8a2ad2b35651309d213dbf0803cc862d491",
+            ),
+            _q(
+                "embed_tokens",
+                "onnx/embed_tokens.onnx",
+                210_080_043,
+                "8497716365d7636307b334a665b0fe3482c9dfc3cc3e31c1d110c25ec183e31d",
+            ),
+            _q(
+                "encoder_model",
+                "onnx/encoder_model.onnx",
+                609_049_107,
+                "f4622b5203e353c0e660f8d2ccd50a1179a092cd2408b208bc9539f1572a321d",
+            ),
+            _florence_tokenizer(),
+        ),
+        florence_tasks=OFFICIAL_LARGE_TASKS,
+    ),
+    ModelFamily(
+        family_id="florence2-base",
+        series_id=SERIES_FLORENCE,
+        name="Florence-2 base(官方)",
+        repo_id="onnx-community/Florence-2-base",
+        downloads=3_014,
+        params_label="0.23B",
+        vision=True,
+        kv_bytes_per_token=36_864,
+        quants=(
+            _q(
+                "ONNX",
+                "onnx/decoder_model_merged.onnx",
+                388_421_910,
+                "6d6e1266d7f94f5d4ec9cc07d9c1f7b3e47049c9b0de7bbe82a91e62dfd152af",
+                recommended=True,
+            ),
+        ),
+        license="MIT",
+        notes="微软官方 base 预训练版(未任务微调,建议优先 -ft)",
+        engine=ENGINE_FLORENCE,
+        extra_files=(
+            _q(
+                "vision_encoder",
+                "onnx/vision_encoder.onnx",
+                366_591_558,
+                "2c7464fce495ea43b415b48afe7dbe84a9ebbe0cfe3c31fdd81c6dd66b39ff75",
+            ),
+            _q(
+                "embed_tokens",
+                "onnx/embed_tokens.onnx",
+                157_560_107,
+                "fec0fd20276af861afb6a23a11544bf1378c05e2a41001b610cc281e244c4b20",
+            ),
+            _q(
+                "encoder_model",
+                "onnx/encoder_model.onnx",
+                173_380_723,
+                "b155b5a0e56a4244c62060751bb1b70dfe481015d0dbfa6d19b1912d9e58da0d",
+            ),
+            _florence_tokenizer(),
+        ),
+        florence_tasks=OFFICIAL_TASKS,
+    ),
+    ModelFamily(
+        family_id="florence2-large",
+        series_id=SERIES_FLORENCE,
+        name="Florence-2 large(官方)",
+        repo_id="onnx-community/Florence-2-large",
+        downloads=53,
+        params_label="0.77B",
+        vision=True,
+        kv_bytes_per_token=98_304,
+        quants=(
+            _q(
+                "ONNX",
+                "onnx/decoder_model_merged.onnx",
+                1_021_996_421,
+                "b8cc87fea29465237fc9980ee9cf4ef5c6a3e197d78ae6fd1e0b31c20bf7fd80",
+                recommended=True,
+            ),
+        ),
+        license="MIT",
+        notes="微软官方 large 预训练版 · BAI_JSON LoRA 的推荐载体(直系底座)",
+        engine=ENGINE_FLORENCE,
+        extra_files=(
+            _q(
+                "vision_encoder",
+                "onnx/vision_encoder.onnx",
+                1_453_500_335,
+                "3579b2a9fe0e73d80a6e6152c610c80fed3739bc9e386145740ac41a0ac0dc05",
+            ),
+            _q(
+                "embed_tokens",
+                "onnx/embed_tokens.onnx",
+                210_080_043,
+                "af0a7ec8918e556c4f3b7931271b8cf882db2024e2b777955daa053ee6a881b3",
+            ),
+            _q(
+                "encoder_model",
+                "onnx/encoder_model.onnx",
+                609_049_107,
+                "3046c1c8abee3c1d5ed667db738035a4abbe2793c5298683a8ccf1d6db5f4170",
+            ),
+            _florence_tokenizer(),
+        ),
+        florence_tasks=OFFICIAL_LARGE_TASKS,
     ),
 )
 
 _FAMILIES_BY_ID: dict[str, ModelFamily] = {f.family_id: f for f in ALL_FAMILIES}
+
+# -- curated LoRAs (内置 LoRA, downloadable like models) ------------------------------
+# Per-user directory name (inside models_dir) holding downloaded LoRAs.
+LORA_DIR_NAME = "loras"
+
+ALL_LORAS: tuple[LoraEntry, ...] = (
+    LoraEntry(
+        lora_id="bai-json-large",
+        name="BAI_JSON(JSON 结构化打标)",
+        base_url=(
+            "https://modelscope.cn/models/silverlong/"
+            "Florence-2-large-PromptGen-v2.0-BAI_JSON-LoRa/resolve/master/"
+            "ep-50/lora/"
+        ),
+        page_url=(
+            "https://modelscope.cn/models/silverlong/"
+            "Florence-2-large-PromptGen-v2.0-BAI_JSON-LoRa"
+        ),
+        files=(
+            _q(
+                "adapter",
+                "adapter_model.safetensors",
+                106_778_680,
+                "fc86f3ce5e9a8f759ef069a70e80ad47a712c0d16ca09ec2a6dc00aa56fcbb12",
+            ),
+            _q(
+                "config",
+                "adapter_config.json",
+                1_170,
+                "103608ef8350f9c07b9b7d288aed7f4369b3dfbccb83749fc3c8d0b76efd3ed0",
+            ),
+        ),
+        # Trained on large-PromptGen v2.0 (1024-dim) — only the large-arch
+        # families can merge it. PromptGen v2.0 itself has no ONNX export;
+        # its direct parent (microsoft/Florence-2-large, per its config's
+        # _name_or_path) is the best carrier: real-image runs produce clean
+        # structured JSON there, while the sibling large-ft finetune
+        # degenerates into token soup. Order = recommendation.
+        compatible_family_ids=("florence2-large", "florence2-large-ft"),
+        task=TASK_BAI_JSON,
+        notes=(
+            "silverlong 训练 · 指令 <BAI_JSON> 输出 JSON 结构化描述;"
+            "推荐搭配 Florence-2 large(其直系底座),large-ft 上效果差;"
+            "原始底座 large-PromptGen v2.0 无 ONNX,JSON 语法偶有小瑕疵"
+        ),
+    ),
+)
+
+_LORAS_BY_ID: dict[str, LoraEntry] = {entry.lora_id: entry for entry in ALL_LORAS}
 
 
 def all_series() -> tuple[ModelSeries, ...]:
@@ -661,6 +947,52 @@ def repo_page_url(repo_id: str) -> str:
     if not REPO_ID_PATTERN.fullmatch(repo_id):
         raise ValidationError(f"非法的仓库 ID: {repo_id!r}")
     return HF_REPO_PAGE_BASE.format(repo_id=repo_id)
+
+
+def all_loras() -> tuple[LoraEntry, ...]:
+    """Every curated LoRA, in catalog order."""
+    return ALL_LORAS
+
+
+def find_lora(lora_id: str) -> LoraEntry:
+    """Look up a curated LoRA by id. Raises ValidationError for unknown ids."""
+    entry = _LORAS_BY_ID.get(lora_id)
+    if entry is None:
+        raise ValidationError(f"未知的内置 LoRA: {lora_id!r}")
+    return entry
+
+
+def loras_for_family(family_id: str) -> tuple[LoraEntry, ...]:
+    """The curated LoRAs merged-compatible with one family."""
+    return tuple(
+        entry for entry in ALL_LORAS if family_id in entry.compatible_family_ids
+    )
+
+
+def lora_dir(models_dir: Path, entry: LoraEntry) -> Path:
+    """Local directory holding one curated LoRA's files."""
+    if not SAFE_ID_PATTERN.fullmatch(entry.lora_id):
+        raise ValidationError(f"非法的 LoRA 目录名: {entry.lora_id!r}")
+    return models_dir / LORA_DIR_NAME / entry.lora_id
+
+
+def lora_file_path(models_dir: Path, entry: LoraEntry, file: QuantFile) -> Path:
+    """Local path of one LoRA file (basename inside the per-LoRA dir)."""
+    return lora_dir(models_dir, entry) / PurePosixPath(file.filename).name
+
+
+def lora_adapter_path(models_dir: Path, entry: LoraEntry) -> Path:
+    """The .safetensors file of a curated LoRA — what the engine loads."""
+    for file in entry.files:
+        if file.filename.endswith(".safetensors"):
+            return lora_file_path(models_dir, entry, file)
+    raise ValidationError(f"内置 LoRA {entry.lora_id} 缺少 safetensors 文件")
+
+
+def lora_download_url(entry: LoraEntry, file: QuantFile) -> str:
+    """Direct download URL of one LoRA file (base_url + encoded filename)."""
+    encoded = "/".join(quote(part) for part in PurePosixPath(file.filename).parts)
+    return entry.base_url + encoded
 
 
 def family_dir(models_dir: Path, family: ModelFamily) -> Path:

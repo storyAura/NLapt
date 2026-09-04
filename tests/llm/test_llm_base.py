@@ -176,6 +176,17 @@ class TestConnectionTest:
         assert len(client.requests) == 1
         assert client.requests[0].model == "model-x"
 
+    def test_budget_survives_thinking_models(self) -> None:
+        """Regression: an 8-token cap made 测试连接 always fail on thinking
+        models (the entire budget went to hidden reasoning, content came back
+        empty). Keep enough room for the reasoning plus the visible reply."""
+        from nlapt.llm.base import CONNECTION_TEST_MAX_TOKENS
+
+        client = MockLLMClient(["pong"])
+        client.test_connection("model-x")
+        assert client.requests[0].max_tokens == CONNECTION_TEST_MAX_TOKENS
+        assert CONNECTION_TEST_MAX_TOKENS >= 512
+
     def test_empty_model_raises(self) -> None:
         client = MockLLMClient(["pong"])
         with pytest.raises(LLMConfigError):

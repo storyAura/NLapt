@@ -19,7 +19,7 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QMimeData, QPoint, Qt, Signal
+from PySide6.QtCore import QAbstractAnimation, QMimeData, QPoint, Qt, Signal
 from PySide6.QtGui import QDrag, QFocusEvent, QKeyEvent, QMouseEvent, QPainter, QPaintEvent, QPalette
 from PySide6.QtWidgets import (
     QApplication,
@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
 
 from nlapt.diagnostics import get_logger
 
+from nlapt_gui import anim
 from nlapt_gui.theme.tokens import DEFAULT_THEME, THEMES, ThemeTokens
 from nlapt_gui.widgets.flow_layout import FlowLayout
 
@@ -167,6 +168,7 @@ class SegmentEditorBase(QWidget):
         self._selected_index: int | None = None
         self._field: QWidget | None = None
         self._drag_index: int | None = None
+        self._reflow_pop_index: int | None = None
 
     # -- identity / state ------------------------------------------------------------
     @property
@@ -483,6 +485,7 @@ class SegmentEditorBase(QWidget):
         item = segs.pop(from_index)
         insert_index = to_index - 1 if to_index > from_index else to_index
         segs.insert(min(insert_index, len(segs)), item)
+        self._reflow_pop_index = min(insert_index, len(segs) - 1) if segs else None
         self._commit(segs, LABEL_REORDER)
 
     # -- internals ------------------------------------------------------------------------
@@ -662,6 +665,7 @@ class ChipsEditor(SegmentEditorBase):
         super().__init__(controller, key, parent)
         self._flow = FlowLayout(self, h_spacing=8, v_spacing=8)
         self._chips: list[ChipWidget] = []
+        self._reflow_anim: QAbstractAnimation | None = None
         self.setAcceptDrops(True)
         self._rebuild()
 
@@ -669,7 +673,19 @@ class ChipsEditor(SegmentEditorBase):
     def chips(self) -> tuple[ChipWidget, ...]:
         return tuple(self._chips)
 
+    def _chip_keys(self) -> list[tuple[str, ChipWidget]]:
+        seen: dict[str, int] = {}
+        keyed: list[tuple[str, ChipWidget]] = []
+        for chip in self._chips:
+            n = seen.get(chip.chip_text, 0)
+            seen[chip.chip_text] = n + 1
+            keyed.append((f"{n}\0{chip.chip_text}", chip))
+        return keyed
+
     def _rebuild(self) -> None:
+        anim.finish_animation(self._reflow_anim)
+        self._reflow_anim = None
+        previous = anim.snapshot_named_rects(self._chip_keys())
         while self._flow.count():
             item = self._flow.takeAt(0)
             widget = item.widget() if item is not None else None
@@ -700,6 +716,19 @@ class ChipsEditor(SegmentEditorBase):
                 empty.setProperty("muted", "true")
                 empty.setStyleSheet("font-size: 12px; padding: 6px 2px;")
                 self._flow.addWidget(empty)
+        layout = self.layout()
+        if layout is not None:
+            layout.activate()
+        pop_index = self._reflow_pop_index
+        self._reflow_pop_index = None
+        pop = (
+            self._chips[pop_index]
+            if pop_index is not None and 0 <= pop_index < len(self._chips)
+            else None
+        )
+        self._reflow_anim = anim.flip_reflow(self._chip_keys(), previous, pop=pop)
+        if self._reflow_anim is not None:
+            self._reflow_anim.finished.connect(lambda: setattr(self, "_reflow_anim", None))
 
     def _create_field(self, initial: str, placeholder: str) -> QWidget:
         field = InlineChipField(self)

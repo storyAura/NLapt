@@ -22,6 +22,8 @@ from nlapt.llm.base import LLMRequest
 from nlapt.llm.mock import MockLLMClient
 from nlapt.llm.rewrite import RewriteService, RewriteSpec, RewriteType
 from nlapt.ops.find_replace import FindReplaceOperation, FindReplaceSpec
+from nlapt.storage.paths import dataset_state_dir
+from nlapt.storage.session import SESSION_FILE_NAME
 
 UTF8 = "utf-8"
 STUB_IMAGE_BYTES = b"\x89"
@@ -161,7 +163,8 @@ class TestFix32SuggestionDurability:
         assert completed_key == "a.png"
         expected_text = app1.caption(completed_key).pending.text  # type: ignore[union-attr]
         # The session was written WITHOUT close() — the process now "crashes".
-        assert (root / ".nlapt" / "session.json").exists()
+        assert (dataset_state_dir(root) / SESSION_FILE_NAME).exists()
+        assert not (root / ".nlapt").exists()
         del app1
 
         app2 = NLaptApp(config=config)

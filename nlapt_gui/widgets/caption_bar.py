@@ -1,4 +1,4 @@
-"""标注工作区 - caption-level 翻译 / LLM 推理 / 本地推理 / 删除 + preview.
+"""标注工作区 - caption-level 翻译 / LLM 推理 / 本地推理 / 删除 / 译文 + preview.
 
 Lives in the editor panel's tab row (right of the 胶囊/分句/文本 mode tabs)
 and operates on the WHOLE caption of the current file:
@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (
 )
 
 from nlapt.diagnostics import get_logger
-from nlapt.llm.translate import LANG_LABELS, TARGET_LANGS
+from nlapt.llm.translate import LANG_LABELS, LANG_ZH, TARGET_LANGS
 
 from nlapt_gui.prompt_store import ENGINE_LLM, ENGINE_LOCAL
 from nlapt_gui.widgets.dialogs import ask_confirm
@@ -49,10 +49,17 @@ BAR_INFER_LLM = "LLM 推理"
 BAR_INFER_LOCAL = "本地推理"
 BAR_INFER_BUSY = "推理中…"
 BAR_DELETE = "删除"
+BAR_QUICK_TRANSLATE = "译文"
+BAR_QUICK_TRANSLATE_BUSY = "翻译中…"
 BAR_TRANSLATE_TIP = "把整篇标注翻译为 中文 / English / 日本語"
 BAR_INFER_LLM_TIP = "用在线视觉模型重新推理这张图片,生成新标注"
 BAR_INFER_LOCAL_TIP = "用本地模型(设置 ▸ 本地推理)推理这张图片,生成新标注"
 BAR_DELETE_TIP = "删除这张图片的全部标注"
+BAR_QUICK_TRANSLATE_TIP = "把当前标注翻译为中文,显示在下方"
+INLINE_TITLE = "译文(中文)"
+INLINE_CLOSE = "关闭"
+INLINE_PANEL_MAX_H = 140
+QUICK_TARGET_LANG = LANG_ZH
 TOAST_TRANSLATE_UNCONFIGURED = "未配置翻译 API — 打开 工具 ▸ 设置"
 TOAST_VISION_UNCONFIGURED = "未配置视觉模型 — 打开 工具 ▸ 设置"
 TOAST_LOCAL_UNCONFIGURED = "本地模型未就绪 — 打开 设置 ▸ 本地推理"
@@ -209,8 +216,69 @@ class TranslationPreview(QFrame):
         self.hide()
 
 
+class InlineTranslationPanel(QFrame):
+    """Read-only Chinese translation docked under the editor (not a replace preview)."""
+
+    dismiss_requested = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setProperty("surfaceCard", "true")
+        self._text = ""
+        column = QVBoxLayout(self)
+        column.setContentsMargins(12, 8, 12, 8)
+        column.setSpacing(6)
+        head = QHBoxLayout()
+        head.setContentsMargins(0, 0, 0, 0)
+        head.setSpacing(6)
+        self._title = QLabel(INLINE_TITLE, self)
+        self._title.setProperty("muted", "true")
+        self._title.setStyleSheet("font-size: 10.5px; font-weight: 600;")
+        head.addWidget(self._title)
+        head.addStretch(1)
+        self.close_btn = QPushButton(INLINE_CLOSE, self)
+        self.close_btn.setProperty("variant", "ghost")
+        self.close_btn.setFixedHeight(22)
+        self.close_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.close_btn.pressed.connect(self.dismiss_requested.emit)
+        head.addWidget(self.close_btn)
+        column.addLayout(head)
+        self._body = QLabel("", self)
+        self._body.setWordWrap(True)
+        self._body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._body.setStyleSheet("font-size: 12.5px; background: transparent;")
+        self._body.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self.body_scroll = QScrollArea(self)
+        self.body_scroll.setWidgetResizable(True)
+        self.body_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.body_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.body_scroll.setStyleSheet("QScrollArea { background: transparent; }")
+        self.body_scroll.viewport().setAutoFillBackground(False)
+        self.body_scroll.setWidget(self._body)
+        self.body_scroll.setMaximumHeight(INLINE_PANEL_MAX_H)
+        column.addWidget(self.body_scroll, 1)
+        self.hide()
+
+    def show_text(self, text: str) -> None:
+        self._text = text
+        self._body.setText(text)
+        self.show()
+
+    def current_text(self) -> str:
+        return self._text
+
+    def clear(self) -> None:
+        self._text = ""
+        self._body.setText("")
+        self.hide()
+
+
 class CaptionBar(QWidget):
-    """The 翻译 / 重译 / 删除 caption workspace in the editor tab row."""
+    """The 翻译 / 推理 / 删除 / 译文 caption workspace in the editor tab row."""
+
+    inline_translation_ready = Signal(str, str)  # key, chinese text
 
     def __init__(
         self,
@@ -229,6 +297,8 @@ class CaptionBar(QWidget):
         self._overlay_top = overlay_top
         # (key, source_text, lang) of the in-flight caption translation.
         self._pending_translate: tuple[str, str, str] | None = None
+        # Separate pending for the docked 译文 button (always zh).
+        self._pending_quick: tuple[str, str, str] | None = None
         # (key, engine) of the in-flight vision inference.
         self._pending_infer: tuple[str, str] | None = None
         # (key, text, label) behind the preview's 替换 button.
@@ -253,6 +323,11 @@ class CaptionBar(QWidget):
         self.delete_btn = self._button(BAR_DELETE, BAR_DELETE_TIP, danger=True)
         self.delete_btn.clicked.connect(self._on_delete)
         row.addWidget(self.delete_btn)
+        self.quick_translate_btn = self._button(
+            BAR_QUICK_TRANSLATE, BAR_QUICK_TRANSLATE_TIP
+        )
+        self.quick_translate_btn.clicked.connect(self.request_quick_translate)
+        row.addWidget(self.quick_translate_btn)
 
         # Result preview overlay (view first, 替换 on demand).
         host = overlay_host if overlay_host is not None else self
@@ -287,6 +362,7 @@ class CaptionBar(QWidget):
         self.reinfer_btn.setEnabled(has_current and idle)
         self.local_infer_btn.setEnabled(has_current and idle)
         self.delete_btn.setEnabled(has_current)
+        self.quick_translate_btn.setEnabled(has_current and self._pending_quick is None)
 
     def _infer_button(self, engine: str) -> QPushButton:
         return self.local_infer_btn if engine == ENGINE_LOCAL else self.reinfer_btn
@@ -346,9 +422,28 @@ class CaptionBar(QWidget):
         self._pending_translate = (key, text, lang)
         self._translate_bridge.request_to(key, text, lang)  # type: ignore[union-attr]
 
+    def request_quick_translate(self) -> None:
+        """Translate the current caption into Chinese; emit ``inline_translation_ready``."""
+        key = self._controller.current_key
+        if key is None or self._pending_quick is not None:
+            return
+        if not self._bridge_configured():
+            self._toast(TOAST_TRANSLATE_UNCONFIGURED, _KIND_WARN)
+            return
+        text = self._controller.record(key).text.strip()
+        if not text:
+            self._toast(TOAST_EMPTY_CAPTION, _KIND_WARN)
+            return
+        self._pending_quick = (key, text, QUICK_TARGET_LANG)
+        self.quick_translate_btn.setText(BAR_QUICK_TRANSLATE_BUSY)
+        self._sync_enabled()
+        self._translate_bridge.request_to(key, text, QUICK_TARGET_LANG)  # type: ignore[union-attr]
+
     def _on_target_ready(
         self, key: str, source: str, lang: str, result: str, ok: bool
     ) -> None:
+        if self._consume_quick_ready(key, source, lang, result, ok):
+            return
         pending = self._pending_translate
         if pending is None or (key, source, lang) != pending:
             return
@@ -363,6 +458,21 @@ class CaptionBar(QWidget):
             result, title=PREVIEW_TITLE_TRANSLATE.format(name=name, lang=lang_label)
         )
         self.reposition_overlay()
+
+    def _consume_quick_ready(
+        self, key: str, source: str, lang: str, result: str, ok: bool
+    ) -> bool:
+        pending = self._pending_quick
+        if pending is None or (key, source, lang) != pending:
+            return False
+        self._pending_quick = None
+        self.quick_translate_btn.setText(BAR_QUICK_TRANSLATE)
+        self._sync_enabled()
+        if not ok:
+            self._toast(TOAST_TRANSLATE_FAILED.format(message=result), _KIND_WARN)
+            return True
+        self.inline_translation_ready.emit(key, result)
+        return True
 
     # -- LLM 推理 / 本地推理 --------------------------------------------------------------
     def _vision_configured(self, engine: str) -> bool:

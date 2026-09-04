@@ -50,6 +50,9 @@ def _extract_text(data: dict[str, Any]) -> str:
     content = message.get("content")
     if not isinstance(content, str):
         raise LLMRequestError(f"{PROVIDER_NAME} response missing message content")
+    if not content.strip():
+        # Empty completions are transient (retryable), never a usable caption.
+        raise LLMRequestError(f"{PROVIDER_NAME} returned empty message content")
     return content
 
 

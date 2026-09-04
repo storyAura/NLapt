@@ -1,28 +1,29 @@
-"""Tests for title_bar / status_bar / main_window (integrator widgets)."""
+"""Tests for MainWindow assembly (rail + two-column body + tools overlay)."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QPoint, QRect, Qt
 from PySide6.QtWidgets import QLineEdit
 
-from nlapt_gui import __version__
+from nlapt.app import NLaptApp
+
+from nlapt_gui import anim
+from nlapt_gui.controller import TOAST_NO_DATASET, TOAST_WARN, AppController
+from nlapt_gui.settings import UISettings
 from nlapt_gui.theme.manager import ThemeManager
 from nlapt_gui.theme.tokens import DEFAULT_THEME, EDITOR_H_RANGE, MIN_WINDOW, THEMES
-from nlapt_gui.widgets.main_window import EDGE_MARGIN_PX, MainWindow
-from nlapt_gui.widgets.status_bar import StatusBar
-from nlapt_gui.widgets.title_bar import (
-    ACTION_OPEN_FOLDER,
-    MENU_EDIT,
-    MENU_FILE,
-    MENU_HELP,
-    MENU_TOOLS,
-    MENU_VIEW,
-    TITLE_BAR_HEIGHT,
-    VERSION_LABEL,
+from nlapt_gui.widgets.main_window import (
+    FILE_PANEL_DEFAULT_W,
+    TOOLS_PANEL_DEFAULT_W,
+    EDGE_MARGIN_PX,
+    MainWindow,
 )
+from nlapt_gui.widgets.preview_panel import HEADER_H
+from nlapt_gui.widgets.status_bar import StatusBar
+from nlapt_gui.widgets.toolbar_rail import RAIL_W
 
 K1 = "0001.png"
 K2 = "0002.png"
@@ -49,11 +50,15 @@ class TestAssembly:
         assert window.windowFlags() & Qt.WindowType.FramelessWindowHint
         assert (window.minimumWidth(), window.minimumHeight()) == MIN_WINDOW
 
-    def test_three_columns_and_bars(self, window) -> None:
-        assert window.file_panel.width() == 300
-        assert window.tools_panel.width() == 340
-        assert window.title_bar.height() == TITLE_BAR_HEIGHT
-        assert window.status_bar.height() == 26
+    def test_rail_and_two_columns(self, window) -> None:
+        assert window.rail.width() == RAIL_W
+        assert window.file_panel.width() == FILE_PANEL_DEFAULT_W
+        assert window.body_splitter.count() == 2
+        assert window.body_splitter.widget(0) is window.file_panel
+        assert not hasattr(window, "title_bar")
+        assert not hasattr(window, "status_bar")
+        assert not window.tools_panel.isVisible()
+        assert window.tools_panel.width() == TOOLS_PANEL_DEFAULT_W
 
     def test_editor_height_from_settings_and_splitter(self, window, controller) -> None:
         assert window.editor_panel.height() == controller.settings.editor_h
@@ -91,50 +96,31 @@ class TestMaxRestore:
         assert not (window.windowState() & self.ZOOMED)
 
     def test_toggle_recovers_from_fullscreen(self, qtbot, window) -> None:
-        # A window stuck in FULLSCREEN must come back to normal too — the
-        # old isMaximized()-only branch kept re-maximizing forever.
         window.showFullScreen()
         window.toggle_max_restore()
         assert not (window.windowState() & self.ZOOMED)
 
-    def test_title_bar_button_delegates_to_window(self, qtbot, window) -> None:
+    def test_info_bar_button_delegates_to_window(self, qtbot, window) -> None:
         window.showMaximized()
-        window.title_bar.toggle_max_restore()
+        window.preview_panel.max_button.clicked.emit()
         assert not (window.windowState() & self.ZOOMED)
 
 
-class TestTitleBar:
-    def test_menus_present(self, window) -> None:
-        bar = window.title_bar
-        assert set(bar.menus) == {MENU_FILE, MENU_EDIT, MENU_VIEW, MENU_TOOLS, MENU_HELP}
-        file_actions = [a.text() for a in bar.menus[MENU_FILE].actions() if a.text()]
-        assert file_actions[0] == ACTION_OPEN_FOLDER
-        assert "刷新" in file_actions
-        assert any(text.startswith("保存") for text in file_actions)
-        assert "全部保存" in file_actions
-        assert "退出" in file_actions
-        edit_actions = [a.text() for a in bar.menus[MENU_EDIT].actions()]
-        assert any(text.startswith("撤销") for text in edit_actions)
-        assert "复制标注" in edit_actions
-
-    def test_version_label_from_package(self, window) -> None:
-        assert window.title_bar.version_label.text() == VERSION_LABEL
-        assert __version__ in window.title_bar.version_label.text()
-
-    def test_file_menu_save_action(self, qtbot, window, controller) -> None:
-        controller.set_caption(K1, "changed via menu", "编辑")
+class TestRail:
+    def test_save_button_saves_current(self, qtbot, window, controller) -> None:
+        controller.set_caption(K1, "changed via rail", "编辑")
         with qtbot.waitSignal(controller.files_saved, timeout=2000):
-            window.title_bar.action_save.trigger()
+            window.rail.save_button.click()
         assert not controller.record(K1).dirty
 
-    def test_view_mode_actions_sync(self, window, controller) -> None:
-        window.title_bar.view_mode_actions["big"].trigger()
+    def test_view_mode_stays_on_file_panel(self, window, controller) -> None:
+        window.file_panel.view_buttons["big"].click()
         assert controller.view_mode == "big"
         controller.set_view_mode("list")
-        assert window.title_bar.view_mode_actions["list"].isChecked()
+        assert window.file_panel.view_buttons["list"].property("segActive") is True
 
     def test_theme_popup_rows_and_pick(self, qtbot, window, manager) -> None:
-        popup = window.title_bar.open_theme_popup()
+        popup = window.rail.open_theme_popup()
         qtbot.addWidget(popup)
         rows = popup.rows()
         assert len(rows) == len(THEMES)
@@ -142,24 +128,18 @@ class TestTitleBar:
         target = next(row for row in rows if row.theme_name == "石墨")
         qtbot.mouseClick(target, Qt.MouseButton.LeftButton)
         assert manager.theme_name == "石墨"
-        assert window.title_bar.theme_name_label.text() == "石墨"
 
     def test_theme_change_updates_controller_settings(self, window, controller, manager) -> None:
         manager.apply("墨黑")
         assert controller.settings.theme == "墨黑"
 
-    def test_theme_menu_applies(self, window, manager) -> None:
-        window.title_bar.theme_actions["深邃"].trigger()
-        assert manager.theme_name == "深邃"
-
     def test_open_folder_action_emits_signal(self, qtbot, window, monkeypatch) -> None:
-        # Neutralize the modal directory dialog wired to this signal.
         picked: list[bool] = []
         monkeypatch.setattr(window, "pick_folder", lambda: picked.append(True))
-        window.title_bar.open_folder_requested.disconnect()
-        window.title_bar.open_folder_requested.connect(window.pick_folder)
-        with qtbot.waitSignal(window.title_bar.open_folder_requested, timeout=1000):
-            window.title_bar.action_open_folder.trigger()
+        window.rail.open_folder_requested.disconnect()
+        window.rail.open_folder_requested.connect(window.pick_folder)
+        with qtbot.waitSignal(window.rail.open_folder_requested, timeout=1000):
+            window.rail.open_button.click()
         assert picked == [True]
 
     def test_pick_folder_opens_dataset(self, qtbot, window, controller, tmp_path, monkeypatch) -> None:
@@ -176,28 +156,168 @@ class TestTitleBar:
             window.pick_folder()
 
 
-class TestStatusBar:
-    def test_left_summary(self, window, controller, demo_dataset: Path) -> None:
-        text = window.status_bar.left_label.text()
+class TestToolsDrawer:
+    def test_starts_hidden(self, window) -> None:
+        assert not window.tools_panel.isVisible()
+        assert not window.rail.tools_open()
+
+    def test_rail_toggle_shows_overlay_on_the_right(self, window) -> None:
+        window.rail.set_tools_open(True)
+        assert window.tools_panel.isVisible()
+        assert window.tools_panel.width() == TOOLS_PANEL_DEFAULT_W
+        assert window.tools_panel.x() == window.width() - TOOLS_PANEL_DEFAULT_W
+        assert window.tools_panel.y() == HEADER_H
+        assert window.tools_panel.height() == window.height() - HEADER_H
+
+    def test_drawer_leaves_window_controls_uncovered(self, window) -> None:
+        window.rail.set_tools_open(True)
+        close_btn = window.preview_panel.close_button
+        tools_rect = QRect(
+            window.tools_panel.mapToGlobal(QPoint(0, 0)), window.tools_panel.size()
+        )
+        close_rect = QRect(close_btn.mapToGlobal(QPoint(0, 0)), close_btn.size())
+        assert not tools_rect.intersects(close_rect)
+
+    def test_escape_closes_drawer(self, qtbot, window) -> None:
+        window.rail.set_tools_open(True)
+        qtbot.keyClick(window, Qt.Key.Key_Escape)
+        assert not window.rail.tools_open()
+        assert not window.tools_panel.isVisible()
+
+    def test_open_slide_reaches_docked_geometry(self, window) -> None:
+        anim.set_animations_enabled(True)
+        try:
+            window.rail.set_tools_open(True)
+            animation = window._tools_anim
+            assert animation is not None
+            animation.setCurrentTime(animation.duration())
+            assert window.tools_panel.isVisible()
+            assert window.tools_panel.width() == TOOLS_PANEL_DEFAULT_W
+            assert window.tools_panel.x() == window.width() - TOOLS_PANEL_DEFAULT_W
+            assert window.tools_panel.y() == HEADER_H
+            assert window.tools_panel.height() == window.height() - HEADER_H
+        finally:
+            anim.set_animations_enabled(False)
+
+    def test_close_slide_hides_at_end(self, window) -> None:
+        anim.set_animations_enabled(True)
+        try:
+            window.rail.set_tools_open(True)
+            window._tools_anim.setCurrentTime(window._tools_anim.duration())
+            window.rail.set_tools_open(False)
+            animation = window._tools_anim
+            assert animation is not None
+            assert window.tools_panel.isVisible()
+            animation.setCurrentTime(animation.duration())
+            assert not window.tools_panel.isVisible()
+        finally:
+            anim.set_animations_enabled(False)
+
+    def test_reopen_during_close_stays_visible(self, window) -> None:
+        anim.set_animations_enabled(True)
+        try:
+            window.rail.set_tools_open(True)
+            window._tools_anim.setCurrentTime(window._tools_anim.duration())
+            window.rail.set_tools_open(False)
+            assert window.tools_panel.isVisible()
+            window.rail.set_tools_open(True)
+            animation = window._tools_anim
+            assert animation is not None
+            animation.setCurrentTime(animation.duration())
+            assert window.tools_panel.isVisible()
+            assert window.tools_panel.x() == window.width() - TOOLS_PANEL_DEFAULT_W
+        finally:
+            anim.set_animations_enabled(False)
+
+    def test_resize_during_close_hides(self, window) -> None:
+        anim.set_animations_enabled(True)
+        try:
+            window.rail.set_tools_open(True)
+            window._tools_anim.setCurrentTime(window._tools_anim.duration())
+            window.rail.set_tools_open(False)
+            assert window._tools_anim is not None
+            window.resize(window.width() + 80, window.height() + 40)
+            assert not window.tools_panel.isVisible()
+        finally:
+            anim.set_animations_enabled(False)
+
+    def test_resize_during_open_snaps_to_new_edge(self, window) -> None:
+        anim.set_animations_enabled(True)
+        try:
+            window.rail.set_tools_open(True)
+            assert window._tools_anim is not None
+            window.resize(window.width() + 80, window.height() + 40)
+            assert window.tools_panel.isVisible()
+            assert window.tools_panel.x() == window.width() - TOOLS_PANEL_DEFAULT_W
+            assert window.tools_panel.y() == HEADER_H
+            assert window.tools_panel.height() == window.height() - HEADER_H
+            assert window.tools_panel.width() == TOOLS_PANEL_DEFAULT_W
+        finally:
+            anim.set_animations_enabled(False)
+
+
+class TestExport:
+    def test_no_dataset_toasts(self, qtbot, qapp, manager) -> None:
+        ctrl = AppController(NLaptApp(), settings=UISettings())
+        win = MainWindow(ctrl, manager)
+        qtbot.addWidget(win)
+        toasts: list[tuple[str, str]] = []
+        ctrl.toast_requested.connect(lambda text, kind: toasts.append((text, kind)))
+        win.export_dataset()
+        assert (TOAST_NO_DATASET, TOAST_WARN) in toasts
+
+    def test_dirty_cancel_skips_dialog(self, qtbot, window, controller, monkeypatch, tmp_path) -> None:
+        from nlapt_gui.widgets import main_window as mw
+
+        controller.set_caption(K1, "dirty export", "编辑")
+        monkeypatch.setattr(mw, "ask_confirm", lambda *args, **kwargs: False)
+        called: list[str] = []
+        monkeypatch.setattr(
+            mw.QFileDialog,
+            "getSaveFileName",
+            staticmethod(lambda *args, **kwargs: called.append("dialog") or ("", "")),
+        )
+        window.export_dataset()
+        assert called == []
+
+    def test_export_writes_zip(self, qtbot, window, controller, monkeypatch, tmp_path) -> None:
+        from nlapt_gui.widgets import main_window as mw
+
+        dest = tmp_path / "dataset.zip"
+        monkeypatch.setattr(
+            mw.QFileDialog,
+            "getSaveFileName",
+            staticmethod(lambda *args, **kwargs: (str(dest), "ZIP (*.zip)")),
+        )
+        with qtbot.waitSignal(controller.toast_requested, timeout=2000) as blocker:
+            window.export_dataset()
+        assert dest.is_file()
+        assert "已导出" in blocker.args[0]
+
+
+class TestStatusBarStandalone:
+    def test_left_summary(self, qtbot, controller, demo_dataset: Path) -> None:
+        bar = StatusBar(controller)
+        qtbot.addWidget(bar)
+        text = bar.left_label.text()
         assert str(demo_dataset) in text
         assert "UTF-8" in text
         assert f"{len(controller.keys())} 个标注文件" in text
 
-    def test_mode_label_tracks_controller(self, window, controller) -> None:
-        assert window.status_bar.mode_label.text() == "模式 · 胶囊"
+    def test_mode_label_tracks_controller(self, qtbot, controller) -> None:
+        bar = StatusBar(controller)
+        qtbot.addWidget(bar)
+        assert bar.mode_label.text() == "模式 · 胶囊"
         controller.set_mode("text")
-        assert window.status_bar.mode_label.text() == "模式 · 文本"
+        assert bar.mode_label.text() == "模式 · 文本"
 
-    def test_theme_label_tracks_manager(self, window, manager) -> None:
+    def test_theme_label_tracks_manager(self, qtbot, controller, manager) -> None:
+        bar = StatusBar(controller, manager)
+        qtbot.addWidget(bar)
         manager.apply("石墨")
-        assert window.status_bar.theme_label.text() == "主题 · 石墨"
+        assert bar.theme_label.text() == "主题 · 石墨"
 
     def test_no_dataset_state(self, qtbot, qapp) -> None:
-        from nlapt.app import NLaptApp
-
-        from nlapt_gui.controller import AppController
-        from nlapt_gui.settings import UISettings
-
         ctrl = AppController(NLaptApp(), settings=UISettings())
         bar = StatusBar(ctrl)
         qtbot.addWidget(bar)
@@ -238,6 +358,14 @@ class TestShortcuts:
         qtbot.keyClick(window, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
         assert controller.record(K1).text == original
 
+    def test_ctrl_y_redoes_caption(self, qtbot, window, controller) -> None:
+        controller.set_current(K1)
+        controller.set_caption(K1, "edited for redo", "编辑")
+        window.setFocus()
+        qtbot.keyClick(window, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
+        qtbot.keyClick(window, Qt.Key.Key_Y, Qt.KeyboardModifier.ControlModifier)
+        assert controller.record(K1).text == "edited for redo"
+
     def test_ctrl_z_inside_text_input_stays_local(self, qtbot, window, controller) -> None:
         controller.set_current(K1)
         controller.set_caption(K1, "edited caption text", "编辑")
@@ -247,7 +375,6 @@ class TestShortcuts:
         qtbot.waitUntil(lambda: field.hasFocus(), timeout=2000)
         qtbot.keyClicks(field, "abc")
         qtbot.keyClick(window, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
-        # The caption edit is untouched; the line edit consumed the undo.
         assert controller.record(K1).text == "edited caption text"
         assert field.text() != "abc"
 

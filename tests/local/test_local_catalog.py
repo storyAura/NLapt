@@ -10,23 +10,31 @@ import pytest
 from nlapt.core.errors import ValidationError
 from nlapt.local.catalog import (
     ALL_FAMILIES,
+    ALL_LORAS,
     ALL_SERIES,
     CATALOG_SNAPSHOT_DATE,
     ENGINE_FLORENCE,
     ENGINE_LLAMA,
     all_families,
+    all_loras,
     all_series,
     download_url,
     families_for,
     family_dir,
     find_family,
+    find_lora,
     find_quant,
+    lora_adapter_path,
+    lora_dir,
+    lora_download_url,
+    lora_file_path,
+    loras_for_family,
     mmproj_path,
     quant_path,
     recommended_quant,
     repo_page_url,
 )
-from nlapt.local.florence import REQUIRED_FILES
+from nlapt.local.florence import FLORENCE_TASK_LABELS, REQUIRED_FILES
 
 
 class TestCatalogIntegrity:
@@ -207,3 +215,87 @@ class TestUrlsAndPaths:
     def test_mmproj_path_none_for_text_only(self, tmp_path: Path) -> None:
         family = find_family("gemma4-26b-a4b-heretic")
         assert mmproj_path(tmp_path, family) is None
+
+
+class TestFlorenceTasks:
+    def test_every_florence_family_declares_tasks(self) -> None:
+        for family in ALL_FAMILIES:
+            if family.engine == ENGINE_FLORENCE:
+                assert family.florence_tasks, family.family_id
+                for token in family.florence_tasks:
+                    assert token in FLORENCE_TASK_LABELS, family.family_id
+            else:
+                assert family.florence_tasks == (), family.family_id
+
+    def test_official_families_do_not_claim_promptgen_tasks(self) -> None:
+        for family_id in ("florence2-base-ft", "florence2-large-ft"):
+            tasks = find_family(family_id).florence_tasks
+            assert "<GENERATE_TAGS>" not in tasks
+            assert "<MORE_DETAILED_CAPTION>" in tasks
+
+    def test_bai_json_task_only_on_large_families(self) -> None:
+        for family in ALL_FAMILIES:
+            if family.engine != ENGINE_FLORENCE:
+                continue
+            has_bai = "<BAI_JSON>" in family.florence_tasks
+            assert has_bai == (family.family_id in ("florence2-large", "florence2-large-ft"))
+
+    def test_requested_official_families_present(self) -> None:
+        for family_id in (
+            "florence2-base",
+            "florence2-base-ft",
+            "florence2-large",
+            "florence2-large-ft",
+        ):
+            family = find_family(family_id)
+            assert family.engine == ENGINE_FLORENCE
+            assert family.vision
+            names = {PurePosixPath(f.filename).name for f in family.extra_files}
+            assert names == set(REQUIRED_FILES) - {PurePosixPath(family.quants[0].filename).name}
+
+
+class TestLoras:
+    def test_lora_integrity(self) -> None:
+        assert all_loras() == ALL_LORAS
+        ids = [entry.lora_id for entry in ALL_LORAS]
+        assert len(ids) == len(set(ids))
+        for entry in ALL_LORAS:
+            assert entry.name
+            assert entry.base_url.startswith("https://")
+            assert entry.page_url.startswith("https://")
+            assert entry.files
+            for file in entry.files:
+                assert file.size_bytes > 0
+                assert re.fullmatch(r"[0-9a-f]{64}", file.sha256)
+            assert entry.compatible_family_ids
+            for family_id in entry.compatible_family_ids:
+                find_family(family_id)  # raises on unknown ids
+            if entry.task:
+                assert entry.task in FLORENCE_TASK_LABELS
+
+    def test_find_lora_and_unknown(self) -> None:
+        assert find_lora("bai-json-large").lora_id == "bai-json-large"
+        with pytest.raises(ValidationError, match="未知的内置 LoRA"):
+            find_lora("nope")
+
+    def test_bai_json_compatible_with_large_arch_only(self) -> None:
+        entry = find_lora("bai-json-large")
+        assert set(entry.compatible_family_ids) == {
+            "florence2-large-ft",
+            "florence2-large",
+        }
+        assert loras_for_family("florence2-large-ft") == (entry,)
+        assert loras_for_family("florence2-promptgen-v2") == ()
+        assert entry.task == "<BAI_JSON>"
+
+    def test_lora_paths_and_urls(self, tmp_path: Path) -> None:
+        entry = find_lora("bai-json-large")
+        assert lora_dir(tmp_path, entry) == tmp_path / "loras" / "bai-json-large"
+        adapter = lora_adapter_path(tmp_path, entry)
+        assert adapter.name == "adapter_model.safetensors"
+        assert adapter.parent == lora_dir(tmp_path, entry)
+        for file in entry.files:
+            assert lora_file_path(tmp_path, entry, file).parent == lora_dir(tmp_path, entry)
+            url = lora_download_url(entry, file)
+            assert url == entry.base_url + file.filename
+            assert url.startswith("https://modelscope.cn/")

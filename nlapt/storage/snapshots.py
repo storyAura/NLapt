@@ -2,9 +2,11 @@
 
 Before any multi-file batch operation, ``SnapshotManager.create`` packs every
 ``*.txt`` under the dataset root (excluding ``.backups/`` and ``.nlapt/``)
-into ``<root>/.backups/YYYY-MM-DD_HHMM_<operation>.zip``. Restore first takes
-a pre-restore snapshot so the restore itself can be undone, and rejects
-zip-slip entries (absolute paths or ``..`` escapes) with SnapshotError.
+into ``<root>/.backups/YYYY-MM-DD_HHMM_<operation>.zip`` by default, or into
+an explicit ``backup_dir`` (the facade uses the per-user dataset state
+folder). Restore first takes a pre-restore snapshot so the restore itself
+can be undone, and rejects zip-slip entries (absolute paths or ``..``
+escapes) with SnapshotError.
 """
 
 from __future__ import annotations
@@ -72,7 +74,13 @@ def _now() -> datetime:
 class SnapshotManager:
     """Create, list, and restore zip snapshots of all caption txts."""
 
-    def __init__(self, root: Path, *, retention: int = DEFAULT_RETENTION) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        retention: int = DEFAULT_RETENTION,
+        backup_dir: Path | None = None,
+    ) -> None:
         base = Path(root)
         if not base.is_dir():
             raise ValidationError(f"snapshot root is not a directory: {base}")
@@ -81,7 +89,11 @@ class SnapshotManager:
         if not isinstance(retention, int) or isinstance(retention, bool) or retention < 1:
             raise ValidationError(f"snapshot retention must be an int >= 1, got {retention!r}")
         self._root = base
-        self._backup_dir = base / BACKUP_DIR_NAME
+        if backup_dir is None:
+            self._backup_dir = base / BACKUP_DIR_NAME
+        else:
+            dest = Path(backup_dir)
+            self._backup_dir = dest if dest.is_absolute() else dest.absolute()
         self._retention = retention
 
     def create(self, operation: str) -> SnapshotInfo:
@@ -100,7 +112,7 @@ class SnapshotManager:
         stamp = _now().replace(second=0, microsecond=0)
         files = _collect_txt_files(self._root)
         try:
-            self._backup_dir.mkdir(exist_ok=True)
+            self._backup_dir.mkdir(parents=True, exist_ok=True)
             target = self._unique_target(stamp, sanitized)
             payload = _build_zip_bytes(files)
             atomic_write_bytes(target, payload)

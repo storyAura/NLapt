@@ -32,7 +32,11 @@ from PySide6.QtWidgets import (
 
 from nlapt.diagnostics import get_logger
 
-from nlapt_gui.widgets.caption_bar import CaptionBar, TranslationPreview
+from nlapt_gui.widgets.caption_bar import (
+    CaptionBar,
+    InlineTranslationPanel,
+    TranslationPreview,
+)
 from nlapt_gui.widgets.chips_editor import ChipsEditor, SegmentEditorBase, resolve_tokens
 from nlapt_gui.widgets.sents_editor import SentsEditor
 from nlapt_gui.widgets.text_editor import TextEditor
@@ -319,7 +323,7 @@ class EditorPanel(QWidget):
         self.setProperty("panel", "true")
 
         column = QVBoxLayout(self)
-        column.setContentsMargins(0, 0, 0, 0)
+        column.setContentsMargins(16, 0, 16, 12)
         column.setSpacing(0)
 
         # -- mode tabs + caption workspace + char/seg info ----------------------------
@@ -372,6 +376,11 @@ class EditorPanel(QWidget):
             lambda _value: self._position_toolbar()
         )
 
+        # -- docked Chinese translation (CaptionBar 译文) --------------------------------
+        self.inline_translation = InlineTranslationPanel(self)
+        self.inline_translation.dismiss_requested.connect(self.inline_translation.clear)
+        column.addWidget(self.inline_translation)
+
         # -- bottom hint line ------------------------------------------------------------
         self._hint = QLabel("", self)
         self._hint.setProperty("muted", "true")
@@ -397,9 +406,11 @@ class EditorPanel(QWidget):
         # refresh) to drop stale segment widgets.
         controller.dataset_opened.connect(lambda _r: self._rebuild(force=True))
         controller.current_changed.connect(lambda _k: self._rebuild())
+        controller.current_changed.connect(lambda _k: self.inline_translation.clear())
         controller.selection_changed.connect(self._rebuild)
         controller.mode_changed.connect(lambda _m: self._rebuild())
         controller.caption_changed.connect(self._on_caption_changed)
+        self.caption_bar.inline_translation_ready.connect(self._on_inline_translation)
         if translate_bridge is not None and hasattr(translate_bridge, "segment_ready"):
             translate_bridge.segment_ready.connect(self._on_segment_ready)
         self._rebuild()
@@ -435,6 +446,14 @@ class EditorPanel(QWidget):
 
     def char_info_text(self) -> str:
         return self._char_info.text()
+
+    def inline_translation_text(self) -> str:
+        return self.inline_translation.current_text()
+
+    def _on_inline_translation(self, key: str, text: str) -> None:
+        if key != self._controller.current_key:
+            return
+        self.inline_translation.show_text(text)
 
     # -- rebuild ------------------------------------------------------------------------------
     def _rebuild(self, *, force: bool = False) -> None:

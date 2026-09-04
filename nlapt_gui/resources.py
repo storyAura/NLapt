@@ -7,20 +7,27 @@ so PyInstaller onedir/onefile builds keep working without code changes.
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
-from nlapt.diagnostics import get_logger
+from nlapt.storage.paths import (
+    ENV_DATA_DIR,
+    UNIX_DIR_NAME,
+    WINDOWS_DIR_NAME,
+    app_state_dir,
+)
 
-_LOGGER = get_logger(__name__)
+# Re-exported so existing callers keep importing these names from resources.
+__all__ = [
+    "CONFIG_FILE_NAME",
+    "ENV_DATA_DIR",
+    "UNIX_DIR_NAME",
+    "WINDOWS_DIR_NAME",
+    "app_data_dir",
+    "config_path",
+    "resource_path",
+]
 
-# Environment override for the data directory (used by tests / portable mode).
-ENV_DATA_DIR = "NLAPT_DATA_DIR"
-# Directory name under %APPDATA% on Windows.
-WINDOWS_DIR_NAME = "NLapt"
-# Directory name under ~/.config on other platforms.
-UNIX_DIR_NAME = "nlapt"
 # File name of the persisted core AppConfig inside the data directory.
 CONFIG_FILE_NAME = "config.json"
 
@@ -45,22 +52,7 @@ def config_path() -> Path:
 def app_data_dir() -> Path:
     """Per-user writable data directory, created on demand.
 
-    ``%APPDATA%/NLapt`` on Windows, ``~/.config/nlapt`` elsewhere. The
-    ``NLAPT_DATA_DIR`` environment variable overrides both (tests and
-    portable installs).
+    Delegates to :func:`nlapt.storage.paths.app_state_dir` so GUI and core
+    share one ``NLAPT_DATA_DIR`` / ``%APPDATA%/NLapt`` resolution.
     """
-    override = os.environ.get(ENV_DATA_DIR, "").strip()
-    if override:
-        target = Path(override)
-    elif sys.platform == "win32":
-        appdata = os.environ.get("APPDATA", "").strip()
-        base = Path(appdata) if appdata else Path.home()
-        target = base / WINDOWS_DIR_NAME
-    else:
-        target = Path.home() / ".config" / UNIX_DIR_NAME
-    try:
-        target.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        _LOGGER.exception("could not create app data dir %s", target)
-        raise
-    return target
+    return app_state_dir()

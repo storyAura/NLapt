@@ -62,6 +62,13 @@ class TestInit:
 
 
 class TestCreate:
+    def test_custom_backup_dir(self, dataset: Path, tmp_path: Path, frozen_now) -> None:
+        dest = tmp_path / "elsewhere" / "backups"
+        info = SnapshotManager(dataset, backup_dir=dest).create("批量替换")
+        assert info.path.parent == dest
+        assert info.file_count == 3
+        assert not (dataset / BACKUP_DIR_NAME).exists()
+
     def test_zip_contains_all_txts_recursively(self, dataset: Path, frozen_now) -> None:
         info = SnapshotManager(dataset).create("批量替换")
         assert info.path.parent == dataset / BACKUP_DIR_NAME

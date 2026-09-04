@@ -14,6 +14,9 @@ from nlapt.core.states import CaptionState
 from nlapt.ops.find_replace import FindReplaceOperation, FindReplaceSpec
 from nlapt.workflow.diff import DiffOp
 
+from nlapt.storage.paths import dataset_state_dir
+from nlapt.storage.session import SESSION_FILE_NAME
+
 from tests.app.conftest import CAPTION_A, CAPTION_B
 
 
@@ -105,6 +108,18 @@ class TestSaving:
         assert set(saved) == {"a.png", "c.png"}
         assert (dataset_root / "c.txt").read_text(encoding="utf-8") == "two"
 
+    def test_export_dataset_zips_images_and_txts(
+        self, app: NLaptApp, dataset_root: Path, tmp_path: Path
+    ) -> None:
+        import zipfile
+
+        dest = tmp_path / "set.zip"
+        count = app.export_dataset(dest)
+        with zipfile.ZipFile(dest) as archive:
+            names = set(archive.namelist())
+        assert names == {"a.png", "a.txt", "b.png", "b.txt", "c.png"}
+        assert count == 5
+
     def test_confirm_saves_and_returns_next_unconfirmed(
         self, app: NLaptApp, dataset_root: Path
     ) -> None:
@@ -122,7 +137,22 @@ class TestSaving:
         app.edit("a.png", "before close")
         app.close()
         assert (dataset_root / "a.txt").read_text(encoding="utf-8") == "before close"
-        assert (dataset_root / ".nlapt" / "session.json").exists()
+        assert (dataset_state_dir(dataset_root) / SESSION_FILE_NAME).exists()
+        assert not (dataset_root / ".nlapt").exists()
+
+    def test_open_migrates_legacy_dataset_dirs(self, tmp_path: Path) -> None:
+        from tests.app.conftest import make_dataset
+
+        root = make_dataset(tmp_path / "legacy")
+        (root / ".backups").mkdir()
+        (root / ".backups" / "old.zip").write_bytes(b"zip")
+        (root / ".nlapt").mkdir()
+        (root / ".nlapt" / SESSION_FILE_NAME).write_text("{}", encoding="utf-8")
+        NLaptApp().open_dataset(root)
+        state = dataset_state_dir(root)
+        assert (state / "backups" / "old.zip").read_bytes() == b"zip"
+        assert not (root / ".backups").exists()
+        assert not (root / ".nlapt").exists()
 
 
 class TestSearchAndScope:

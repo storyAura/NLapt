@@ -1,8 +1,9 @@
 """Offscreen end-to-end smoke: MainWindow + real controller on the demo dataset.
 
 One primary interaction per panel: pick a file (left), switch editor modes,
-edit a chip (middle), run 全部替换 scope=current (right) and toggle the theme
-(title bar) - asserting expected state transitions and zero exceptions.
+edit a chip (middle), run 全部替换 scope=current (tools overlay) and toggle
+the theme from the left rail - asserting expected state transitions and
+zero exceptions.
 Also verifies the packaging reserve: the spec compiles and the ``nlapt-gui``
 entry point resolves.
 """
@@ -85,15 +86,14 @@ class TestEndToEnd:
         assert "sailor suit" in controller.record(K2).text
         assert any("已在 1 个文件中替换" in text for text, _kind in toasts)
 
-    def test_toggle_theme_from_title_bar(self, qtbot, window, controller) -> None:
-        popup = window.title_bar.open_theme_popup()
+    def test_toggle_theme_from_rail(self, qtbot, window, controller) -> None:
+        popup = window.rail.open_theme_popup()
         qtbot.addWidget(popup)
         target = next(row for row in popup.rows() if row.theme_name == "深邃")
         qtbot.mouseClick(target, Qt.MouseButton.LeftButton)
-        assert window.status_bar.theme_label.text() == "主题 · 深邃"
         assert controller.settings.theme == "深邃"
         # Back to the default so later tests see a known state.
-        window.title_bar.theme_actions[DEFAULT_THEME].trigger()
+        window._theme_manager.apply(DEFAULT_THEME)
         assert controller.settings.theme == DEFAULT_THEME
 
     def test_save_flow_after_edits(self, qtbot, window, controller) -> None:

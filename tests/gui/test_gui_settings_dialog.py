@@ -19,7 +19,6 @@ from nlapt_gui.widgets.settings_dialog import (
     TOAST_NEED_BASE_URL,
     TOAST_NEED_TEXT_MODEL,
     TOAST_SAVED,
-    TOAST_TEST_OK,
     WINDOW_TITLE,
     SettingsDialog,
     config_path,
@@ -173,8 +172,13 @@ class TestConnectionProbe:
         dialog = _make_dialog(qtbot, dlg_controller)
         _fill(dialog)
         dialog.test_button.click()
+        # 测速: the success toast reports the measured round-trip seconds.
         qtbot.waitUntil(
-            lambda: (TOAST_TEST_OK, "ok") in dlg_toasts, timeout=2000
+            lambda: any(
+                text.startswith("连接成功(") and text.endswith("秒)") and kind == "ok"
+                for text, kind in dlg_toasts
+            ),
+            timeout=2000,
         )
         assert dialog.test_button.isEnabled()
 

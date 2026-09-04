@@ -51,6 +51,12 @@ from nlapt.llm.base import create_client
 from nlapt.llm.rewrite import RewriteService, RewriteSpec
 from nlapt.llm.translate import TranslationCache, Translator
 from nlapt.ops.base import MatchPreview, TextOperation
+from nlapt.storage.export import export_dataset_zip
+from nlapt.storage.paths import (
+    STATE_BACKUPS_DIR_NAME,
+    dataset_state_dir,
+    migrate_legacy_dataset_state,
+)
 from nlapt.storage.scanner import scan_dataset
 from nlapt.storage.session import SessionSnapshot, SessionStore
 from nlapt.storage.snapshots import RestoreResult, SnapshotManager
@@ -187,9 +193,15 @@ class NLaptApp:
         """
         result = scan_dataset(Path(root))
         self._root = result.root
-        self._snapshots = SnapshotManager(result.root, retention=self._config.snapshot_retention)
-        self._session = SessionStore(result.root)
-        self._checkpoints = CheckpointStore(result.root)
+        state_dir = dataset_state_dir(result.root)
+        migrate_legacy_dataset_state(result.root, state_dir)
+        self._snapshots = SnapshotManager(
+            result.root,
+            retention=self._config.snapshot_retention,
+            backup_dir=state_dir / STATE_BACKUPS_DIR_NAME,
+        )
+        self._session = SessionStore(result.root, state_dir=state_dir)
+        self._checkpoints = CheckpointStore(result.root, state_dir=state_dir)
         self._engine = BatchEngine(
             snapshots=self._snapshots, bus=self.bus, checkpoints=self._checkpoints
         )
@@ -347,6 +359,12 @@ class NLaptApp:
             else:
                 saved.append(key)
         return tuple(saved)
+
+    def export_dataset(self, dest: Path) -> int:
+        """Zip the open dataset's images and existing caption txts to ``dest``."""
+        self._require_dataset()
+        assert self._root is not None
+        return export_dataset_zip(self._root, Path(dest), tuple(self._files.values()))
 
     def token_count(self, key: str) -> int:
         """Estimated CLIP token count of the current caption text (spec 6.5)."""

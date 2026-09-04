@@ -37,6 +37,10 @@ MSG_CONTENT_FILTERED = (
     "请求被服务商内容安全拦截(finish_reason=content_filter),"
     "可重试或调整提示词/图片"
 )
+MSG_EMPTY_COMPLETION = (
+    "服务商返回了空回复(finish_reason={reason})— "
+    "常见于高并发或思考型模型输出预算耗尽,可稍后重试或降低并发"
+)
 
 
 def _image_part(image: bytes) -> dict[str, Any]:
@@ -85,6 +89,12 @@ def _extract_text(data: dict[str, Any]) -> str:
             f"{PROVIDER_NAME} response content has unexpected type "
             f"{type(content).__name__}"
         )
+    if not content.strip():
+        # An HTTP-200 body with empty content (proxies under load, thinking
+        # models exhausting max_tokens on reasoning). LLMRequestError so the
+        # spec-8 retry path treats it as transient instead of writing "".
+        reason = choice.get("finish_reason") if isinstance(choice, dict) else None
+        raise LLMRequestError(MSG_EMPTY_COMPLETION.format(reason=reason))
     return content
 
 

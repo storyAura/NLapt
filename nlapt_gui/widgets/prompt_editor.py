@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -50,6 +51,7 @@ NOTE_SHARED = (
 LABEL_TEMPLATE = "推理提示词模板"
 LABEL_SYSTEM = "系统提示词(推理图片前发送,默认留空)"
 LABEL_USER = "用户提示词(留空使用内置指令)"
+LABEL_LOCAL_BLOCK = "本地推理提示词"
 LABEL_LOCAL_UNIFIED = "本地推理共用上方提示词(统一管线)"
 LABEL_LOCAL_SYSTEM = "本地推理 · 系统提示词"
 LABEL_LOCAL_USER = "本地推理 · 用户提示词(留空使用内置指令)"
@@ -94,7 +96,7 @@ class PromptsTab(QWidget):
         self._loading = False
 
         column = QVBoxLayout(self)
-        column.setSpacing(8)
+        column.setSpacing(10)
 
         # One shared prompt set for every LLM (在线 + 本地) — spec issue 3.
         self.shared_note = self._muted_label(NOTE_SHARED)
@@ -113,12 +115,16 @@ class PromptsTab(QWidget):
         top.addWidget(self.save_template_button)
         self.delete_button = self._button(BUTTON_DELETE, self._on_delete)
         top.addWidget(self.delete_button)
+        self.export_current_button = self._button(BUTTON_EXPORT_CURRENT, self._on_export_current)
+        top.addWidget(self.export_current_button)
+        self.export_all_button = self._button(BUTTON_EXPORT_ALL, self._on_export_all)
+        top.addWidget(self.export_all_button)
         column.addLayout(top)
 
         column.addWidget(self._muted_label(LABEL_SYSTEM))
         self.system_edit = QPlainTextEdit(self)
         self.system_edit.setMinimumHeight(SYSTEM_EDIT_MIN_H)
-        column.addWidget(self.system_edit, 1)
+        column.addWidget(self.system_edit, 3)
         self.hint = QLabel(HINT_DEFAULT_READONLY, self)
         self.hint.setProperty("muted", True)
         self.hint.setWordWrap(True)
@@ -127,8 +133,14 @@ class PromptsTab(QWidget):
         column.addWidget(self._muted_label(LABEL_USER))
         self.user_edit = QPlainTextEdit(self)
         self.user_edit.setMinimumHeight(USER_EDIT_MIN_H)
-        column.addWidget(self.user_edit)
+        column.addWidget(self.user_edit, 2)
 
+        self.local_divider = QFrame(self)
+        self.local_divider.setProperty("divider", True)
+        self.local_divider.setFixedHeight(1)
+        column.addWidget(self.local_divider)
+        self.local_block_label = self._muted_label(LABEL_LOCAL_BLOCK)
+        column.addWidget(self.local_block_label)
         # 本地推理: unified by default, optional separate prompt pair.
         self.local_unified_box = QCheckBox(LABEL_LOCAL_UNIFIED, self)
         self.local_unified_box.toggled.connect(self._sync_local_visibility)
@@ -143,15 +155,6 @@ class PromptsTab(QWidget):
         self.local_user_edit = QPlainTextEdit(self)
         self.local_user_edit.setMinimumHeight(LOCAL_EDIT_MIN_H)
         column.addWidget(self.local_user_edit)
-
-        exports = QHBoxLayout()
-        exports.setSpacing(6)
-        self.export_current_button = self._button(BUTTON_EXPORT_CURRENT, self._on_export_current)
-        exports.addWidget(self.export_current_button)
-        self.export_all_button = self._button(BUTTON_EXPORT_ALL, self._on_export_all)
-        exports.addWidget(self.export_all_button)
-        exports.addStretch(1)
-        column.addLayout(exports)
 
         self._reload_names(select=self._prompts.active)
         self.user_edit.setPlainText(self._prompts.user_prompt)

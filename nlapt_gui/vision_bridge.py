@@ -12,8 +12,13 @@ Two engines produce captions from images:
 Single requests (``request``) power the caption workspace buttons; batch
 requests (``request_batch``) power the file panel's 文件夹推标 and run
 through :meth:`AppController.run_caption_batch` (snapshot + oplog +
-checkpoint). For a local batch that had to start the server, the model is
-unloaded after the WHOLE batch finishes — never between items.
+checkpoint). ``request_custom`` / ``request_layered_batch`` power the
+分层推标 wizard (caller-supplied prompts; final caption = card + blank +
+scene). For local inference that had to start the server, the model is
+NOT unloaded when the run finishes: an idle timer
+(:class:`nlapt_gui.local_bridge.IdleServerStopper`) stops the server only
+after 30s without a new local request, so repeated runs keep the model
+loaded. A user-prestarted server is never auto-stopped.
 
 Prompts come from :mod:`nlapt_gui.prompt_store` (统一管线 by default; the
 local engine may carry its own system/user prompts).
@@ -28,11 +33,17 @@ from PySide6.QtCore import QObject, QThreadPool, Signal
 
 from nlapt.core.errors import NLaptError
 from nlapt.diagnostics import get_logger
+from nlapt.local.catalog import ENGINE_FLORENCE, find_family
 from nlapt.local.settings import load_local_settings
 
 from nlapt_gui.controller import AppController
+from nlapt_gui.layered_prompts import (
+    LAYERED_BATCH_DESCRIPTION_FMT,
+    LAYERED_BATCH_HISTORY,
+    assemble_caption,
+)
 from nlapt_gui.local_bridge import (
-    get_server_manager,
+    get_idle_stopper,
     local_settings_path,
     make_local_vision_captioner,
     resolve_local_target,
@@ -62,6 +73,7 @@ class VisionBridge(QObject):
     """Non-blocking image captioner over the LLM profile or the local model."""
 
     caption_ready = Signal(str, str, bool)  # key, result_or_error, ok
+    custom_ready = Signal(str, str, bool)  # request_id, result_or_error, ok
 
     def __init__(
         self,
@@ -136,11 +148,18 @@ class VisionBridge(QObject):
         prompts = self._prompts()
         system = prompts.system_text_for(engine)
         user_prompt = prompts.user_prompt_for(engine)
+        # 空闲卸载: a new local request cancels any pending idle stop before
+        # the worker touches the server; finishing (re-)arms the window.
+        stopper = get_idle_stopper() if engine == ENGINE_LOCAL else None
+        if stopper is not None:
+            stopper.note_request()
 
         def work() -> str:
             return captioner(image_path, system, user_prompt)
 
         def done(result: object) -> None:
+            if stopper is not None:
+                stopper.note_finished()
             text = result if isinstance(result, str) else ""
             if text.strip():
                 self.caption_ready.emit(key, text, True)
@@ -149,19 +168,131 @@ class VisionBridge(QObject):
                 self.caption_ready.emit(key, "", False)
 
         def failed(message: str) -> None:
+            if stopper is not None:
+                stopper.note_finished()
             _LOGGER.warning("vision caption failed for %r: %s", key, message)
             self.caption_ready.emit(key, message, False)
 
         run_async(self._pool, work, on_done=done, on_error=failed)
+
+    def request_custom(
+        self,
+        request_id: str,
+        key: str,
+        engine: str,
+        *,
+        system: str,
+        user_prompt: str,
+    ) -> bool:
+        """Caption ``key`` with caller-supplied prompts; emit ``custom_ready``.
+
+        Bypasses ``load_vision_prompts``. Used by the 分层推标 wizard to
+        generate character-card candidates. Returns False (and emits a
+        failed ``custom_ready``) when the engine is not ready or the key
+        has no image. Local idle-stopper pairing matches :meth:`request`.
+        """
+        captioner, error = self._make_captioner(engine)
+        if captioner is None:
+            self.custom_ready.emit(request_id, error, False)
+            return False
+        try:
+            image_path = self._controller.image_path(key)
+        except NLaptError as exc:
+            self.custom_ready.emit(request_id, str(exc), False)
+            return False
+        stopper = get_idle_stopper() if engine == ENGINE_LOCAL else None
+        if stopper is not None:
+            stopper.note_request()
+
+        def work() -> str:
+            return captioner(image_path, system, user_prompt)
+
+        def done(result: object) -> None:
+            if stopper is not None:
+                stopper.note_finished()
+            text = result if isinstance(result, str) else ""
+            if text.strip():
+                self.custom_ready.emit(request_id, text, True)
+            else:
+                _LOGGER.error("empty custom vision payload for %r", request_id)
+                self.custom_ready.emit(request_id, "", False)
+
+        def failed(message: str) -> None:
+            if stopper is not None:
+                stopper.note_finished()
+            _LOGGER.warning("custom vision failed for %r: %s", request_id, message)
+            self.custom_ready.emit(request_id, message, False)
+
+        run_async(self._pool, work, on_done=done, on_error=failed)
+        return True
+
+    def request_layered_batch(
+        self,
+        keys: tuple[str, ...],
+        engine: str,
+        *,
+        card_text: str,
+        scene_system: str,
+        scene_user: str,
+    ) -> bool:
+        """Batch-caption ``keys`` as 人物卡 + blank + 画面段.
+
+        Reuses :meth:`AppController.run_caption_batch` so snapshot / progress
+        / cancel / history stay on the existing 推标 path. Returns False
+        (with a warn toast) when the engine is not ready or a batch is
+        already running.
+        """
+        captioner, error = self._make_captioner(engine)
+        if captioner is None:
+            self._controller.toast_requested.emit(error, "warn")
+            return False
+        word = ENGINE_WORDS.get(engine, engine)
+        config = self._controller.app.config
+        if engine == ENGINE_LOCAL:
+            concurrency = load_local_settings(local_settings_path()).parallel
+        else:
+            concurrency = config.request.concurrency
+
+        stopper = get_idle_stopper() if engine == ENGINE_LOCAL else None
+        if stopper is not None:
+            stopper.note_request()
+
+        def caption_one(_key: str, image_path: Path) -> str:
+            scene = captioner(image_path, scene_system, scene_user)
+            return assemble_caption(card_text, scene)
+
+        def finished(_report: object) -> None:
+            if stopper is not None:
+                stopper.note_finished()
+
+        started = self._controller.run_caption_batch(
+            keys,
+            caption_one,
+            description=LAYERED_BATCH_DESCRIPTION_FMT.format(n=len(keys)),
+            history_label=LAYERED_BATCH_HISTORY,
+            engine=engine,
+            concurrency=max(1, concurrency),
+            on_finished=finished,
+        )
+        if not started and stopper is not None:
+            stopper.note_finished()
+        _LOGGER.info(
+            "layered batch %s: %d file(s) via %s",
+            "started" if started else "refused",
+            len(keys),
+            word,
+        )
+        return started
 
     # -- batch request (文件夹推标) ------------------------------------------------------
     def request_batch(self, keys: tuple[str, ...], engine: str = ENGINE_LLM) -> bool:
         """Run 推标 over ``keys`` via the controller's caption batch.
 
         Returns False (with a warn toast) when the engine is not ready or a
-        batch is already running. Local engine: the server is started once,
-        reused for every item, and stopped after the LAST item only if this
-        batch started it (a user-prestarted server is left running).
+        batch is already running. Local engine: the server is started once
+        and reused for every item; after the batch it stays loaded and is
+        stopped by the idle timer only after 30s without a new local run —
+        and only if inference (not the user) started it.
         """
         captioner, error = self._make_captioner(engine)
         if captioner is None:
@@ -178,26 +309,21 @@ class VisionBridge(QObject):
         else:
             concurrency = config.request.concurrency
 
-        manager = get_server_manager()
-        server_was_running = manager.is_running()
+        # 推理完先不卸载: the whole batch counts as one run for the idle
+        # stopper — a pending stop is cancelled now, and the 30s window only
+        # starts once the LAST item finished.
+        stopper = get_idle_stopper() if engine == ENGINE_LOCAL else None
+        if stopper is not None:
+            stopper.note_request()
 
         def caption_one(_key: str, image_path: Path) -> str:
             return captioner(image_path, system, user_prompt)
 
         def finished(_report: object) -> None:
-            # 全部推理完再卸载: unload only after the whole batch, and only
-            # when this batch was the one that loaded the model.
-            if engine == ENGINE_LOCAL and not server_was_running:
-                run_async(
-                    self._pool,
-                    manager.stop,
-                    on_done=lambda _r: None,
-                    on_error=lambda message: _LOGGER.warning(
-                        "post-batch llama-server stop failed: %s", message
-                    ),
-                )
+            if stopper is not None:
+                stopper.note_finished()
 
-        return self._controller.run_caption_batch(
+        started = self._controller.run_caption_batch(
             keys,
             caption_one,
             description=BATCH_DESCRIPTION_FMT.format(word=word, n=len(keys)),
@@ -206,3 +332,23 @@ class VisionBridge(QObject):
             concurrency=max(1, concurrency),
             on_finished=finished,
         )
+        if not started and stopper is not None:
+            stopper.note_finished()  # nothing queued: balance note_request
+        return started
+
+
+def local_engine_is_florence() -> bool:
+    """True when the configured local family is Florence-2 (instruction mode).
+
+    Does not require the weights to be downloaded — the wizard uses this
+    to disable the local engine option, because Florence ignores free-form
+    prompts and cannot run the 分层推标 skills.
+    """
+    settings = load_local_settings(local_settings_path())
+    if not settings.family_id:
+        return False
+    try:
+        family = find_family(settings.family_id)
+    except NLaptError:
+        return False
+    return family.engine == ENGINE_FLORENCE

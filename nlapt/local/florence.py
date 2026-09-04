@@ -29,13 +29,14 @@ import json
 import re
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Protocol
 
 from nlapt.core.errors import LocalInferenceError, ValidationError
 from nlapt.diagnostics import get_logger
+from nlapt.local.lora import MSG_LORA_NO_MATCH, load_adapter, merge_into_onnx
 
 _LOGGER = get_logger(__name__)
 
@@ -53,6 +54,17 @@ REQUIRED_FILES: tuple[str, ...] = (
     FILE_TOKENIZER,
 )
 
+# Which part of the PEFT module tree each ONNX file serves — passed to the
+# LoRA merge as its candidate filter (some exports root node names at the
+# submodule, where a bare ``layers.N`` suffix cannot tell encoder from
+# decoder).
+LORA_MODULE_PREFIXES: dict[str, str] = {
+    FILE_DECODER: "language_model.",
+    FILE_VISION: "vision_tower.",
+    FILE_EMBED: "language_model.",
+    FILE_ENCODER: "language_model.model.encoder.",
+}
+
 # -- task instructions (指令) --------------------------------------------------------
 TASK_GENERATE_TAGS = "<GENERATE_TAGS>"
 TASK_CAPTION = "<CAPTION>"
@@ -61,6 +73,8 @@ TASK_MORE_DETAILED_CAPTION = "<MORE_DETAILED_CAPTION>"
 TASK_ANALYZE = "<ANALYZE>"
 TASK_MIXED_CAPTION = "<MIXED_CAPTION>"
 TASK_MIXED_CAPTION_PLUS = "<MIXED_CAPTION_PLUS>"
+# BAI_JSON LoRA's training 指令 (see the catalog's built-in LoRA entry).
+TASK_BAI_JSON = "<BAI_JSON>"
 
 DEFAULT_FLORENCE_TASK = TASK_GENERATE_TAGS
 
@@ -73,6 +87,7 @@ FLORENCE_TASK_LABELS: dict[str, str] = {
     TASK_ANALYZE: "构图分析",
     TASK_MIXED_CAPTION: "混合标题(描述 + 标签)",
     TASK_MIXED_CAPTION_PLUS: "混合标题 + 构图分析",
+    TASK_BAI_JSON: "JSON 结构化描述(配合 BAI_JSON LoRA)",
 }
 FLORENCE_TASK_TOKENS: tuple[str, ...] = tuple(FLORENCE_TASK_LABELS)
 
@@ -134,6 +149,31 @@ def _require_onnxruntime() -> Any:
     except ImportError as exc:  # pragma: no cover - environment dependent
         raise LocalInferenceError(MSG_MISSING_DEPS) from exc
     return onnxruntime
+
+
+_ort_dlls_preloaded = False
+
+
+def _preload_ort_dlls(ort: Any) -> None:
+    """Load CUDA/cuDNN DLLs from ``nvidia-*`` pip packages before sessions.
+
+    ``onnxruntime-gpu`` lists CUDA as available even when ``cudnn64_9.dll``
+    is missing from PATH; the first Conv then fails with NOT_IMPLEMENTED.
+    ``preload_dlls(directory="")`` picks up
+    ``pip install onnxruntime-gpu[cuda,cudnn]`` site-packages. Missing
+    optional GPU DLLs must not block CPU inference.
+    """
+    global _ort_dlls_preloaded
+    if _ort_dlls_preloaded:
+        return
+    _ort_dlls_preloaded = True
+    preload = getattr(ort, "preload_dlls", None)
+    if not callable(preload):
+        return
+    try:
+        preload(cuda=True, cudnn=True, directory="")
+    except Exception:  # pragma: no cover - environment dependent
+        pass
 
 
 def _require_pillow() -> Any:
@@ -313,14 +353,42 @@ class InferenceSession(Protocol):
     def get_outputs(self) -> Sequence[TensorSpec]: ...
 
 
-SessionFactory = Callable[[str], InferenceSession]
+class SessionFactory(Protocol):
+    """Creates a session for ``path``; called with ``initializers`` (an
+    initializer-name -> numpy-array mapping to override in the graph)
+    only when a LoRA is active, so plain unary callables keep working."""
+
+    def __call__(
+        self, path: str, initializers: Mapping[str, Any] | None = None
+    ) -> InferenceSession: ...
 
 
-def _default_session_factory(path: str) -> InferenceSession:
+def _default_session_factory(
+    path: str, initializers: Mapping[str, Any] | None = None
+) -> InferenceSession:
     ort = _require_onnxruntime()
+    _preload_ort_dlls(ort)
     available = set(ort.get_available_providers())
     providers = [p for p in PREFERRED_PROVIDERS if p in available]
-    return ort.InferenceSession(path, providers=providers or None)
+    options = None
+    keepalive: list[Any] = []
+    if initializers:
+        # Merged LoRA weights replace the baked-in graph constants at
+        # session creation (nothing is written back to the model file).
+        options = ort.SessionOptions()
+        for name, array in initializers.items():
+            value = ort.OrtValue.ortvalue_from_numpy(array)
+            options.add_initializer(name, value)
+            keepalive.append(value)
+    session = ort.InferenceSession(
+        path, sess_options=options, providers=providers or None
+    )
+    if keepalive:
+        # ORT mandates added initializers outlive the session (it keeps raw
+        # pointers into them) — tie the OrtValues to the session object so
+        # both are released together.
+        session.nlapt_lora_keepalive = keepalive
+    return session
 
 
 def _load_pixels(image_path: Path) -> Any:
@@ -356,8 +424,10 @@ class FlorenceEngine:
     """Loads the ONNX pipeline once and captions images until unloaded.
 
     ``files`` maps each :data:`REQUIRED_FILES` basename to its local path.
-    Loading is lazy and serialized; ``caption`` may be called from several
-    worker threads (onnxruntime sessions are thread-safe for ``run``).
+    ``lora_path`` (a PEFT .safetensors file, see :mod:`nlapt.local.lora`)
+    is merged into the session weights while loading. Loading is lazy and
+    serialized; ``caption`` may be called from several worker threads
+    (onnxruntime sessions are thread-safe for ``run``).
     """
 
     def __init__(
@@ -365,6 +435,7 @@ class FlorenceEngine:
         files: Mapping[str, Path],
         *,
         session_factory: SessionFactory | None = None,
+        lora_path: Path | None = None,
     ) -> None:
         missing_keys = [name for name in REQUIRED_FILES if name not in files]
         if missing_keys:
@@ -373,6 +444,9 @@ class FlorenceEngine:
         self._session_factory = (
             session_factory if session_factory is not None else _default_session_factory
         )
+        self._lora_path = Path(lora_path) if lora_path is not None else None
+        # Keeps merged arrays alive for the sessions that reference them.
+        self._lora_overrides: dict[str, Mapping[str, Any]] = {}
         self._lock = threading.Lock()
         self._sessions: dict[str, InferenceSession] = {}
         self._tokenizer: FlorenceTokenizer | None = None
@@ -385,7 +459,12 @@ class FlorenceEngine:
         return self._tokenizer is not None
 
     def load(self) -> None:
-        """Create the four sessions + tokenizer (idempotent, thread-safe)."""
+        """Create the four sessions + tokenizer (idempotent, thread-safe).
+
+        With a LoRA configured, every file's weights are merged before its
+        session is created; a LoRA whose modules match nothing anywhere is
+        rejected (wrong base model) instead of silently running unchanged.
+        """
         with self._lock:
             if self._tokenizer is not None:
                 return
@@ -393,19 +472,56 @@ class FlorenceEngine:
                 if not path.is_file():
                     raise LocalInferenceError(MSG_FILE_MISSING.format(name=name))
             started = time.monotonic()
-            for name in (FILE_VISION, FILE_EMBED, FILE_ENCODER, FILE_DECODER):
-                self._sessions[name] = self._session_factory(str(self._files[name]))
+            try:
+                adapter = (
+                    load_adapter(self._lora_path)
+                    if self._lora_path is not None
+                    else None
+                )
+                matched: set[str] = set()
+                for name in (FILE_VISION, FILE_EMBED, FILE_ENCODER, FILE_DECODER):
+                    path = self._files[name]
+                    if adapter is None:
+                        self._sessions[name] = self._session_factory(str(path))
+                        continue
+                    result = merge_into_onnx(
+                        path, adapter, module_prefix=LORA_MODULE_PREFIXES[name]
+                    )
+                    matched |= result.matched
+                    self._lora_overrides[name] = result.initializers
+                    self._sessions[name] = self._session_factory(
+                        str(path), result.initializers
+                    )
+                if adapter is not None:
+                    if not matched:
+                        raise LocalInferenceError(MSG_LORA_NO_MATCH)
+                    leftover = len(adapter.modules) - len(matched)
+                    if leftover:
+                        _LOGGER.warning(
+                            "lora %s: %d/%d modules had no matching weight",
+                            adapter.path.name,
+                            leftover,
+                            len(adapter.modules),
+                        )
+            except Exception:
+                # Never keep a half-built session set: the next load()
+                # must start from scratch.
+                self._sessions.clear()
+                self._lora_overrides.clear()
+                raise
             self._tokenizer = FlorenceTokenizer.from_file(self._files[FILE_TOKENIZER])
             _LOGGER.info(
-                "florence engine loaded in %.1fs (%s)",
+                "florence engine loaded in %.1fs (%s%s)",
                 time.monotonic() - started,
                 self._files[FILE_DECODER].parent,
+                f", lora={self._lora_path.name}" if self._lora_path else "",
             )
 
     def unload(self) -> None:
         """Drop sessions and tokenizer (memory back to the OS)."""
         with self._lock:
             self._sessions.clear()
+            self._lora_overrides.clear()
             self._tokenizer = None
 
     # -- inference -----------------------------------------------------------------

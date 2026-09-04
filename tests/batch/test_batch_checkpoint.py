@@ -78,6 +78,16 @@ def test_unknown_id_has_empty_completed_set(tmp_path: Path) -> None:
     assert store.has("deadbeef") is False
 
 
+def test_state_dir_writes_outside_dataset(tmp_path: Path) -> None:
+    dest = tmp_path / "state"
+    store = CheckpointStore(tmp_path, state_dir=dest)
+    store.mark("cid", "a.txt")
+    assert (dest / CHECKPOINT_FILE_NAME).is_file()
+    assert not _checkpoint_path(tmp_path).exists()
+    reloaded = CheckpointStore(tmp_path, state_dir=dest)
+    assert reloaded.completed("cid") == frozenset({"a.txt"})
+
+
 def test_mark_persists_and_reloads(tmp_path: Path) -> None:
     cid = make_checkpoint_id("replace", KEYS, PARAMS)
     store = CheckpointStore(tmp_path)

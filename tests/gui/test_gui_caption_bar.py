@@ -10,9 +10,12 @@ from nlapt_gui.widgets.caption_bar import (
     BAR_INFER_BUSY,
     BAR_INFER_LLM,
     BAR_INFER_LOCAL,
+    BAR_QUICK_TRANSLATE,
+    BAR_QUICK_TRANSLATE_BUSY,
     CONFIRM_DELETE_TITLE,
     LABEL_INFERRED_LLM,
     LABEL_INFERRED_LOCAL,
+    QUICK_TARGET_LANG,
     TOAST_DELETED,
     TOAST_EMPTY_CAPTION,
     TOAST_LOCAL_UNCONFIGURED,
@@ -137,6 +140,32 @@ class TestTranslate:
         # A reply for a different (key, text, lang) than the pending request.
         translate.target_ready.emit(KEY, "other text", "zh", "x", True)
         assert not bar.preview.is_active()
+
+    def test_quick_translate_emits_inline_not_preview(
+        self, qtbot, controller
+    ) -> None:
+        translate = StubTranslateBridge()
+        bar = make_bar(qtbot, controller, translate=translate)
+        received: list[tuple[str, str]] = []
+        bar.inline_translation_ready.connect(lambda k, t: received.append((k, t)))
+        source = controller.record(KEY).text.strip()
+        bar.quick_translate_btn.click()
+        assert translate.requests == [(KEY, source, QUICK_TARGET_LANG)]
+        assert bar.quick_translate_btn.text() == BAR_QUICK_TRANSLATE_BUSY
+        translate.target_ready.emit(KEY, source, QUICK_TARGET_LANG, "少女站在樱花树下", True)
+        assert received == [(KEY, "少女站在樱花树下")]
+        assert not bar.preview.is_active()
+        assert controller.record(KEY).text == source
+        assert bar.quick_translate_btn.text() == BAR_QUICK_TRANSLATE
+
+    def test_quick_translate_unconfigured_toasts(
+        self, qtbot, controller, toasts
+    ) -> None:
+        translate = StubTranslateBridge(configured=False)
+        bar = make_bar(qtbot, controller, translate=translate)
+        bar.request_quick_translate()
+        assert (TOAST_TRANSLATE_UNCONFIGURED, "warn") in toasts
+        assert not translate.requests
 
 
 class TestReinfer:

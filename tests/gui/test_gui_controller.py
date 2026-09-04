@@ -14,7 +14,11 @@ from nlapt.llm.base import register_client
 from nlapt.llm.mock import MockLLMClient
 
 from nlapt_gui.controller import FOLDER_ROOT_LABEL, AppController
+from nlapt_gui.layered_prompts import count_words, estimate_tokens
 from nlapt_gui.settings import UISettings
+
+from nlapt.storage.paths import dataset_state_dir
+from nlapt.storage.session import SESSION_FILE_NAME
 
 from tests.gui.conftest import DEMO_CAPTIONS
 
@@ -257,10 +261,26 @@ class TestEditing:
         assert ("没有可撤销的操作", "info") in toasts
         assert controller.record(K2).text == DEMO_CAPTIONS[K2]
 
+    def test_redo_current(self, controller: AppController, toasts) -> None:
+        controller.set_caption(K1, "edited", "编辑")
+        controller.undo_current()
+        controller.redo_current()
+        assert controller.record(K1).text == "edited"
+        assert ("已重做", "info") in toasts
+        assert not controller.can_redo()
+        assert controller.can_undo()
+
+    def test_redo_nothing_to_redo(self, controller: AppController, toasts) -> None:
+        controller.redo_current()
+        assert ("没有可重做的操作", "info") in toasts
+
     def test_segments_and_char_seg_info(self, controller: AppController) -> None:
         assert controller.segments(K3) == ("1girl", "yukata", "fireworks")
         text = DEMO_CAPTIONS[K3]
-        assert controller.char_seg_info(K3) == f"{len(text)} 字符 · 3 段"
+        assert controller.char_seg_info(K3) == (
+            f"{len(text)} 字符 · 3 段"
+            f" · 约 {estimate_tokens(text)} tokens · {count_words(text)} 词"
+        )
 
 
 class TestSaving:
@@ -299,6 +319,33 @@ class TestSaving:
         assert QGuiApplication.clipboard().text() == DEMO_CAPTIONS[K1]
         assert ("已复制标注文本", "ok") in toasts
 
+    def test_export_dataset(
+        self, controller: AppController, toasts, demo_dataset: Path, qtbot, tmp_path
+    ) -> None:
+        dest = tmp_path / "pack.zip"
+        with qtbot.waitSignal(controller.toast_requested, timeout=2000):
+            controller.export_dataset(dest)
+        assert dest.is_file()
+        assert any(text.startswith("已导出") for text, _kind in toasts)
+
+    def test_export_refused_while_batch_in_flight(
+        self, controller: AppController, toasts, tmp_path: Path
+    ) -> None:
+        controller._batch_in_flight = True
+        try:
+            controller.export_dataset(tmp_path / "unused.zip")
+        finally:
+            controller._batch_in_flight = False
+        assert any("正在处理" in text for text, _kind in toasts)
+        assert not (tmp_path / "unused.zip").exists()
+
+    def test_export_without_dataset(self, qtbot, qapp) -> None:
+        ctrl = AppController(NLaptApp(), settings=UISettings())
+        seen: list[tuple[str, str]] = []
+        ctrl.toast_requested.connect(lambda text, kind: seen.append((text, kind)))
+        ctrl.export_dataset(Path("unused.zip"))
+        assert ("请先打开数据集", "warn") in seen
+
 
 class TestModesAndStats:
     def test_mode_change_emits(self, controller: AppController, qtbot) -> None:
@@ -331,6 +378,10 @@ class TestModesAndStats:
         assert meta.startswith("4 × 3 · PNG · ")
         # cached second call
         assert controller.image_meta(K1) is meta
+
+    def test_image_format_and_mtime_label(self, controller: AppController) -> None:
+        assert controller.image_format(K1) == "PNG"
+        assert controller.image_modified_label(K1).startswith("修改于 ")
 
 
 class TestScopesAndBatches:
@@ -482,7 +533,8 @@ class TestClose:
         controller.set_view_mode("list")
         controller.close()
         # crash-safe session written; txt NOT written (explicit-save model)
-        assert (demo_dataset / ".nlapt" / "session.json").exists()
+        assert (dataset_state_dir(demo_dataset) / SESSION_FILE_NAME).exists()
+        assert not (demo_dataset / ".nlapt").exists()
         assert (demo_dataset / "0001.txt").read_text(encoding="utf-8") == DEMO_CAPTIONS[K1]
         from nlapt_gui.settings import load_ui_settings
 

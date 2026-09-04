@@ -40,6 +40,8 @@ _RESIZE_SENSITIVE = (
     "file_panel.py",
     "tools_panel.py",
     "title_bar.py",
+    "toolbar_rail.py",
+    "window_chrome.py",
 )
 
 

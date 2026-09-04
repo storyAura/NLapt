@@ -43,6 +43,39 @@ class TestDefaults:
         assert load_local_settings(target) == LocalSettings()
 
 
+class TestFlorenceLora:
+    def test_defaults_empty(self, tmp_path: Path) -> None:
+        settings = load_local_settings(settings_file(tmp_path))
+        assert settings.florence_lora == ""
+        assert settings.florence_loras == ()
+
+    def test_roundtrip(self, tmp_path: Path) -> None:
+        target = settings_file(tmp_path)
+        original = LocalSettings(
+            florence_lora=str(tmp_path / "bai.safetensors"),
+            florence_loras=(str(tmp_path / "bai.safetensors"), "d:/other.safetensors"),
+        )
+        save_local_settings(target, original)
+        assert load_local_settings(target) == original
+
+    def test_junk_values_tolerated(self, tmp_path: Path) -> None:
+        target = settings_file(tmp_path)
+        target.write_text(
+            '{"florence_lora": 7, "florence_loras": {"not": "a list"}}',
+            encoding="utf-8",
+        )
+        settings = load_local_settings(target)
+        assert settings.florence_lora == "7"
+        assert settings.florence_loras == ()
+
+    def test_non_string_entries_filtered(self, tmp_path: Path) -> None:
+        target = settings_file(tmp_path)
+        target.write_text(
+            '{"florence_loras": ["a.safetensors", 3, "  ", null]}', encoding="utf-8"
+        )
+        assert load_local_settings(target).florence_loras == ("a.safetensors",)
+
+
 class TestRoundtrip:
     def test_save_and_load(self, tmp_path: Path) -> None:
         target = settings_file(tmp_path)

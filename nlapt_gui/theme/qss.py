@@ -103,6 +103,11 @@ QWidget[surfaceCard="true"] {{
     border: 1px solid {t.bd};
     border-radius: 11px;
 }}
+QLabel[sectionTitle="true"] {{
+    font-size: 12px;
+    font-weight: 700;
+    color: {t.text};
+}}
 QLabel {{ background: transparent; }}
 QLabel[muted="true"] {{ color: {t.text3}; }}
 QLabel[secondary="true"] {{ color: {t.text2}; }}

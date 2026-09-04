@@ -1,15 +1,18 @@
-"""Tests for nlapt_gui.widgets.thumbnails (async LRU thumbnail loader)."""
+"""Tests for nlapt_gui.widgets.thumbnails (async LRU + disk thumbnail loader)."""
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 from PySide6.QtGui import QPixmap
 
+from nlapt_gui.resources import app_data_dir
 from nlapt_gui.widgets.thumbnails import (
     HEIGHT_BUCKET_PX,
     THUMB_CACHE_LIMIT,
+    THUMB_DISK_DIR_NAME,
     ThumbnailLoader,
     bucket_height,
 )
@@ -107,3 +110,41 @@ class TestThumbnailLoader:
         loader.clear()
         assert loader.cache_size() == 0
         assert loader.pixmap("k1", 44) is None
+
+
+class TestDiskCache:
+    """加载提速: decoded thumbnails persist across loaders and sessions."""
+
+    def _decode_once(self, qtbot, png: Path) -> None:
+        loader = ThumbnailLoader()
+        with qtbot.waitSignal(loader.ready, timeout=2000):
+            loader.request("k1", png, 44)
+
+    def test_thumbnail_persisted_to_disk(self, qtbot, small_png: Path) -> None:
+        self._decode_once(qtbot, small_png)
+        thumbs = list((app_data_dir() / THUMB_DISK_DIR_NAME).glob("*.png"))
+        assert len(thumbs) == 1
+
+    def test_fresh_loader_serves_from_disk_without_redecoding(
+        self, qtbot, small_png: Path
+    ) -> None:
+        self._decode_once(qtbot, small_png)
+        # Corrupt the ORIGINAL while keeping mtime + size identical: only the
+        # persisted thumbnail can produce a valid image now.
+        stat = small_png.stat()
+        small_png.write_bytes(b"x" * stat.st_size)
+        os.utime(small_png, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        fresh = ThumbnailLoader()
+        with qtbot.waitSignal(fresh.ready, timeout=2000) as blocker:
+            fresh.request("k1", small_png, 44)
+        _key, pix = blocker.args
+        assert not pix.isNull()
+        assert pix.height() == 30  # the cached decode, not the garbage bytes
+
+    def test_changed_file_gets_a_fresh_entry(self, qtbot, small_png: Path) -> None:
+        self._decode_once(qtbot, small_png)
+        _write_png(small_png, (60, 50))  # replaced image: new mtime/size key
+        fresh = ThumbnailLoader()
+        with qtbot.waitSignal(fresh.ready, timeout=2000) as blocker:
+            fresh.request("k1", small_png, 44)
+        assert blocker.args[1].height() == 50

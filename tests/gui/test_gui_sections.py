@@ -29,6 +29,8 @@ from nlapt_gui.widgets.sections.history import (
 )
 from nlapt_gui.widgets.sections.prefix_suffix import PrefixSuffixSection
 from nlapt_gui.widgets.sections.translate import (
+    MODE_SEGMENTS,
+    MODE_WHOLE,
     PENDING_NOTE,
     TOAST_NO_CJK,
     TOAST_SWAPPED,
@@ -302,6 +304,56 @@ class TestTranslateSection:
                 PENDING_NOTE,
                 TRANSLATIONS.get(row.source, "mock-out"),
             )
+
+
+class TestTranslateSectionWholeMode:
+    """整段对照: the whole caption is one compare unit."""
+
+    FULL_TEXT = "1girl, solo, long hair, 少女站在樱花树下。masterpiece"
+
+    def make_whole(self, qtbot, tr_controller) -> TranslateSection:
+        section = TranslateSection(tr_controller)
+        qtbot.addWidget(section)
+        section.mode_bar.set_current(MODE_WHOLE)
+        return section
+
+    def test_whole_mode_shows_one_row_with_full_caption(
+        self, qtbot, tr_controller
+    ) -> None:
+        section = self.make_whole(qtbot, tr_controller)
+        assert section.whole_mode
+        rows = section.rows()
+        assert [row.source for row in rows] == [self.FULL_TEXT]
+
+    def test_switch_back_restores_segment_rows(self, qtbot, tr_controller) -> None:
+        section = self.make_whole(qtbot, tr_controller)
+        section.mode_bar.set_current(MODE_SEGMENTS)
+        assert not section.whole_mode
+        assert len(section.rows()) == 4
+
+    def test_whole_swap_replaces_entire_caption(
+        self, qtbot, tr_controller, tr_toasts
+    ) -> None:
+        section = self.make_whole(qtbot, tr_controller)
+        section.set_live(True)
+        qtbot.waitUntil(
+            lambda: all(row.ready for row in section.rows()), timeout=2000
+        )
+        section.rows()[0].swap_button.click()
+        # The mock maps the full caption (contains "1girl") to 一个女孩.
+        assert tr_controller.record("0001.png").text == "一个女孩"
+        assert tr_controller.history.entries("0001.png")[0].label == "翻译替换"
+        assert (TOAST_SWAPPED, "info") in tr_toasts
+
+    def test_whole_mode_translate_all_commits_one_unit(
+        self, qtbot, tr_controller, tr_toasts
+    ) -> None:
+        section = self.make_whole(qtbot, tr_controller)
+        with qtbot.waitSignal(section.bridge.all_done, timeout=2000):
+            section.all_en_button.click()
+        assert tr_controller.record("0001.png").text == "一个女孩"
+        assert ("已将 1 个中文片段转为英文", "ok") in tr_toasts
+        assert section.mode_bar.isEnabled()  # unlocked after the batch
 
 
 class TestHistorySection:

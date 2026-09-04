@@ -975,3 +975,215 @@ JoyCaption / ToriiGate 这类模型自带官方预设,需要全部补上。
    `resolve_preset(family_id, settings.prompt_preset)` 用预设的
    system/user 覆盖传入提示词;`PRESET_CUSTOM` 沿用 设置 ▸ 提示词。
    云端 LLM 引擎与 Florence 不受影响。
+
+## v1.11 — 空闲 30 秒再卸载、缩略图磁盘缓存、整段对照、目录树扁平化
+
+User request: 本地推理经常连续跑好几轮,推理一结束就卸载模型导致每轮都
+重新加载数 GB 权重 — 改为 30 秒内无新请求才卸载;左侧预览图加载很慢;
+翻译对照按逗号切段翻译长句效果差,需要整段对照;目录树里单模型也要
+展开两层;右栏底部说明文字无用;测试连接对思考型模型必失败,高并发
+推标容易拿到空回复。
+
+1. **空闲自动卸载(先不卸载,30 秒后再卸载)**:`local_bridge` 新增
+   `IdleServerStopper`(`IDLE_STOP_DELAY_SECONDS = 30.0`,进程级单例
+   `get_idle_stopper()`,绑定共享 server manager)。
+   `note_request()`/`note_finished()` 成对包住每一次本地推理(单张与
+   整个批次各算一次):请求开始先取消挂起的停止计时器,并在服务未运行
+   时记下「本次是推理拉起的」;全部在飞请求结束且服务确为推理拉起时,
+   armed 一个 `threading.Timer`(daemon,`timer_factory` 可注入),
+   到点才 `manager.stop()`。`note_user_control()`(用户点 启动/停止
+   本地服务 时由 `LocalBridge.start_server`/`stop_server` 调用)取消
+   计时并清除 auto 标记 — 用户手动启动的服务永不被自动卸载。
+   `vision_bridge` 不再在批量结束时立即 `manager.stop()`(原
+   `server_was_running` 判定删除),单张本地推理同样参与空闲窗口。
+2. **缩略图磁盘缓存(预览加载提速)**:`ThumbnailLoader` 在内存 LRU 外
+   增加持久缓存 `app_data_dir()/thumbs`(`THUMB_DISK_DIR_NAME`,构造
+   参数 `disk_cache_dir` 可注入)。键 = 源路径 + mtime_ns + size +
+   bucket 高度的 SHA1,值为缩好的 PNG:大 PNG 缩到 64px 仍要整幅解码,
+   有了磁盘缓存后 refresh 与后续会话直接读小图。`clear()` 只清内存
+   (磁盘缓存保留,刷新数据集秒开);替换过的图片因 mtime/size 变化
+   自然换新键,旧条目不清理(体积极小)。回调补了
+   `shiboken6.isValid(self)` 守卫 — 加载器销毁后迟到的解码结果不再
+   触发 "Signal source has been deleted"。
+3. **翻译对照 整段模式**:`TranslateSection` 顶部新增 对照方式
+   分段/整段 `SegmentedBar`(`MODE_SEGMENTS`/`MODE_WHOLE`,属性
+   `whole_mode`)。整段模式下整篇标注是唯一一行(`_sources_for`),
+   ⇄ 替换整篇(`set_caption`,标签仍为 翻译替换);中文全部转为英文
+   在整段模式按整篇翻译、每文件提交一次(`_commit_results` 按模式
+   分流);批次进行中 mode_bar 禁用,防止中途切换用错单元形状。
+   翻译缓存仍按文本哈希共享,整篇文本只是另一个键。
+4. **目录树扁平化(单模型不分层)**:`LocalTab._populate_tree` 折叠
+   单子链 — 只有一个家族的系列不再出系列行(家族顶格),只有一个
+   量化档的家族自身就是可选量化行(合并行带体积/热度/评级,同时携带
+   ROLE_FAMILY + ROLE_QUANT;单档不再显示 ★推荐)。Florence-2 从三层
+   变一行,ToriiGate/JoyCaption 变两层。`_quant_items()` 改为任意深度
+   递归收集(判据:携带 ROLE_QUANT),`_select_quant_item` 与
+   `current_selection()` 不变。
+5. **移除右栏底部说明**:`SERVER_HINT` 常量与 `server_hint` QLabel
+   删除(内容与实际操作重复,占空间)。
+6. **测试连接测速 + 空回复修复(GUI 侧)**:设置页 测试连接 成功 toast
+   变为 `连接成功({seconds:.1f} 秒)`(`probe` 返回 monotonic 耗时)。
+   配合核心 v1.10 addendum(空回复抛可重试错误、
+   `CONNECTION_TEST_MAX_TOKENS` 1024),思考型模型的测试不再必失败,
+   高并发下的空回复走指数退避重试。`make_local_vision_captioner` 的
+   llama 分支现在也包 `with_retry(RetryPolicy())` — 本地并发槽位繁忙
+   或空回复同样重试(v1.10 曾因 300 s 超时顾虑不加;空回复是即时
+   失败,重试代价低)。
+
+## v1.12 — Florence LoRA 选择(设置 ▸ 本地推理)
+
+1. **LoRA 行(仅 Florence 家族显示)**:`LocalTab` 在 指令模式 下新增
+   「LoRA」行 — `florence_lora_combo`(首项固定为 `LORA_NONE_LABEL`
+   「不使用 LoRA」,data=""; 其余项 data=safetensors 绝对路径,显示
+   文件名 stem)+ 添加 / 移除按钮(`_add_lora` 打开
+   `QFileDialog.getOpenFileName`,过滤 `*.safetensors`,去重后选中;
+   `_remove_lora` 只移除非首项)。行可见性与 `florence_task_combo`
+   同步(`florence_lora_holder`,选中非 Florence 或无选择时隐藏)。
+   `persist()` 写入 `florence_lora`(当前选中,"" = 不使用)与
+   `florence_loras`(全部已注册路径);预填时未注册但被选中的路径会
+   自动补进下拉框。
+2. **桥接**:`get_florence_engine(files, lora_path=None)` — 缓存键
+   加入 LoRA 标识(路径 + mtime_ns + size,重新训练同名文件会自动
+   重建引擎);`make_local_vision_captioner` 的 Florence 分支读取
+   `settings.florence_lora`,非空则先做存在性检查(缺失 →
+   `LocalInferenceError`,复用 `nlapt.local.lora.MSG_LORA_FILE_MISSING`
+   的可操作文案),再把 `Path` 传给引擎。合并/兼容性错误(架构不匹配、
+   零命中等)由核心层在加载时抛出,经既有推理错误链路展示给用户。
+3. **约束**:LoRA 必须与当前 ONNX 模型同架构(现有目录中的
+   Florence-2 PromptGen v2.0 实为 base 0.23B,隐藏维度 768);基于
+   large(1024 维)训练的 LoRA(如 ModelScope 的 BAI_JSON LoRA)会
+   得到明确的架构不匹配报错 — large 架构的 PromptGen ONNX 导出在
+   快照时间点尚不存在,无法入目录。
+
+## v1.13 — 官方 Florence-2 家族 + 内置 LoRA 下载
+
+1. **内置 LoRA 展示与下载**:`_rebuild_lora_combo(family)` 组装 LoRA 下拉:
+   固定首项「不使用 LoRA」+ 所选家族兼容的内置 LoRA(`loras_for_family`;
+   data=主目录内 `loras/<id>/adapter_model.safetensors` 绝对路径,
+   `ROLE_LORA_ID` 角色存 lora_id,ToolTip 显示 notes,未下载时名称追加
+   `LORA_MISSING_SUFFIX`「(未下载)」)+ 用户自选文件(`self._user_loras`,
+   持久化到 `florence_loras`;内置项不写入该字段)。选中未下载的内置项时
+   显示「下载」按钮(`lora_download_button`)→
+   `LocalBridge.start_lora_download(lora_id)`;完成后 toast
+   `TOAST_LORA_OK` 并刷新(去掉未下载后缀)。内置项不可移除
+   (`_remove_lora` 对带 `ROLE_LORA_ID` 的项不动作)。选中带 `task` 的
+   内置 LoRA 会自动把 指令模式 切到该 指令(BAI_JSON → `<BAI_JSON>`)。
+2. **指令按家族过滤**:`_rebuild_task_combo(family)` 只列出
+   `family.florence_tasks`(官方家族看不到 PromptGen 专属指令;PromptGen
+   看不到 `<BAI_JSON>`),切家族时保留仍合法的当前选择,否则回退第一项;
+   `make_local_vision_captioner` 在推理侧同样钳制(设置文件被手改也安全)。
+3. **桥接下载管道复用**:`LocalBridge._launch_jobs(family_id, quant_label,
+   jobs, runtime_asset)` 是从 `start_download` 提取的共用执行器(单任务
+   槽位 + 进度节流 + hub 广播不变);`start_lora_download` 用哨兵
+   family_id `LORA_FAMILY_PREFIX + lora_id`(`"lora:"` 前缀)与空 quant
+   走同一管道,LoRA 文件按 pinned 大小 + SHA256 校验,已存在即刻发
+   OK。新增 `lora_adapter_file(entry)` / `is_lora_downloaded(entry)`
+   (module 级 `is_lora_downloaded_in`,只查主目录 — LoRA 体积小,不进
+   复用目录机制)。`_on_download_finished` 对 `lora:` 前缀走专属 toast,
+   不再误入 `find_family`。
+4. **目录树**:Florence 系列现有 5 个家族,系列节点恢复(此前单家族被
+   扁平化到顶层);相关结构测试同步更新。
+
+## v1.14 — 原型骨架接到现有功能(轨 + 两栏 + 工具浮层)
+
+`nlapt-prototype/` 只当视觉规格,不进运行时、不进 PyInstaller。继续走
+`AppController` + 现有 bridge;不嵌 WebEngine。
+
+1. **主窗装配**:`QHBox(ToolbarRail 44px, body_splitter)`。splitter 两栏
+   (文件 | 预览+编辑)。标题栏与状态栏不再挂到 `MainWindow`;
+   `TitleBar` / `StatusBar` 模块保留,单测仍可直接实例化。
+   `body_splitter.json` 从 3 个数迁到 2 个数(旧档取 left,丢掉 right)。
+2. **窗控搬家**:`window_chrome.py` 抽出 `WindowButton` / `ThemePopup` /
+   `WindowDragHelper`。预览 46px 信息栏承担拖窗、双击最大化、─ □ ×。
+   轨空白也可 `startSystemMove`。边缘缩放仍在 `MainWindow`。
+3. **ToolbarRail**:打开 / 保存 / 全部保存 / 导出 / 撤销 / 重做 /
+   修改工具 / 主题 / 设置;Logo 菜单(使用说明 / 关于 / 退出)。
+   主题弹层仍是五套 + 色彩设置,不是亮暗对切。
+4. **ToolsPanel 浮层**:轨「修改工具」开关,右侧 340px 覆盖中栏,默认隐;
+   Esc 收起。四张卡片不重写。动画只用几何 / `windowOpacity`。
+5. **信息栏**:文件名 + 格式胶囊 + `宽 × 高` / 大小 / `修改于 yyyy-mm-dd`
+   + 窗控。撤销 / 复制 / 保存从预览顶栏撤走(复制改快捷键 + 文件右键)。
+   多选对比、CaptionBar、文件夹推标、未保存黄点全部保留。
+6. **重做**:`FileHistory.step_newer` + `AppController.redo_current`
+   (`Ctrl+Y` / `Ctrl+Shift+Z`)。走 UI 历史光标,不是 `NLaptApp.redo`。
+7. **导出**:`MainWindow.export_dataset` → 未打开 toast;有脏文件则确认
+   「先全部保存再打包」; `QFileDialog` 选目标; worker 调
+   `AppController.export_dataset(dest, save_first=...)`。
+8. **文件栏默认宽 260 / 最小 200**。最小窗仍 1360×760。
+
+## v1.15 — 修改工具抽屉滑入/滑出
+
+轨「修改工具」开关仍是右侧 340px 覆盖层 + Esc 收起。打开/关闭改为
+`nlapt_gui.anim.slide_geometry` 纯 geometry 滑动(屏外 → 右缘 / 右缘 → 屏外),
+不用 `QGraphicsOpacityEffect`。`animations_enabled()` 为假时同步落到终态
+(测试契约不变)。窗口 resize 时把进行中的滑动跳到终态再贴新右缘;关闭滑动
+的 `finished` 才 `hide()`,且只在该动画仍是当前抽屉动画时生效,避免连点
+互打误藏。
+
+## v1.16 — 工具抽屉避开预览顶栏窗控
+
+抽屉不再铺满窗高:停靠矩形从 `HEADER_H`(46px 预览信息栏)下沿起,高度
+`window.height - HEADER_H`。预览顶栏的 ─ □ × 始终露在抽屉上方,可点。
+屏外起点仍是该矩形右移 340px。
+
+## v1.17 — 胶囊 FLIP / 预览去闪 / 折叠门控 / 本地推理卡片
+
+1. **胶囊拖拽**:`ChipsEditor._rebuild` 做 FLIP(`anim.animate_reflow` /
+   `flip_reflow`),按段文本+出现序号对齐旧几何;被拖放的胶囊 `pop_in`。
+   测试禁用动画时同步落终态。
+2. **预览切图**:未命中缓存时保留上一张,解码完成再淡入;数据集切换仍清空。
+   `_start_fade` 经 `animations_enabled()` 门控。
+3. **合集折叠**:`_FolderGroup.set_open` / `_Arrow.animate_to` 经同一门控,
+   重入先 stop 旧动画。
+4. **布局**:提示词页系统/用户框 3:2 stretch,导出并入模板行,本地区块分隔;
+   文件列表头行间距统一;`SettingsDialog` 表单 label 最小宽与间距统一。
+5. **本地推理右栏**:四张 `surfaceCard`(模型状态 / 模型设置 / 运行参数 / 目录),
+   构建抽出 `local_tab_sections.py`;属性名与中文文案不变。
+
+## v1.18 — 分层推标(人物卡 + 画面描述)
+
+Two-stage caption workflow. Final txt = locked English character card + blank
+line + per-image pose/scene paragraph. Core `nlapt/` unchanged; batch write
+reuses `AppController.run_caption_batch` (v1.7 snapshot / oplog / progress).
+
+1. **Skills** (`nlapt_gui/layered_prompts.py`): `CHARACTER_CARD_PROMPT` /
+   `POSE_SCENE_PROMPT`; `build_card_prompt(name, series, *, variant)`,
+   `build_scene_prompt(name)`, `assemble_caption(card, scene)`. Scene system
+   prompt is the user's existing 提示词 template (`VisionPrompts.system_text_for`);
+   the scene skill is the user message. History label `分层推标`.
+2. **Memory** (`nlapt_gui/layered_store.py`): `LayeredMemory` at
+   `app_data_dir()/layered_infer.json` (name / series / last card).
+3. **VisionBridge**: `custom_ready(request_id, text, ok)`;
+   `request_custom(request_id, key, engine, *, system, user_prompt)`;
+   `request_layered_batch(keys, engine, *, card_text, scene_system, scene_user)`;
+   `local_engine_is_florence()` (no download required). Florence local engine
+   cannot run free-form skills — the wizard disables 本地模型.
+4. **Wizard** (`widgets/layered_infer_dialog.py` + `layered_infer_cards.py`):
+   `CenteredDialog` / `QStackedWidget` — role (name, series, engine, clickable
+   `RefPickerGrid` strip + `PreviewPane` that scales with the dialog) → three
+   bilingual candidates (editable EN, review-only ZH via
+   `TranslateBridge.request_to`, live `约 N tokens · M 词` stats) → confirm
+   (same stats on the locked card and the scene-prompt preview). Confirm calls
+   `request_layered_batch` and closes; `BatchProgressDialog` takes over.
+   Token counts are a `len//4` heuristic (`format_card_stats`); no tokenizer.
+5. **FilePanel**: `layered_infer_requested(keys)` plus scoped menu entries
+   (`分层推标此文件夹/已选/全部/这张图片` and unlabeled variants). Labels and
+   scope wiring live in `widgets/file_panel_infer.py`. No `ask_confirm` on
+   this path (wizard page 3 confirms). `MainWindow` opens
+   `LayeredInferDialog`. Batch-running menus still only offer `取消当前推标`.
+
+## v1.19 — 底部常驻译文 + token/词统计
+
+1. **CaptionBar**: `删除` is followed by `译文`. That button translates the
+   whole current caption to Chinese via `TranslateBridge.request_to(..., "zh")`
+   and emits `inline_translation_ready(key, result)` — no overlay, no replace.
+   The existing `翻译 ▾` menu (floating `TranslationPreview` + 替换) is unchanged.
+   `InlineTranslationPanel` is the read-only docked card (title `译文(中文)`,
+   selectable text, 关闭).
+2. **EditorPanel**: the panel sits under the editor blocks and above the mode
+   hint. `current_changed` / 关闭 clears it. Switching files never leaves a
+   stale translation visible.
+3. **AppController.char_seg_info**:
+   `{n} 字符 · {m} 段 · 约 {t} tokens · {w} 词`
+   using `layered_prompts.estimate_tokens` / `count_words` (`len//4` heuristic).
+   Tab-row `_char_info` and per-block `_stat` follow automatically.

@@ -1,9 +1,9 @@
-"""MainWindow - frameless assembly of the whole CaptionForge layout.
+"""MainWindow - frameless assembly of the prototype rail + two-column body.
 
-Structure (per design): 40px title bar / three columns (file panel |
-preview + splitter + editor | tools panel) held in a horizontal
-:class:`QSplitter` with two draggable dividers / 26px status bar, plus the
-toast overlay.
+Structure (v1.14): 44px left icon rail | file list | preview + editor.
+The old title bar and status bar are gone; window drag / ─ □ × live on the
+preview info bar. The tools panel is a right-edge overlay toggled from the
+rail.
 
 Window resizing uses Qt's cross-platform ``startSystemResize``: hovering near
 an edge shows a resize cursor and pressing there starts the OS resize loop.
@@ -24,6 +24,7 @@ from PySide6.QtCore import (
     QObject,
     QPoint,
     QPropertyAnimation,
+    QRect,
     Qt,
 )
 from PySide6.QtGui import (
@@ -38,6 +39,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
+    QHBoxLayout,
     QLineEdit,
     QPlainTextEdit,
     QSplitter,
@@ -50,7 +52,7 @@ from nlapt.diagnostics import get_logger
 from nlapt.storage.atomic import atomic_write_text
 
 from nlapt_gui import anim
-from nlapt_gui.controller import AppController
+from nlapt_gui.controller import TOAST_NO_DATASET, TOAST_WARN, AppController
 from nlapt_gui.resources import app_data_dir
 from nlapt_gui.theme.logo import load_app_icon
 from nlapt_gui.theme.manager import ThemeManager
@@ -59,12 +61,13 @@ from nlapt_gui.translate_bridge import TranslateBridge
 from nlapt_gui.vision_bridge import VisionBridge
 from nlapt_gui.widgets.batch_progress_dialog import BatchProgressDialog
 from nlapt_gui.widgets.color_dialog import ColorSettingsDialog
+from nlapt_gui.widgets.dialogs import ask_confirm
 from nlapt_gui.widgets.editor_panel import EditorPanel
 from nlapt_gui.widgets.file_panel import FilePanel
-from nlapt_gui.widgets.preview_panel import PreviewPanel, SplitterHandle
-from nlapt_gui.widgets.status_bar import StatusBar
-from nlapt_gui.widgets.title_bar import TitleBar
+from nlapt_gui.widgets.layered_infer_dialog import LayeredInferDialog
+from nlapt_gui.widgets.preview_panel import HEADER_H, PreviewPanel, SplitterHandle
 from nlapt_gui.widgets.toast import ToastOverlay
+from nlapt_gui.widgets.toolbar_rail import ToolbarRail
 from nlapt_gui.widgets.tools_panel import ToolsPanel
 
 _LOGGER = get_logger(__name__)
@@ -75,14 +78,20 @@ EDGE_MARGIN_PX = 8
 
 WINDOW_TITLE = "NLapt"
 OPEN_FOLDER_CAPTION = "打开数据集文件夹"
+EXPORT_CAPTION = "导出数据集"
+EXPORT_FILTER = "ZIP (*.zip)"
+EXPORT_DIRTY_TITLE = "导出数据集"
+EXPORT_DIRTY_TEXT = (
+    "有未保存的标注。导出只打包磁盘上的文件。是否先全部保存再导出？"
+)
 
 # Body splitter: thin themed handle + default / min / max panel widths.
 SPLITTER_HANDLE_W = 4
-FILE_PANEL_DEFAULT_W = 300
+FILE_PANEL_DEFAULT_W = 260
 TOOLS_PANEL_DEFAULT_W = 340
 MIDDLE_DEFAULT_W = 760
 MIDDLE_MIN_W = 360
-PANEL_MIN_W = 240
+PANEL_MIN_W = 200
 PANEL_MAX_W = 16_777_215  # Qt QWIDGETSIZE_MAX - "large value" per contract
 SPLITTER_SIZES_FILE = "body_splitter.json"
 
@@ -125,13 +134,16 @@ def load_splitter_sizes(path: Path | None = None) -> list[int] | None:
     except (OSError, ValueError) as exc:
         _LOGGER.warning("corrupt splitter sizes %s (%s); ignoring", target, exc)
         return None
-    if (
-        not isinstance(data, list)
-        or len(data) != 3
-        or not all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in data)
+    if not isinstance(data, list) or not all(
+        isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in data
     ):
         return None
-    return [int(v) for v in data]
+    if len(data) == 2:
+        return [int(v) for v in data]
+    if len(data) == 3:
+        # v1.13 three-column file: keep the left width, drop the tools column.
+        return [int(data[0]), int(data[1])]
+    return None
 
 
 def save_splitter_sizes(sizes: list[int], path: Path | None = None) -> None:
@@ -142,36 +154,36 @@ def save_splitter_sizes(sizes: list[int], path: Path | None = None) -> None:
 
 
 class _BodySplitter(QSplitter):
-    """Horizontal 3-pane splitter that pins exact side widths on first layout.
+    """Horizontal 2-pane splitter that pins the file-panel width on first layout.
 
     ``QSplitter.setSizes`` scales the requested sizes proportionally when their
     sum differs from the current width, so it cannot guarantee an exact initial
-    side-panel width. This subclass records the desired left/right widths and
-    applies them (middle absorbs the remainder) on the first layout wide enough
-    to honour them, then leaves the panes fully user-draggable.
+    side-panel width. This subclass records the desired left width and applies
+    it (middle absorbs the remainder) on the first layout wide enough to honour
+    it, then leaves the panes fully user-draggable.
     """
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(Qt.Orientation.Horizontal, parent)
-        self._pending: tuple[int, int] | None = None
+        self._pending_left: int | None = None
 
-    def set_initial_side_widths(self, left: int, right: int) -> None:
-        """Request exact left/right pane widths for the first valid layout."""
-        self._pending = (left, right)
+    def set_initial_side_widths(self, left: int, _right: int = 0) -> None:
+        """Request an exact left pane width for the first valid layout."""
+        self._pending_left = left
 
     def _handles_width(self) -> int:
         return self.handleWidth() * max(0, self.count() - 1)
 
     def resizeEvent(self, event: QResizeEvent) -> None:  # noqa: N802 - Qt override
         super().resizeEvent(event)
-        if self._pending is None or self.count() != 3:
+        if self._pending_left is None or self.count() != 2:
             return
-        left, right = self._pending
-        needed = left + right + self._handles_width() + PANEL_MIN_W
+        left = self._pending_left
+        needed = left + self._handles_width() + MIDDLE_MIN_W
         if self.width() >= needed:
-            middle = self.width() - left - right - self._handles_width()
-            self.setSizes([left, middle, right])
-            self._pending = None
+            middle = self.width() - left - self._handles_width()
+            self.setSizes([left, middle])
+            self._pending_left = None
 
 
 class MainWindow(QWidget):
@@ -202,7 +214,7 @@ class MainWindow(QWidget):
         self.translate_bridge = TranslateBridge(controller, parent=self)
         self.vision_bridge = VisionBridge(controller, parent=self)
 
-        self.title_bar = TitleBar(controller, theme_manager, self)
+        self.rail = ToolbarRail(controller, theme_manager, self)
         self.file_panel = FilePanel(controller, tokens=theme_manager.tokens, parent=self)
         self.preview_panel = PreviewPanel(controller, tokens=theme_manager.tokens, parent=self)
         self.splitter = SplitterHandle(controller, tokens=theme_manager.tokens, parent=self)
@@ -210,14 +222,14 @@ class MainWindow(QWidget):
             controller, self.translate_bridge, self, vision_bridge=self.vision_bridge
         )
         self.tools_panel = ToolsPanel(controller, self)
-        self.status_bar = StatusBar(controller, theme_manager, self)
+        self.tools_panel.setAutoFillBackground(True)
+        self.tools_panel.hide()
 
-        root = QVBoxLayout(self)
+        root = QHBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
-        root.addWidget(self.title_bar)
+        root.addWidget(self.rail)
         root.addWidget(self._build_body(), 1)
-        root.addWidget(self.status_bar)
 
         self.toast_overlay = ToastOverlay(self, tokens=theme_manager.tokens)
         controller.toast_requested.connect(self.toast_overlay.show_toast)
@@ -236,9 +248,13 @@ class MainWindow(QWidget):
         self.file_panel.infer_requested.connect(
             lambda keys, engine: self.vision_bridge.request_batch(tuple(keys), engine)
         )
-        self.title_bar.open_folder_requested.connect(self.pick_folder)
-        self.title_bar.settings_requested.connect(self.tools_panel.open_settings_dialog)
-        self.title_bar.colors_requested.connect(self.open_color_settings)
+        self.file_panel.layered_infer_requested.connect(self._open_layered_infer)
+        self._layered_dialog: LayeredInferDialog | None = None
+        self.rail.open_folder_requested.connect(self.pick_folder)
+        self.rail.settings_requested.connect(self.tools_panel.open_settings_dialog)
+        self.rail.colors_requested.connect(self.open_color_settings)
+        self.rail.export_requested.connect(self.export_dataset)
+        self.rail.tools_toggled.connect(self.set_tools_open)
 
         theme_manager.theme_changed.connect(self._on_theme_changed)
         self._install_shortcuts()
@@ -248,6 +264,8 @@ class MainWindow(QWidget):
         self._fade_anim: QPropertyAnimation | None = None
         self._state_anim: QPropertyAnimation | None = None
         self._close_fade_done = False
+        self._tools_anim: QPropertyAnimation | None = None
+        self._tools_want_open = False
 
         app = QApplication.instance()
         if app is not None:
@@ -255,7 +273,7 @@ class MainWindow(QWidget):
 
     # -- body assembly -----------------------------------------------------------------
     def _build_body(self) -> QSplitter:
-        """Three columns in a horizontal QSplitter with two draggable dividers."""
+        """File list + preview/editor in a horizontal QSplitter."""
         middle = QWidget(self)
         middle_lay = QVBoxLayout(middle)
         middle_lay.setContentsMargins(0, 0, 0, 0)
@@ -274,26 +292,19 @@ class MainWindow(QWidget):
         splitter.setHandleWidth(SPLITTER_HANDLE_W)
         splitter.addWidget(self.file_panel)
         splitter.addWidget(middle)
-        splitter.addWidget(self.tools_panel)
 
-        # The panels lock their own width in their constructors; release that
-        # lock so the splitter can resize them (contract 3.1).
-        for panel in (self.file_panel, self.tools_panel):
-            panel.setMinimumWidth(PANEL_MIN_W)
-            panel.setMaximumWidth(PANEL_MAX_W)
+        # The file panel locks its own width in the constructor; release that
+        # lock so the splitter can resize it (contract 3.1).
+        self.file_panel.setMinimumWidth(PANEL_MIN_W)
+        self.file_panel.setMaximumWidth(PANEL_MAX_W)
 
-        # Only the middle column stretches; the side panels keep their sizes.
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setStretchFactor(2, 0)
 
         saved = load_splitter_sizes(self._splitter_sizes_path)
-        if saved is not None:
-            left, _mid, right = saved
-        else:
-            left, right = FILE_PANEL_DEFAULT_W, TOOLS_PANEL_DEFAULT_W
-        splitter.setSizes([left, MIDDLE_DEFAULT_W, right])
-        splitter.set_initial_side_widths(left, right)
+        left = saved[0] if saved is not None else FILE_PANEL_DEFAULT_W
+        splitter.setSizes([left, MIDDLE_DEFAULT_W])
+        splitter.set_initial_side_widths(left)
         splitter.splitterMoved.connect(self._on_splitter_moved)
 
         self.body_splitter = splitter
@@ -312,7 +323,7 @@ class MainWindow(QWidget):
 
     def _persist_splitter_sizes(self) -> None:
         sizes = self.body_splitter.sizes()
-        if len(sizes) != 3 or any(size <= 0 for size in sizes):
+        if len(sizes) != 2 or any(size <= 0 for size in sizes):
             return  # never laid out yet; don't clobber a good saved layout
         try:
             save_splitter_sizes(sizes, self._splitter_sizes_path)
@@ -328,12 +339,111 @@ class MainWindow(QWidget):
         self.tools_panel.set_busy(busy)
 
     # -- folder picking ---------------------------------------------------------------
+    def _open_layered_infer(self, keys: object) -> None:
+        """Show the 分层推标 wizard for the file-panel menu's key list."""
+        batch = tuple(keys) if isinstance(keys, (list, tuple)) else ()
+        if self._layered_dialog is not None:
+            self._layered_dialog.close()
+        dialog = LayeredInferDialog(
+            self._controller,
+            self.vision_bridge,
+            batch,
+            loader=self.file_panel.thumbnail_loader,
+            parent=self,
+        )
+        self._layered_dialog = dialog
+        dialog.exec()
+
     def pick_folder(self) -> None:
         """Directory dialog -> controller.open_dataset."""
         start = str(self._controller.root) if self._controller.root else str(Path.home())
         chosen = QFileDialog.getExistingDirectory(self, OPEN_FOLDER_CAPTION, start)
         if chosen:
             self._controller.open_dataset(Path(chosen))
+
+    def export_dataset(self) -> None:
+        """Ask for a zip path, optionally save dirty files, then export."""
+        if self._controller.root is None:
+            self._controller.toast_requested.emit(TOAST_NO_DATASET, TOAST_WARN)
+            return
+        save_first = False
+        if self._controller.dirty_count() > 0:
+            if not ask_confirm(self, EXPORT_DIRTY_TITLE, EXPORT_DIRTY_TEXT):
+                return
+            save_first = True
+        suggested = str(self._controller.root) + ".zip"
+        path, _filter = QFileDialog.getSaveFileName(
+            self, EXPORT_CAPTION, suggested, EXPORT_FILTER
+        )
+        if path:
+            self._controller.export_dataset(Path(path), save_first=save_first)
+
+    def set_tools_open(self, open_: bool) -> None:
+        """Show or hide the right-edge tools overlay (geometry slide)."""
+        self._tools_want_open = open_
+        self._stop_tools_anim()
+        docked = self._tools_drawer_rect()
+        offscreen = self._tools_offscreen_rect()
+        if open_:
+            start = self.tools_panel.geometry() if self.tools_panel.isVisible() else offscreen
+            self.tools_panel.show()
+            self._tools_anim = anim.slide_geometry(self.tools_panel, start, docked)
+            if self._tools_anim is not None:
+                self._tools_anim.finished.connect(self._on_tools_anim_finished)
+            self.tools_panel.raise_()
+            self.toast_overlay.raise_()
+            return
+        if not self.tools_panel.isVisible():
+            return
+        if not anim.animations_enabled():
+            self.tools_panel.hide()
+            return
+        self._tools_anim = anim.slide_geometry(
+            self.tools_panel, self.tools_panel.geometry(), offscreen
+        )
+        if self._tools_anim is None:
+            self.tools_panel.hide()
+            return
+        self._tools_anim.finished.connect(self._on_tools_anim_finished)
+
+    def _tools_drawer_rect(self) -> QRect:
+        # Sit below the 46px preview info bar so ─ □ × stay visible and clickable.
+        width = TOOLS_PANEL_DEFAULT_W
+        top = HEADER_H
+        return QRect(self.width() - width, top, width, max(0, self.height() - top))
+
+    def _tools_offscreen_rect(self) -> QRect:
+        return self._tools_drawer_rect().translated(TOOLS_PANEL_DEFAULT_W, 0)
+
+    def _stop_tools_anim(self) -> None:
+        animation = self._tools_anim
+        self._tools_anim = None
+        if animation is not None:
+            animation.stop()
+
+    def _finish_tools_anim(self) -> None:
+        """Jump a running drawer animation to its end state (resize-safe)."""
+        animation = self._tools_anim
+        if animation is None:
+            return
+        animation.setCurrentTime(animation.duration())
+        self._tools_anim = None
+
+    def _on_tools_anim_finished(self) -> None:
+        animation = self.sender()
+        if animation is None or animation is not self._tools_anim:
+            return
+        self._tools_anim = None
+        if not self._tools_want_open:
+            self.tools_panel.hide()
+
+    def _position_tools_drawer(self) -> None:
+        self._finish_tools_anim()
+        if not self.tools_panel.isVisible():
+            return
+        self.tools_panel.setGeometry(self._tools_drawer_rect())
+        self.tools_panel.raise_()
+        self.toast_overlay.raise_()
 
     # -- theme ------------------------------------------------------------------------
     def open_color_settings(self) -> None:
@@ -366,8 +476,23 @@ class MainWindow(QWidget):
         add("Ctrl+S", lambda: self._controller.save_current())
         add("Ctrl+Shift+S", lambda: self._controller.save_all())
         add("Ctrl+Z", self._undo_shortcut)
+        add("Ctrl+Y", self._redo_shortcut)
+        add("Ctrl+Shift+Z", self._redo_shortcut)
+        add("Ctrl+Shift+C", lambda: self._controller.copy_caption())
         add("Alt+Up", lambda: self._controller.nav(-1))
         add("Alt+Down", lambda: self._controller.nav(1))
+        add("Escape", self._close_tools_if_open)
+
+    def _redo_shortcut(self) -> None:
+        focus = QApplication.focusWidget()
+        if isinstance(focus, _TEXT_INPUT_TYPES) and hasattr(focus, "redo"):
+            focus.redo()
+            return
+        self._controller.redo_current()
+
+    def _close_tools_if_open(self) -> None:
+        if self.rail.tools_open():
+            self.rail.set_tools_open(False)
 
     def _undo_shortcut(self) -> None:
         """Ctrl+Z: text inputs keep their own undo; otherwise undo the caption."""
@@ -570,6 +695,11 @@ class MainWindow(QWidget):
             if not self.frameGeometry().contains(QCursor.pos()):
                 self._clear_resize_cursor()
         return super().eventFilter(watched, event)
+
+    def resizeEvent(self, event: QResizeEvent) -> None:  # noqa: N802 - Qt override
+        super().resizeEvent(event)
+        if self.tools_panel.isVisible():
+            self._position_tools_drawer()
 
     # -- lifecycle -------------------------------------------------------------------
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt override

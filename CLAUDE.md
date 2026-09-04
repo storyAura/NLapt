@@ -37,12 +37,15 @@ Two strictly layered packages:
   `api_type → factory`: openai/anthropic/ollama + translate/rewrite/vision services),
   batch (thread-pool engine: snapshot → execute → oplog, pause/cancel/checkpoint),
   history (per-file undo + operation log rollback), local (model catalog / hardware
-  advisor / downloader / llama-server manager / Florence-2 ONNX engine).
+  advisor / downloader / llama-server manager / Florence-2 ONNX engine / PEFT LoRA
+  merge).
 - **`nlapt_gui/`** — PySide6 UI. **Widgets never touch the filesystem or core packages
   directly**: everything goes through `nlapt_gui/controller.py::AppController` (the only
   importer of `nlapt.app`) plus the async bridges (`translate_bridge`, `vision_bridge`,
-  `local_bridge`). Sanctioned exception: `widgets/settings_dialog.py` and
-  `widgets/local_tab.py` may read/write the core `config.json` directly.
+  `local_bridge`). Sanctioned exceptions: `widgets/settings_dialog.py` and
+  `widgets/local_tab.py` may read/write the core `config.json` directly, and
+  `widgets/thumbnails.py` persists decoded thumbnails under `app_data_dir()/thumbs`
+  (keyed by source mtime+size — its `clear()` drops the memory LRU only, on purpose).
 
 Data-safety model the UI relies on: every batch operation snapshots all txt files to
 `.backups/` **before** executing and is recorded in the operation log for whole-batch
@@ -55,23 +58,44 @@ Local inference (`nlapt/local`) has two engines, selected by `ModelFamily.engine
   launching llama.cpp's `llama-server` (`http://127.0.0.1:{port}/v1`); a pinned official
   llama.cpp release is auto-downloaded on first use (`nlapt/local/runtime.py`). The
   server manager is a process-wide singleton (`local_bridge.get_server_manager()`,
-  stopped via `atexit`). `ServerSpec.context_length` is PER SLOT — the emitted `-c` is
-  ctx × parallel, and `--reasoning off` is always passed (thinking models return empty
-  captions otherwise).
-- **`ENGINE_FLORENCE`** (Florence-2 PromptGen, `nlapt/local/florence.py`): llama.cpp
-  cannot serve this architecture, so it runs in-process via onnxruntime (lazy optional
+  stopped via `atexit`). A server started BY inference is stopped only after 30s idle
+  (`local_bridge.get_idle_stopper()` — every local run brackets itself with
+  `note_request`/`note_finished`, a new run cancels the pending stop); a server the
+  USER started is never auto-stopped. `ServerSpec.context_length` is PER SLOT — the
+  emitted `-c` is ctx × parallel, and `--reasoning off` is always passed (thinking
+  models return empty captions otherwise).
+- **`ENGINE_FLORENCE`** (Florence-2, `nlapt/local/florence.py`): llama.cpp cannot
+  serve this architecture, so it runs in-process via onnxruntime (lazy optional
   import, extra `local`). No server, no runtime download; driven by task instructions
-  (指令模式, persisted as `LocalSettings.florence_task`), not free-form prompts. Multi-file
+  (指令模式, persisted as `LocalSettings.florence_task`), not free-form prompts —
+  `ModelFamily.florence_tasks` lists what each family was trained on (official
+  Microsoft exports know only the three caption tasks; PromptGen its seven); the UI
+  filters the dropdown AND the captioner clamps to the family's first task. Multi-file
   model: the quant is the decoder, siblings live in `ModelFamily.extra_files`. Engine
-  singleton: `local_bridge.get_florence_engine()`.
+  singleton: `local_bridge.get_florence_engine(files, lora_path)` — keyed by files +
+  the LoRA's path/mtime/size.
 
-The model catalog and the llama.cpp runtime table are hardcoded snapshots (exact byte
-sizes + SHA256 from the HuggingFace / GitHub APIs) — update the data AND
-`CATALOG_SNAPSHOT_DATE` / `RUNTIME_SNAPSHOT_DATE` together.
+Florence PEFT LoRA support (`nlapt/local/lora.py`): safetensors + adapter_config.json
+parsed with stdlib+numpy, matched to ONNX MatMul weights by a protobuf walk (NO `onnx`
+package, no torch), merged as `M + scale·downᵀ@upᵀ` and injected at session creation
+via `SessionOptions.add_initializer`. Two traps: the OrtValue wrappers MUST outlive the
+session (ORT keeps raw pointers — dropping them segfaults; they're tied to the session
+as `nlapt_lora_keepalive`), and matching needs `florence.LORA_MODULE_PREFIXES[file]`
+passed as `module_prefix` (onnx-community's encoder export has bare `/layers.N/...`
+node names — a suffix alone cannot tell encoder from decoder). Curated downloadable
+LoRAs live in the catalog as `LoraEntry`/`ALL_LORAS` (full `base_url`, e.g.
+ModelScope) and download to `models_dir/loras/<lora_id>/`; user-picked safetensors
+are a plain path in `LocalSettings.florence_lora`.
+
+The model catalog (families AND curated LoRAs) and the llama.cpp runtime table are
+hardcoded snapshots (exact byte sizes + SHA256 from the HuggingFace / GitHub /
+ModelScope APIs) — update the data AND `CATALOG_SNAPSHOT_DATE` /
+`RUNTIME_SNAPSHOT_DATE` together.
 
 Per-user state lives in `%APPDATA%/NLapt` (override with env `NLAPT_DATA_DIR`; GUI tests
 isolate it automatically): `config.json` (LLM profiles — the only file with API keys),
-`ui_settings.json`, `translate.json`, `vision_prompts.json`, `local_llm.json`.
+`ui_settings.json`, `translate.json`, `vision_prompts.json`, `local_llm.json`, plus the
+`thumbs/` thumbnail cache and `runtime/` (auto-provisioned llama.cpp).
 
 ## Hard rules (enforced by tests or bitter experience)
 
@@ -111,7 +135,20 @@ Local-inference hermeticity: tests that reach `start_download`/`start_server` mu
 manual `server_path` or monkeypatch `local_bridge.ensure_runtime` (else the runtime
 auto-provision hits the real network), and set explicit `gpu_layers` or patch
 `local_bridge.detect_hardware` (自动 probes real hardware). Florence tests inject
-`session_factory` fakes — onnxruntime is never required by the suite.
+`session_factory` fakes — onnxruntime is never required by the suite. Process-wide
+singletons (server manager, download hub, idle stopper, Florence engine) outlive any
+test — patch them (e.g. `vision_bridge.get_idle_stopper`) instead of letting real 30s
+timers arm; `tests/gui/test_gui_vision_bridge.py` has an autouse isolation fixture to
+copy.
+
+The default models dir is the REPO's own `models/` in a source checkout (NLAPT_DATA_DIR
+isolation does NOT cover it) — any test that writes fake model/LoRA files or asserts
+download state must first `bridge.update_settings(models_dir=str(tmp_path))`, or it
+reads (and can CLOBBER) real downloaded weights on the dev machine.
+
+Windows console is GBK: printing Chinese file content in the terminal shows mojibake
+even when the file is valid UTF-8 — verify content with Python assertions
+(`assert '某词' in text`), never by eyeballing shell output.
 
 ## Packaging
 
@@ -126,5 +163,5 @@ and a fresh startup line in `%APPDATA%/NLapt/logs/nlapt.log`, not just process e
 ## Git
 
 Conventional commits (`feat:`/`fix:`/…), no attribution trailers. Repo is public at
-github.com/storyAura/NLapt (branch `main`). `models/`, `dist/`, `build/`, `NLapt-head/`
-and all per-user config stay untracked.
+github.com/storyAura/NLapt (branch `main`). `models/`, `dist/`, `build/`, `NLapt-head/`,
+`anli.md` (the user's personal notes) and all per-user config stay untracked.

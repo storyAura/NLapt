@@ -1,8 +1,10 @@
 """Batch resume checkpoints (spec 9).
 
 Long batch runs (notably LLM batches) record every successfully completed key
-under a stable checkpoint id in ``<root>/.nlapt/checkpoints.json``. When the
-same operation is started again after an interruption (including a crash),
+under a stable checkpoint id in ``checkpoints.json`` (default
+``<root>/.nlapt/checkpoints.json``; pass ``state_dir`` to store it outside
+the dataset). When the same operation is started again after an interruption
+(including a crash),
 the engine skips the recorded keys ("从断点继续"). The file is written
 atomically after every change so a crash never corrupts it.
 
@@ -87,13 +89,19 @@ class CheckpointStore:
     place, and every change is persisted atomically.
     """
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, state_dir: Path | None = None) -> None:
         base = Path(root)
         if not base.is_dir():
             raise ValidationError(f"checkpoint root is not a directory: {base}")
         if not base.is_absolute():
             base = base.absolute()
-        self._path = base / SESSION_DIR_NAME / CHECKPOINT_FILE_NAME
+        if state_dir is None:
+            self._path = base / SESSION_DIR_NAME / CHECKPOINT_FILE_NAME
+        else:
+            dest = Path(state_dir)
+            if not dest.is_absolute():
+                dest = dest.absolute()
+            self._path = dest / CHECKPOINT_FILE_NAME
         self._lock = threading.RLock()
         self._data: dict[str, frozenset[str]] = self._load()
 

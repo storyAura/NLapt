@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import replace as _dc_replace
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
@@ -39,6 +40,7 @@ from nlapt.ops.find_replace import FindReplaceOperation, FindReplaceSpec, scope_
 from nlapt.ops.prefix_suffix import PrefixSuffixOperation, PrefixSuffixSpec
 
 from nlapt_gui.history_model import FileHistory
+from nlapt_gui.layered_prompts import count_words, estimate_tokens
 from nlapt_gui.settings import UISettings, load_ui_settings, save_ui_settings
 from nlapt_gui.workers import run_async
 
@@ -62,6 +64,10 @@ TOAST_INFO = "info"
 TOAST_NO_UNSAVED = "没有未保存的更改"
 TOAST_UNDONE = "已撤销"
 TOAST_NO_UNDO = "没有可撤销的操作"
+TOAST_REDONE = "已重做"
+TOAST_NO_REDO = "没有可重做的操作"
+TOAST_NO_DATASET = "请先打开数据集"
+TOAST_EXPORTED = "已导出 {n} 个文件"
 TOAST_COPIED = "已复制标注文本"
 TOAST_COPY_FAILED = "复制失败"
 TOAST_FIND_EMPTY = "请输入查找内容"
@@ -329,12 +335,27 @@ class AppController(QObject):
         self._meta_cache[key] = meta
         return meta
 
+    def image_format(self, key: str) -> str:
+        """Uppercase extension without the dot (``PNG``)."""
+        return self.image_path(key).suffix.lstrip(".").upper()
+
+    def image_modified_label(self, key: str) -> str:
+        """``修改于 yyyy-mm-dd`` from the image mtime, or empty on stat failure."""
+        try:
+            stamp = datetime.fromtimestamp(self.image_path(key).stat().st_mtime)
+        except (OSError, ValidationError):
+            return ""
+        return f"修改于 {stamp.strftime('%Y-%m-%d')}"
+
     def segments(self, key: str) -> tuple[str, ...]:
         return split_chips(self.record(key).text)
 
     def char_seg_info(self, key: str) -> str:
         text = self.record(key).text
-        return f"{len(text)} 字符{_DOT}{len(split_chips(text))} 段"
+        return (
+            f"{len(text)} 字符{_DOT}{len(split_chips(text))} 段"
+            f"{_DOT}约 {estimate_tokens(text)} tokens{_DOT}{count_words(text)} 词"
+        )
 
     # -- current / navigation -----------------------------------------------------------
     @property
@@ -513,6 +534,72 @@ class AppController(QObject):
         self.caption_changed.emit(key)
         self.toast_requested.emit(TOAST_UNDONE, TOAST_INFO)
 
+    def redo_current(self) -> None:
+        """Redo = step the history cursor one entry newer."""
+        key = self._current
+        if key is None:
+            return
+        nxt = self._history.step_newer(key)
+        if nxt is None:
+            self.toast_requested.emit(TOAST_NO_REDO, TOAST_INFO)
+            return
+        self._app.edit(key, nxt)
+        self.caption_changed.emit(key)
+        self.toast_requested.emit(TOAST_REDONE, TOAST_INFO)
+
+    def can_undo(self) -> bool:
+        key = self._current
+        if key is None:
+            return False
+        entries = self._history.entries(key)
+        return self._history.current_index(key) + 1 < len(entries)
+
+    def can_redo(self) -> bool:
+        key = self._current
+        if key is None:
+            return False
+        return self._history.current_index(key) > 0
+
+    def export_dataset(self, dest: Path, *, save_first: bool = False) -> None:
+        """Zip images + existing txts off-thread; toast on success or failure.
+
+        ``save_first`` writes dirty captions to disk before packing so the
+        archive matches the editor.
+        """
+        if self._root is None:
+            self.toast_requested.emit(TOAST_NO_DATASET, TOAST_WARN)
+            return
+        if self._batch_in_flight or self._rescanning:
+            self.toast_requested.emit(self.TOAST_BUSY, TOAST_WARN)
+            return
+        self._batch_in_flight = True
+        self.busy_changed.emit(True)
+
+        def job() -> object:
+            saved: tuple[str, ...] = ()
+            if save_first:
+                saved = self._app.save_all_dirty()
+            count = self._app.export_dataset(Path(dest))
+            return (count, saved)
+
+        def done(result: object) -> None:
+            self._batch_in_flight = False
+            self.busy_changed.emit(False)
+            count, saved = result if isinstance(result, tuple) else (0, ())
+            if saved:
+                self.save_state_changed.emit("saved")
+                self.files_saved.emit(tuple(saved))
+                for key in saved:
+                    self.caption_changed.emit(key)
+            self.toast_requested.emit(TOAST_EXPORTED.format(n=int(count)), TOAST_OK)
+
+        def failed(message: str) -> None:
+            self._batch_in_flight = False
+            self.busy_changed.emit(False)
+            self.toast_requested.emit(message, TOAST_ERR)
+
+        run_async(self._pool, job, on_done=done, on_error=failed)
+
     def save_current(self) -> None:
         """Save the current file off-thread (atomic disk write on the pool)."""
         key = self._current
@@ -569,12 +656,12 @@ class AppController(QObject):
 
         run_async(self._pool, self._app.save_all_dirty, on_done=done, on_error=failed)
 
-    def copy_caption(self) -> None:
-        key = self._current
-        if key is None:
+    def copy_caption(self, key: str | None = None) -> None:
+        target = key if key is not None else self._current
+        if target is None:
             return
         try:
-            QGuiApplication.clipboard().setText(self._app.caption(key).text)
+            QGuiApplication.clipboard().setText(self._app.caption(target).text)
         except Exception:
             _LOGGER.exception("clipboard copy failed")
             self.toast_requested.emit(TOAST_COPY_FAILED, TOAST_ERR)

@@ -893,9 +893,11 @@ class TestFlorenceCaptioner:
 
         stub = StubEngine()
         seen_files: list[dict[str, Path]] = []
+        seen_loras: list[Path | None] = []
 
-        def fake_get_engine(files):  # noqa: ANN001, ANN202
+        def fake_get_engine(files, lora_path=None):  # noqa: ANN001, ANN202
             seen_files.append(files)
+            seen_loras.append(lora_path)
             return stub
 
         monkeypatch.setattr(
@@ -910,6 +912,50 @@ class TestFlorenceCaptioner:
             "vision_encoder.onnx",
             "tokenizer.json",
         }
+        assert seen_loras == [None]  # no LoRA configured
+
+    def test_captioner_passes_selected_lora(
+        self, qtbot, bridge: LocalBridge, florence_family: ModelFamily, monkeypatch
+    ) -> None:
+        from nlapt_gui.local_bridge import make_local_vision_captioner
+
+        lora_file = bridge.models_dir() / "style.safetensors"
+        lora_file.parent.mkdir(parents=True, exist_ok=True)
+        lora_file.write_bytes(b"st")
+        self.save_settings(bridge, server_path="", florence_lora=str(lora_file))
+        write_florence_files(bridge, florence_family)
+        seen_loras: list[Path | None] = []
+
+        class StubEngine:
+            def caption(self, image_path: Path, task: str) -> str:
+                return "ok"
+
+        def fake_get_engine(files, lora_path=None):  # noqa: ANN001, ANN202
+            seen_loras.append(lora_path)
+            return StubEngine()
+
+        monkeypatch.setattr(
+            "nlapt_gui.local_bridge.get_florence_engine", fake_get_engine
+        )
+        captioner = make_local_vision_captioner(image_max_edge=1024)
+        assert captioner(Path("img.png"), "", "") == "ok"
+        assert seen_loras == [Path(str(lora_file))]
+
+    def test_captioner_rejects_missing_lora_file(
+        self, qtbot, bridge: LocalBridge, florence_family: ModelFamily
+    ) -> None:
+        from nlapt.core.errors import LocalInferenceError
+
+        from nlapt_gui.local_bridge import make_local_vision_captioner
+
+        self.save_settings(
+            bridge,
+            server_path="",
+            florence_lora=str(bridge.models_dir() / "gone.safetensors"),
+        )
+        write_florence_files(bridge, florence_family)
+        with pytest.raises(LocalInferenceError, match="LoRA 文件不存在"):
+            make_local_vision_captioner(image_max_edge=1024)
 
     def test_get_florence_engine_reuses_until_files_change(self, qtbot) -> None:
         from nlapt.local.florence import REQUIRED_FILES
@@ -921,3 +967,231 @@ class TestFlorenceCaptioner:
         first = lb.get_florence_engine(dict(files_a))
         assert lb.get_florence_engine(dict(files_a)) is first
         assert lb.get_florence_engine(files_b) is not first
+
+    def test_captioner_clamps_task_to_family_set(
+        self, qtbot, bridge: LocalBridge, monkeypatch
+    ) -> None:
+        from dataclasses import replace
+
+        from nlapt.local.florence import TASK_CAPTION, TASK_GENERATE_TAGS
+
+        from nlapt_gui.local_bridge import make_local_vision_captioner
+
+        # An official-style family that never learned the PromptGen 指令.
+        fam = replace(make_florence_family(), florence_tasks=(TASK_CAPTION,))
+        monkeypatch.setattr("nlapt_gui.local_bridge.find_family", lambda fid: fam)
+        monkeypatch.setattr(
+            "nlapt_gui.local_bridge.find_quant", lambda f, label: f.quants[0]
+        )
+        self.save_settings(bridge, server_path="", florence_task=TASK_GENERATE_TAGS)
+        write_florence_files(bridge, fam)
+
+        class StubEngine:
+            def __init__(self) -> None:
+                self.tasks: list[str] = []
+
+            def caption(self, image_path: Path, task: str) -> str:
+                self.tasks.append(task)
+                return "ok"
+
+        stub = StubEngine()
+        monkeypatch.setattr(
+            "nlapt_gui.local_bridge.get_florence_engine",
+            lambda files, lora_path=None: stub,
+        )
+        captioner = make_local_vision_captioner(image_max_edge=1024)
+        captioner(Path("img.png"), "", "")
+        assert stub.tasks == [TASK_CAPTION]  # clamped, not <GENERATE_TAGS>
+
+    def test_get_florence_engine_keyed_by_lora(self, qtbot, tmp_path: Path) -> None:
+        from nlapt.local.florence import REQUIRED_FILES
+
+        import nlapt_gui.local_bridge as lb
+
+        files = {name: Path(f"k-{name}") for name in REQUIRED_FILES}
+        lora = tmp_path / "style.safetensors"
+        lora.write_bytes(b"one")
+        plain = lb.get_florence_engine(dict(files))
+        with_lora = lb.get_florence_engine(dict(files), lora)
+        assert with_lora is not plain
+        assert lb.get_florence_engine(dict(files), lora) is with_lora
+        # A retrained (rewritten) LoRA file must rebuild the engine.
+        lora.write_bytes(b"retrained-longer")
+        assert lb.get_florence_engine(dict(files), lora) is not with_lora
+
+
+class TestLoraDownload:
+    LORA_ID = "bai-json-large"
+
+    def test_download_writes_files_and_reports(
+        self, qtbot, bridge: LocalBridge, monkeypatch
+    ) -> None:
+        from nlapt.local.catalog import find_lora
+
+        from nlapt_gui.local_bridge import LORA_FAMILY_PREFIX
+
+        urls: list[str] = []
+
+        def fake_download(url, dest, *, expected_bytes=None, progress=None, cancel=None, **kw):  # noqa: ANN001, ANN003
+            urls.append(url)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"x" * int(expected_bytes or 0))
+            return dest
+
+        monkeypatch.setattr("nlapt_gui.local_bridge.download_file", fake_download)
+        entry = find_lora(self.LORA_ID)
+        assert not bridge.is_lora_downloaded(entry)
+        with qtbot.waitSignal(bridge.download_finished, timeout=2000) as blocker:
+            assert bridge.start_lora_download(self.LORA_ID)
+        assert blocker.args[0] == LORA_FAMILY_PREFIX + self.LORA_ID
+        assert blocker.args[1] == ""
+        assert blocker.args[2] == DOWNLOAD_OK
+        assert bridge.is_lora_downloaded(entry)
+        assert bridge.lora_adapter_file(entry).is_file()
+        assert all(url.startswith("https://modelscope.cn/") for url in urls)
+        assert len(urls) == len(entry.files)
+
+    def test_already_downloaded_short_circuits(
+        self, qtbot, bridge: LocalBridge, monkeypatch
+    ) -> None:
+        from nlapt.local.catalog import find_lora, lora_file_path
+
+        entry = find_lora(self.LORA_ID)
+        for file in entry.files:
+            dest = lora_file_path(bridge.models_dir(), entry, file)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"x" * file.size_bytes)
+        monkeypatch.setattr(
+            "nlapt_gui.local_bridge.download_file",
+            lambda *a, **k: (_ for _ in ()).throw(AssertionError("no download")),
+        )
+        with qtbot.waitSignal(bridge.download_finished, timeout=2000) as blocker:
+            assert bridge.start_lora_download(self.LORA_ID)
+        assert blocker.args[2] == DOWNLOAD_OK
+
+    def test_refused_while_another_download_runs(
+        self, qtbot, bridge: LocalBridge, monkeypatch
+    ) -> None:
+        import nlapt_gui.local_bridge as lb
+
+        monkeypatch.setattr(
+            lb,
+            "_ACTIVE_TASK",
+            lb._ActiveDownload(
+                family_id="other", quant_label="Q4", cancel=threading.Event()
+            ),
+        )
+        assert not bridge.start_lora_download(self.LORA_ID)
+
+
+# -- idle auto-stop (推理完先不卸载,空闲 30 秒后再卸载) ------------------------------
+class RecordingTimer:
+    """Fake threading.Timer: records the delay, fires only on demand."""
+
+    def __init__(self, delay: float, fn) -> None:  # noqa: ANN001
+        self.delay = delay
+        self.fn = fn
+        self.daemon = False
+        self.cancelled = False
+
+    def start(self) -> None:
+        pass
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+    def fire(self) -> None:
+        if not self.cancelled:
+            self.fn()
+
+
+def make_idle_stopper(manager: FakeManager):
+    from nlapt_gui.local_bridge import IdleServerStopper
+
+    timers: list[RecordingTimer] = []
+
+    def factory(delay: float, fn):  # noqa: ANN001
+        timer = RecordingTimer(delay, fn)
+        timers.append(timer)
+        return timer
+
+    return IdleServerStopper(manager, timer_factory=factory), timers
+
+
+class TestIdleServerStopper:
+    def test_finish_arms_default_delay_and_fire_stops(self) -> None:
+        from nlapt_gui.local_bridge import IDLE_STOP_DELAY_SECONDS
+
+        manager = FakeManager()
+        stopper, timers = make_idle_stopper(manager)
+        stopper.note_request()  # server not running -> this run loads it
+        manager.running = True
+        stopper.note_finished()
+        assert stopper.pending()
+        assert timers[-1].delay == IDLE_STOP_DELAY_SECONDS
+        assert timers[-1].daemon  # must never delay interpreter exit
+        assert manager.stop_calls == 0  # 先不卸载
+        timers[-1].fire()
+        assert manager.stop_calls == 1
+        assert not stopper.pending()
+
+    def test_new_request_cancels_pending_stop(self) -> None:
+        manager = FakeManager()
+        stopper, timers = make_idle_stopper(manager)
+        stopper.note_request()
+        manager.running = True
+        stopper.note_finished()
+        armed = timers[-1]
+        stopper.note_request()  # 反复推理: cancels the pending unload
+        assert armed.cancelled
+        assert not stopper.pending()
+        armed.fire()  # late fire of a cancelled timer is inert
+        assert manager.stop_calls == 0
+        stopper.note_finished()  # run ends again -> re-armed
+        assert stopper.pending()
+
+    def test_overlapping_runs_arm_only_after_the_last(self) -> None:
+        manager = FakeManager()
+        stopper, timers = make_idle_stopper(manager)
+        stopper.note_request()
+        manager.running = True
+        stopper.note_request()  # second run overlaps the first
+        stopper.note_finished()
+        assert not stopper.pending()  # one run still in flight
+        stopper.note_finished()
+        assert stopper.pending()
+        assert len(timers) == 1
+
+    def test_user_started_server_is_never_auto_stopped(self) -> None:
+        manager = FakeManager()
+        manager.running = True  # user pre-started via 启动本地服务
+        stopper, timers = make_idle_stopper(manager)
+        stopper.note_request()
+        stopper.note_finished()
+        assert not timers
+        assert manager.stop_calls == 0
+
+    def test_user_control_clears_pending_stop(self) -> None:
+        manager = FakeManager()
+        stopper, timers = make_idle_stopper(manager)
+        stopper.note_request()
+        manager.running = True
+        stopper.note_finished()
+        stopper.note_user_control()  # user clicked 启动/停止 themselves
+        assert timers[-1].cancelled
+        assert not stopper.pending()
+        stopper.note_request()  # server still running (user's) -> no re-arm
+        stopper.note_finished()
+        assert not stopper.pending()
+
+    def test_fire_during_new_run_does_not_stop(self) -> None:
+        manager = FakeManager()
+        stopper, timers = make_idle_stopper(manager)
+        stopper.note_request()
+        manager.running = True
+        stopper.note_finished()
+        armed = timers[-1]
+        stopper.note_request()
+        armed.cancelled = False  # simulate the timer racing the cancel
+        armed.fire()
+        assert manager.stop_calls == 0  # in-flight run guards the server

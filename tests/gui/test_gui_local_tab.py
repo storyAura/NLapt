@@ -94,23 +94,76 @@ def quant_item(tab: LocalTab, family_id: str, quant_label: str) -> QTreeWidgetIt
 
 
 class TestTreeStructure:
-    def test_top_level_series_match_catalog(self, qtbot, tab_controller) -> None:
+    def test_top_level_rows_match_series(self, qtbot, tab_controller) -> None:
+        # One top-level row per series; single-family series show the FAMILY
+        # name directly (不分层), which always starts with the series name.
         tab = make_tab(qtbot, tab_controller)
-        names = [
-            tab.tree.topLevelItem(i).text(0)
-            for i in range(tab.tree.topLevelItemCount())
-        ]
-        assert names == [series.name for series in all_series()]
-
-    def test_family_and_quant_counts(self, qtbot, tab_controller) -> None:
-        tab = make_tab(qtbot, tab_controller)
+        assert tab.tree.topLevelItemCount() == len(all_series())
         for index, series in enumerate(all_series()):
-            series_item = tab.tree.topLevelItem(index)
+            text = tab.tree.topLevelItem(index).text(0)
             families = families_for(series.series_id)
-            assert series_item.childCount() == len(families)
-            for family_index, family in enumerate(families):
-                family_item = series_item.child(family_index)
-                assert family_item.childCount() == len(family.quants)
+            if len(families) == 1:
+                assert text.startswith(families[0].name)
+            else:
+                assert text == series.name
+
+    def test_every_catalog_quant_has_exactly_one_row(
+        self, qtbot, tab_controller
+    ) -> None:
+        from nlapt.local.catalog import all_families
+
+        tab = make_tab(qtbot, tab_controller)
+        pairs = sorted(
+            (item.data(0, ROLE_FAMILY), item.data(0, ROLE_QUANT))
+            for item in tab._quant_items()
+        )
+        expected = sorted(
+            (family.family_id, quant.label)
+            for family in all_families()
+            for quant in family.quants
+        )
+        assert pairs == expected
+
+    def test_multi_family_series_keep_the_nested_shape(
+        self, qtbot, tab_controller
+    ) -> None:
+        tab = make_tab(qtbot, tab_controller)
+        item = quant_item(tab, "gemma4-12b", "Q4_K_M")
+        family_row = item.parent()
+        series_row = family_row.parent()
+        assert series_row is not None and series_row.text(0) == "Gemma 4"
+
+    def test_single_family_series_flattened_to_top_level(
+        self, qtbot, tab_controller
+    ) -> None:
+        # ToriiGate has one family (several quants): no series row.
+        tab = make_tab(qtbot, tab_controller)
+        family_row = quant_item(tab, "toriigate-0.5", "Q4_K_M").parent()
+        assert family_row.parent() is None
+        assert family_row.text(0).startswith("ToriiGate 0.5")
+
+    def test_single_quant_family_is_one_selectable_row(
+        self, qtbot, tab_controller
+    ) -> None:
+        # A single-quant family is its own selectable row carrying size,
+        # downloads and grade itself; the Florence series (5 families since
+        # the official models joined) keeps its series node above them.
+        from PySide6.QtCore import Qt
+
+        tab = make_tab(qtbot, tab_controller)
+        item = quant_item(tab, "florence2-promptgen-v2", "ONNX")
+        assert item.parent() is not None  # the Florence-2 series row
+        assert item.parent().text(0) == "Florence-2"
+        assert item.childCount() == 0
+        assert item.flags() & Qt.ItemFlag.ItemIsSelectable
+        assert item.text(2)  # 热度 shown on the merged row
+        for family_id in (
+            "florence2-base-ft",
+            "florence2-large-ft",
+            "florence2-base",
+            "florence2-large",
+        ):
+            assert quant_item(tab, family_id, "ONNX") is not None
 
     def test_requested_models_have_rows(self, qtbot, tab_controller) -> None:
         tab = make_tab(qtbot, tab_controller)
@@ -553,6 +606,176 @@ class TestFlorenceTaskUI:
         fresh = make_tab(qtbot, tab_controller)
         assert fresh.florence_task_combo.currentData() == TASK_MIXED_CAPTION
 
+
+class TestFlorenceLoraUI:
+    """The Florence-only LoRA row: 不使用 sentinel + add / remove / persist."""
+
+    FLOR = "florence2-promptgen-v2"
+
+    def pick_file(self, monkeypatch, path) -> None:  # noqa: ANN001
+        monkeypatch.setattr(
+            "nlapt_gui.widgets.local_tab.QFileDialog.getOpenFileName",
+            staticmethod(lambda *a, **k: (str(path), "")),
+        )
+
+    def test_lora_row_toggles_with_selection(self, qtbot, tab_controller) -> None:
+        tab = make_tab(qtbot, tab_controller)
+        assert not tab._form.isRowVisible(tab.florence_lora_holder)
+        tab.tree.setCurrentItem(quant_item(tab, self.FLOR, "ONNX"))
+        assert tab._form.isRowVisible(tab.florence_lora_holder)
+        tab.tree.setCurrentItem(quant_item(tab, "toriigate-0.5", "Q4_K_M"))
+        assert not tab._form.isRowVisible(tab.florence_lora_holder)
+
+    def test_add_select_persist_prefill(
+        self, qtbot, tab_controller, tmp_path, monkeypatch
+    ) -> None:
+        lora = tmp_path / "bai-json.safetensors"
+        lora.write_bytes(b"x")
+        tab = make_tab(qtbot, tab_controller)
+        assert tab.florence_lora_combo.currentData() == ""  # 不使用 sentinel
+        self.pick_file(monkeypatch, lora)
+        tab._add_lora()
+        assert tab.florence_lora_combo.currentData() == str(lora)
+        tab._add_lora()  # picking the same file again must not duplicate
+        assert tab.florence_lora_combo.count() == 2
+        tab.persist()
+        stored = load_local_settings(app_data_dir() / "local_llm.json")
+        assert stored.florence_lora == str(lora)
+        assert stored.florence_loras == (str(lora),)
+        fresh = make_tab(qtbot, tab_controller)
+        assert fresh.florence_lora_combo.currentData() == str(lora)
+        assert fresh.florence_lora_combo.currentText() == "bai-json"
+
+    def test_cancelled_picker_changes_nothing(
+        self, qtbot, tab_controller, monkeypatch
+    ) -> None:
+        tab = make_tab(qtbot, tab_controller)
+        self.pick_file(monkeypatch, "")
+        tab._add_lora()
+        assert tab.florence_lora_combo.count() == 1
+
+    def test_remove_returns_to_none(
+        self, qtbot, tab_controller, tmp_path, monkeypatch
+    ) -> None:
+        lora = tmp_path / "style.safetensors"
+        lora.write_bytes(b"x")
+        tab = make_tab(qtbot, tab_controller)
+        self.pick_file(monkeypatch, lora)
+        tab._add_lora()
+        tab._remove_lora()
+        assert tab.florence_lora_combo.count() == 1
+        assert tab.florence_lora_combo.currentData() == ""
+        tab._remove_lora()  # the 不使用 sentinel itself is not removable
+        assert tab.florence_lora_combo.count() == 1
+        tab.persist()
+        stored = load_local_settings(app_data_dir() / "local_llm.json")
+        assert stored.florence_lora == ""
+        assert stored.florence_loras == ()
+
+
+class TestCuratedLoraUI:
+    """内置 LoRA: listed per compatible family, downloadable, task-linked."""
+
+    LARGE = "florence2-large-ft"
+
+    def curated_index(self, tab) -> int:  # noqa: ANN001
+        from nlapt_gui.widgets.local_tab import ROLE_LORA_ID
+
+        combo = tab.florence_lora_combo
+        for index in range(combo.count()):
+            if combo.itemData(index, ROLE_LORA_ID):
+                return index
+        return -1
+
+    def test_listed_only_for_compatible_families(self, qtbot, tab_controller) -> None:
+        tab = make_tab(qtbot, tab_controller)
+        tab.tree.setCurrentItem(quant_item(tab, self.LARGE, "ONNX"))
+        assert self.curated_index(tab) > 0
+        tab.tree.setCurrentItem(quant_item(tab, "florence2-promptgen-v2", "ONNX"))
+        assert self.curated_index(tab) == -1
+
+    def test_missing_curated_lora_offers_download(
+        self, qtbot, tab_controller, tmp_path, monkeypatch
+    ) -> None:
+        from nlapt_gui.widgets.local_tab import LORA_MISSING_SUFFIX, ROLE_LORA_ID
+
+        tab = make_tab(qtbot, tab_controller)
+        # Hermeticity: never look at (or write near) the repo's real models/.
+        tab.bridge.update_settings(models_dir=str(tmp_path))
+        tab.tree.setCurrentItem(quant_item(tab, self.LARGE, "ONNX"))
+        index = self.curated_index(tab)
+        combo = tab.florence_lora_combo
+        assert combo.itemData(index, ROLE_LORA_ID) == "bai-json-large"
+        assert LORA_MISSING_SUFFIX in combo.itemText(index)
+        assert tab.lora_download_button.isHidden()  # 不使用 selected
+        started: list[str] = []
+        monkeypatch.setattr(
+            tab.bridge, "start_lora_download", lambda lora_id: started.append(lora_id) or True
+        )
+        combo.setCurrentIndex(index)
+        assert not tab.lora_download_button.isHidden()
+        tab._on_lora_download_clicked()
+        assert started == ["bai-json-large"]
+
+    def test_downloaded_curated_lora_needs_no_button(
+        self, qtbot, tab_controller, tmp_path
+    ) -> None:
+        from nlapt.local.catalog import find_lora, lora_file_path
+
+        from nlapt_gui.widgets.local_tab import LORA_MISSING_SUFFIX
+
+        tab = make_tab(qtbot, tab_controller)
+        # Hermeticity: fake files go under tmp, never the repo's models/.
+        tab.bridge.update_settings(models_dir=str(tmp_path))
+        entry = find_lora("bai-json-large")
+        for file in entry.files:
+            dest = lora_file_path(tab.bridge.models_dir(), entry, file)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"x" * file.size_bytes)
+        tab.tree.setCurrentItem(quant_item(tab, self.LARGE, "ONNX"))
+        index = self.curated_index(tab)
+        combo = tab.florence_lora_combo
+        assert LORA_MISSING_SUFFIX not in combo.itemText(index)
+        combo.setCurrentIndex(index)
+        assert tab.lora_download_button.isHidden()
+        assert combo.currentData() == str(tab.bridge.lora_adapter_file(entry))
+
+    def test_selecting_curated_lora_switches_task(
+        self, qtbot, tab_controller
+    ) -> None:
+        from nlapt.local.florence import TASK_BAI_JSON
+
+        tab = make_tab(qtbot, tab_controller)
+        tab.tree.setCurrentItem(quant_item(tab, self.LARGE, "ONNX"))
+        assert tab.florence_task_combo.currentData() != TASK_BAI_JSON
+        tab.florence_lora_combo.setCurrentIndex(self.curated_index(tab))
+        assert tab.florence_task_combo.currentData() == TASK_BAI_JSON
+
+    def test_curated_lora_not_removable(self, qtbot, tab_controller) -> None:
+        tab = make_tab(qtbot, tab_controller)
+        tab.tree.setCurrentItem(quant_item(tab, self.LARGE, "ONNX"))
+        index = self.curated_index(tab)
+        combo = tab.florence_lora_combo
+        before = combo.count()
+        combo.setCurrentIndex(index)
+        tab._remove_lora()
+        assert combo.count() == before
+
+    def test_task_combo_filtered_per_family(self, qtbot, tab_controller) -> None:
+        from nlapt.local.catalog import find_family
+
+        tab = make_tab(qtbot, tab_controller)
+
+        def tokens() -> tuple[str, ...]:
+            combo = tab.florence_task_combo
+            return tuple(combo.itemData(i) for i in range(combo.count()))
+
+        tab.tree.setCurrentItem(quant_item(tab, self.LARGE, "ONNX"))
+        assert tokens() == find_family(self.LARGE).florence_tasks
+        tab.tree.setCurrentItem(quant_item(tab, "florence2-promptgen-v2", "ONNX"))
+        assert tokens() == find_family("florence2-promptgen-v2").florence_tasks
+        assert "<BAI_JSON>" not in tokens()
+
     def test_size_column_shows_total_of_all_files(
         self, qtbot, tab_controller
     ) -> None:
@@ -560,16 +783,21 @@ class TestFlorenceTaskUI:
         from nlapt.local.hardware import format_bytes
 
         tab = make_tab(qtbot, tab_controller)
-        family = find_family(self.FLOR)
+        family = find_family("florence2-promptgen-v2")
         total = family.quants[0].size_bytes + sum(
             extra.size_bytes for extra in family.extra_files
         )
-        assert quant_item(tab, self.FLOR, "ONNX").text(1) == format_bytes(total)
+        assert (
+            quant_item(tab, "florence2-promptgen-v2", "ONNX").text(1)
+            == format_bytes(total)
+        )
 
     def test_server_click_explains_no_server_needed(
         self, qtbot, tab_controller, tab_toasts
     ) -> None:
         tab = make_tab(qtbot, tab_controller)
-        tab.tree.setCurrentItem(quant_item(tab, self.FLOR, "ONNX"))
+        tab.tree.setCurrentItem(
+            quant_item(tab, "florence2-promptgen-v2", "ONNX")
+        )
         tab._on_server_clicked()  # the button itself is disabled
         assert any("免启动服务" in text for text, _ in tab_toasts)

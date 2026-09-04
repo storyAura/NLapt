@@ -67,6 +67,12 @@ class TestSaveLoad:
         assert payload["drafts"]["img1.png"] == "a draft caption, 中文内容"
         assert payload["saved_at"] == SAVED_AT
 
+    def test_state_dir_writes_session_outside_dataset(self, tmp_path: Path) -> None:
+        dest = tmp_path / "state"
+        SessionStore(tmp_path, state_dir=dest).save(make_snapshot())
+        assert (dest / SESSION_FILE_NAME).is_file()
+        assert not session_file(tmp_path).exists()
+
     def test_save_overwrites_previous(self, tmp_path: Path) -> None:
         store = SessionStore(tmp_path)
         store.save(make_snapshot())

@@ -147,6 +147,23 @@ class TestStepOlder:
         assert history.step_older("nope.png") is None
 
 
+class TestStepNewer:
+    def test_step_newer_after_older_restores_caption(self, history: FileHistory) -> None:
+        history.seed("a.png", "v1")
+        history.push("a.png", "编辑", "v2")
+        assert history.step_older("a.png") == "v1"
+        assert history.step_newer("a.png") == "v2"
+        assert history.current_index("a.png") == 0
+
+    def test_step_newer_at_newest_returns_none(self, history: FileHistory) -> None:
+        history.seed("a.png", "v1")
+        history.push("a.png", "编辑", "v2")
+        assert history.step_newer("a.png") is None
+
+    def test_step_newer_unknown_key_returns_none(self, history: FileHistory) -> None:
+        assert history.step_newer("nope.png") is None
+
+
 class TestClear:
     def test_clear_keep_current(self, history: FileHistory) -> None:
         history.seed("a.png", "v1")

@@ -254,26 +254,39 @@ class TestSmootherZoom:
 
 
 class TestImageFade:
+    def test_fade_disabled_is_end_state(self, big_panel: PreviewPanel) -> None:
+        view = big_panel.single_view
+        image = QImage(20, 20, QImage.Format.Format_RGB32)
+        image.fill(0)
+        view.set_pixmap(QPixmap.fromImage(image))
+        assert view._fade_alpha == 1.0
+        assert view.graphicsEffect() is None
+
     def test_fade_is_skip_safe(self, big_panel: PreviewPanel) -> None:
         """The fade exposes its final state synchronously; content stays correct."""
+        from nlapt_gui import anim
+
         panel = big_panel
         panel.zoom_fit()
         view = panel.single_view
+        anim.set_animations_enabled(True)
+        try:
+            image = QImage(20, 20, QImage.Format.Format_RGB32)
+            image.fill(0)
+            fresh = QPixmap.fromImage(image)
+            view.set_pixmap(fresh)
 
-        image = QImage(20, 20, QImage.Format.Format_RGB32)
-        image.fill(0)
-        fresh = QPixmap.fromImage(image)
-        view.set_pixmap(fresh)
+            # Paint-level fade (no QGraphicsEffect - those crash during resizes):
+            # mid-fade the alpha is below 1.0 but the pixmap is already current.
+            assert view.graphicsEffect() is None
+            assert view._fade_alpha < 1.0
+            assert view._pixmap is fresh
 
-        # Paint-level fade (no QGraphicsEffect - those crash during resizes):
-        # mid-fade the alpha is below 1.0 but the pixmap is already current.
-        assert view.graphicsEffect() is None
-        assert view._fade_alpha < 1.0
-        assert view._pixmap is fresh
-
-        view.finish_image_fade()
-        assert view._fade_alpha == 1.0  # jumped to end state synchronously
-        assert not panel.grab().isNull()
+            view.finish_image_fade()
+            assert view._fade_alpha == 1.0
+            assert not panel.grab().isNull()
+        finally:
+            anim.set_animations_enabled(False)
 
     def test_finish_fade_is_idempotent(self, big_panel: PreviewPanel) -> None:
         view = big_panel.single_view

@@ -121,6 +121,16 @@ class FileHistory(QObject):
             return None
         return self.revert_caption(key, cursor + 1)
 
+    def step_newer(self, key: str) -> str | None:
+        """Move the cursor one entry newer (Ctrl+Y); ``None`` at the newest."""
+        entries = self._entries.get(key)
+        if not entries:
+            return None
+        cursor = self._cursor.get(key, 0)
+        if cursor <= 0:
+            return None
+        return self.revert_caption(key, cursor - 1)
+
     def clear_keep_current(self, key: str) -> None:
         """Keep only the applied entry (design: 清空历史,保留当前状态)."""
         entries = self._entries.get(key)

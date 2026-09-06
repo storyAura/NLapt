@@ -106,14 +106,17 @@ class FlowLayout(QLayout):
         row_height = 0
         for item in self._items:
             hint = item.sizeHint()
-            next_x = x + hint.width() + self._h_spacing
+            width = min(hint.width(), max(0, effective.width()))
+            height = item.heightForWidth(width) if item.hasHeightForWidth() else hint.height()
+            size = QSize(width, height)
+            next_x = x + width + self._h_spacing
             if next_x - self._h_spacing > effective.right() + 1 and row_height > 0:
                 x = effective.x()
                 y = y + row_height + self._v_spacing
-                next_x = x + hint.width() + self._h_spacing
+                next_x = x + width + self._h_spacing
                 row_height = 0
             if not test_only:
-                item.setGeometry(QRect(QPoint(x, y), hint))
+                item.setGeometry(QRect(QPoint(x, y), size))
             x = next_x
-            row_height = max(row_height, hint.height())
+            row_height = max(row_height, height)
         return y + row_height - rect.y() + margins.bottom()

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from nlapt_gui.layered_prompts import (
+    CARD_APPEARANCE_SKILL,
     CARD_BAN_WORDS,
+    CARD_CLOTHING_SKILL,
+    CARD_VARIANT_HINTS,
     CHARACTER_CARD_PROMPT,
     POSE_SCENE_PROMPT,
     SCENE_HEDGE_WORDS,
@@ -40,6 +43,24 @@ class TestCardPrompt:
         lower = CHARACTER_CARD_PROMPT.lower()
         for word in CARD_BAN_WORDS:
             assert word in lower
+
+    def test_appearance_skill_before_clothing_skill(self) -> None:
+        appear_at = CHARACTER_CARD_PROMPT.find(CARD_APPEARANCE_SKILL.strip())
+        cloth_at = CHARACTER_CARD_PROMPT.find(CARD_CLOTHING_SKILL.strip())
+        assert appear_at != -1
+        assert cloth_at != -1
+        assert appear_at < cloth_at
+        assert "pupil" in CARD_APPEARANCE_SKILL.lower()
+        assert "hair" in CARD_APPEARANCE_SKILL.lower()
+
+    def test_variants_keep_appearance_first(self) -> None:
+        joined = " ".join(CARD_VARIANT_HINTS).lower()
+        assert "never start with garments" in joined
+        assert "do not lead with footwear" in joined
+        for hint in CARD_VARIANT_HINTS:
+            assert "lead with headwear" not in hint.lower()
+            assert not hint.lower().startswith("lead with footwear")
+            assert "lead with outer layers" not in hint.lower()
 
 
 class TestScenePrompt:

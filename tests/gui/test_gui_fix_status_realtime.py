@@ -5,6 +5,7 @@ Covers:
   through a window resize (the native-crash source: effect buffers re-render
   during resizes). Drag-time effects in the chip/sentence editors are exempt
   (the mouse is captured during a drag - no resize can happen).
+  ``anim.pop_in`` is geometry-only and never installs an effect.
 - The bottom-left live clock (system year + time).
 - The real save-state indicator (spec 2.3: 已保存 / 保存中 / 保存失败 + 未保存 n).
 - The file-panel footer 未保存 indicator is live (was a prototype legend).

@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 
 import pytest
+from PySide6.QtCore import QThreadPool
 from PySide6.QtGui import QPixmap
 
 from nlapt_gui.resources import app_data_dir
@@ -15,6 +16,7 @@ from nlapt_gui.widgets.thumbnails import (
     THUMB_DISK_DIR_NAME,
     ThumbnailLoader,
     bucket_height,
+    get_decode_pool,
 )
 
 
@@ -50,6 +52,11 @@ class TestBucketHeight:
 class TestThumbnailLoader:
     def test_contract_cache_limit(self) -> None:
         assert THUMB_CACHE_LIMIT == 512
+
+    def test_default_pool_is_decode_pool(self) -> None:
+        loader = ThumbnailLoader()
+        assert loader._pool is get_decode_pool()
+        assert loader._pool is not QThreadPool.globalInstance()
 
     def test_async_load_emits_ready(self, qtbot, small_png: Path) -> None:
         loader = ThumbnailLoader()
@@ -110,6 +117,25 @@ class TestThumbnailLoader:
         loader.clear()
         assert loader.cache_size() == 0
         assert loader.pixmap("k1", 44) is None
+
+    def test_clear_invalidates_inflight_generation(self, qtbot, small_png: Path) -> None:
+        loader = ThumbnailLoader()
+        callbacks: list[object] = []
+        loader.ready.connect(lambda key, _pix: callbacks.append(key))
+        loader.request("k1", small_png, 44)
+        loader.clear()
+        with qtbot.waitSignal(loader.ready, timeout=2000):
+            loader.request("k1", small_png, 44)
+        assert callbacks == ["k1"]
+
+    def test_failed_request_is_not_requeued_by_repaint(self, qtbot, tmp_path: Path) -> None:
+        loader = ThumbnailLoader()
+        missing = tmp_path / "missing.png"
+        with qtbot.assertNotEmitted(loader.ready, wait=250):
+            loader.request("missing", missing, 44)
+        before = len(loader._in_flight)
+        loader.request("missing", missing, 44)
+        assert len(loader._in_flight) == before
 
 
 class TestDiskCache:

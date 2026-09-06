@@ -171,6 +171,27 @@ class TestFolderGroups:
         finally:
             anim.set_animations_enabled(False)
 
+    def test_expand_animation_starts_at_zero_and_keeps_rows_natural(
+        self, panel: FilePanel
+    ) -> None:
+        group = panel.folder_group(FOLDER_ROOT_LABEL)
+        assert group is not None
+        anim.set_animations_enabled(True)
+        try:
+            group.set_open(False, animate=False)
+            natural = group._content.sizeHint().height()
+            group.set_open(True, animate=True)
+            assert group._anim is not None
+            assert group._anim.startValue() == 0
+            assert group._anim.endValue() == natural
+            group._anim.setCurrentTime(group._anim.duration() // 2)
+            assert 0 < group._content.maximumHeight() < natural
+            body = group._content.layout().itemAt(0).widget()
+            assert body is not None
+            assert body.height() >= natural - 12
+        finally:
+            anim.set_animations_enabled(False)
+
 
 class TestClickSemantics:
     def test_plain_click_sets_current_and_anchor(
@@ -215,6 +236,41 @@ class TestClickSemantics:
 
 
 class TestSelectionRow:
+    def test_select_all_uses_only_matching_results(self, qtbot, panel, controller) -> None:
+        controller.set_filter("0003")
+        qtbot.mouseClick(panel.select_all_box, Qt.MouseButton.LeftButton)
+        assert controller.selected_keys() == (K3,)
+        assert panel.select_all_box.checkState() == Qt.CheckState.Checked
+        assert panel.selected_label.text() == "已选 1"
+        assert panel.all_row.check.checkState() == Qt.CheckState.PartiallyChecked
+        qtbot.mouseClick(panel.select_all_box, Qt.MouseButton.LeftButton)
+        assert controller.selected_keys() == ()
+
+    def test_filter_removes_hidden_selection_and_updates_partial_state(
+        self, qtbot, panel, controller
+    ) -> None:
+        controller.toggle_selected(K1)
+        controller.toggle_selected(K3)
+        controller.set_filter("hair")
+        assert controller.selected_keys() == (K1,)
+        assert panel.select_all_box.checkState() == Qt.CheckState.PartiallyChecked
+        qtbot.mouseClick(panel.select_all_box, Qt.MouseButton.LeftButton)
+        assert controller.selected_keys() == (K1, K2)
+        assert panel.select_all_box.checkState() == Qt.CheckState.Checked
+
+    def test_no_results_disables_filtered_selection_but_all_stays_global(
+        self, qtbot, panel, controller
+    ) -> None:
+        controller.set_filter("no-matching-files")
+        assert not panel.select_all_box.isEnabled()
+        assert panel.select_all_box.checkState() == Qt.CheckState.Unchecked
+        qtbot.mouseClick(panel.all_row.check, Qt.MouseButton.LeftButton)
+        assert controller.selected_keys() == (K1, K2, K3, K4)
+        assert panel.all_row.check.checkState() == Qt.CheckState.Checked
+        assert not panel.select_all_box.isEnabled()
+        qtbot.mouseClick(panel.clear_button, Qt.MouseButton.LeftButton)
+        assert controller.selected_keys() == ()
+
     def test_select_all_checkbox(self, qtbot, panel: FilePanel, controller) -> None:
         assert panel.select_all_box.text() == TEXT_SELECT_ALL
         qtbot.mouseClick(panel.select_all_box, Qt.MouseButton.LeftButton)
@@ -309,6 +365,21 @@ class TestPaintAndTheme:
 
 
 class TestFolderMultiSelect:
+    def test_folder_check_uses_results_but_menu_keeps_whole_folder(
+        self, qtbot, qapp, panel, controller
+    ) -> None:
+        controller.set_filter("0003")
+        qapp.processEvents()
+        group = panel.folder_group("10_concept")
+        qtbot.mouseClick(group.check, Qt.MouseButton.LeftButton)
+        assert controller.selected_keys() == (K3,)
+        assert group.check.checkState() == Qt.CheckState.Checked
+        assert controller.folder_keys("10_concept") == (K3, K4)
+        labels = [label for label, _action in panel.infer_menu_actions("10_concept")]
+        assert "用 LLM 推理此文件夹(2 张)" in labels
+        qtbot.mouseClick(group.check, Qt.MouseButton.LeftButton)
+        assert controller.selected_keys() == ()
+
     def test_folder_checkbox_selects_whole_folder(
         self, qtbot, panel: FilePanel, controller: AppController
     ) -> None:
@@ -357,9 +428,9 @@ class TestInferMenu:
         labels = [label for label, _run in panel.infer_menu_actions("10_concept")]
         assert "用 LLM 推理此文件夹(2 张)" in labels
         assert "用本地模型推理此文件夹(2 张)" in labels
-        assert "分层推标此文件夹(2 张)" in labels
-        assert "分层推标此文件夹未标注(1 张)" in labels
-        assert "分层推标全部(4 张)" in labels
+        assert "CHA标注此文件夹(2 张)" in labels
+        assert "CHA标注此文件夹未标注(1 张)" in labels
+        assert "CHA标注全部(4 张)" in labels
         assert "用 LLM 推理此文件夹未标注(1 张)" in labels
         assert "用本地模型推理此文件夹未标注(1 张)" in labels
         assert "用 LLM 推理全部(4 张)" in labels
@@ -394,7 +465,7 @@ class TestInferMenu:
         assert labels == [
             "用 LLM 推理这张图片",
             "用本地模型推理这张图片",
-            "分层推标这张图片",
+            "CHA标注这张图片",
         ]
 
     def test_image_menu_multiselect_adds_selected_and_all(
@@ -419,7 +490,7 @@ class TestInferMenu:
         assert labels == [
             "用 LLM 推理这张图片",
             "用本地模型推理这张图片",
-            "分层推标这张图片",
+            "CHA标注这张图片",
         ]
 
     def test_image_action_infers_single_key(
@@ -448,7 +519,7 @@ class TestInferMenu:
         panel.layered_infer_requested.connect(
             lambda keys: received.append(tuple(keys))
         )
-        dict(panel.infer_menu_actions(None, image=K2))["分层推标这张图片"]()
+        dict(panel.infer_menu_actions(None, image=K2))["CHA标注这张图片"]()
         assert received == [(K2,)]
         assert confirms == []
 

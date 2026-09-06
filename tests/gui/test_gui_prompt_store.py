@@ -9,11 +9,15 @@ import pytest
 from nlapt.core.errors import StorageError
 
 from nlapt_gui.prompt_store import (
+    BUILTIN_PROMPT_ORDER,
     DEFAULT_PROMPT_NAME,
     DEFAULT_USER_PROMPT,
     ENGINE_LLM,
     ENGINE_LOCAL,
+    PROMPT_OBJECTIVE_REPORT,
+    PROMPT_STRUCTURED_COMPILER,
     VisionPrompts,
+    is_locked_template,
     load_vision_prompts,
     save_vision_prompts,
     vision_prompts_path,
@@ -28,9 +32,37 @@ class TestModel:
         assert prompts.user_prompt == ""
         assert prompts.effective_user_prompt() == DEFAULT_USER_PROMPT
 
-    def test_names_lists_default_first(self) -> None:
+    def test_names_lists_default_then_builtins_then_custom(self) -> None:
         prompts = VisionPrompts(prompts={"动漫": "sys-a", "写实": "sys-b"})
-        assert prompts.names() == (DEFAULT_PROMPT_NAME, "动漫", "写实")
+        assert prompts.names() == (
+            DEFAULT_PROMPT_NAME,
+            *BUILTIN_PROMPT_ORDER,
+            "动漫",
+            "写实",
+        )
+        assert BUILTIN_PROMPT_ORDER == (
+            PROMPT_STRUCTURED_COMPILER,
+            PROMPT_OBJECTIVE_REPORT,
+        )
+
+    def test_builtin_system_text_is_shipped_scheme(self) -> None:
+        compiler = VisionPrompts(active=PROMPT_STRUCTURED_COMPILER)
+        assert "Visual Prompt Compiler v2.1" in compiler.system_text()
+        assert "PURE POSITIVE ONLY" in compiler.system_text()
+        report = VisionPrompts(active=PROMPT_OBJECTIVE_REPORT)
+        assert "image analysis system" in report.system_text()
+        assert "{NAME}" in report.system_text()
+        assert is_locked_template(PROMPT_STRUCTURED_COMPILER)
+        assert is_locked_template(DEFAULT_PROMPT_NAME)
+        assert not is_locked_template("动漫")
+
+    def test_custom_override_wins_over_builtin_body(self) -> None:
+        prompts = VisionPrompts(
+            active=PROMPT_STRUCTURED_COMPILER,
+            prompts={PROMPT_STRUCTURED_COMPILER: "user-override"},
+        )
+        assert prompts.system_text() == "user-override"
+        assert prompts.names()[1] == PROMPT_STRUCTURED_COMPILER
 
     def test_system_text_of_active_custom(self) -> None:
         prompts = VisionPrompts(active="动漫", prompts={"动漫": "sys-a"})
@@ -119,6 +151,17 @@ class TestPersistence:
             encoding="utf-8",
         )
         assert load_vision_prompts(target).active == DEFAULT_PROMPT_NAME
+
+    def test_builtin_active_survives_empty_custom_map(self, tmp_path: Path) -> None:
+        target = tmp_path / "vision_prompts.json"
+        target.write_text(
+            f'{{"active": "{PROMPT_OBJECTIVE_REPORT}", "prompts": {{}}, "user_prompt": ""}}',
+            encoding="utf-8",
+        )
+        loaded = load_vision_prompts(target)
+        assert loaded.active == PROMPT_OBJECTIVE_REPORT
+        assert "{NAME}" in loaded.system_text()
+        assert PROMPT_OBJECTIVE_REPORT not in loaded.prompts
 
     def test_default_name_never_stored_as_custom(self, tmp_path: Path) -> None:
         target = tmp_path / "vision_prompts.json"

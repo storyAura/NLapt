@@ -28,6 +28,7 @@ from nlapt_gui.theme.tokens import ThemeTokens
 from nlapt_gui.widgets.thumbnails import ThumbnailLoader
 
 CARD_TITLE_FMT = "候选 {n}"
+CARD_MODEL_FMT = "模型: {model}"
 BUTTON_REGEN_ONE = "重新生成"
 PLACEHOLDER_CARD = "生成中…"
 PLACEHOLDER_ZH = "中文对照将显示在这里"
@@ -36,6 +37,9 @@ THUMB_H = 110
 THUMB_W = 110
 STRIP_H = 132
 PREVIEW_MIN_H = 200
+# Scroll viewport stays this size so long 中文对照 cannot inflate the wizard.
+CARDS_SCROLL_HINT = QSize(480, 360)
+CARDS_SCROLL_MIN = QSize(240, 160)
 
 
 class CandidateCard(QFrame):
@@ -48,6 +52,9 @@ class CandidateCard(QFrame):
         self.index = index
         self.setProperty("surfaceCard", True)
         self.radio = QRadioButton(CARD_TITLE_FMT.format(n=index + 1), self)
+        self.model_label = QLabel("", self)
+        self.model_label.setProperty("muted", True)
+        self.model_label.hide()
         self.english = QPlainTextEdit(self)
         self.english.setPlaceholderText(PLACEHOLDER_CARD)
         self.english.setMinimumHeight(ENGLISH_MIN_H)
@@ -63,7 +70,8 @@ class CandidateCard(QFrame):
 
         head = QHBoxLayout()
         head.setContentsMargins(0, 0, 0, 0)
-        head.addWidget(self.radio, 1)
+        head.addWidget(self.radio)
+        head.addWidget(self.model_label, 1)
         head.addWidget(self.regen)
 
         body = QVBoxLayout(self)
@@ -86,6 +94,12 @@ class CandidateCard(QFrame):
         """Replace the review-only Chinese gloss."""
         self.chinese.setText(text if text.strip() else PLACEHOLDER_ZH)
 
+    def set_model_name(self, model: str) -> None:
+        """Show which model this slot calls; hide the label when empty."""
+        name = model.strip()
+        self.model_label.setText(CARD_MODEL_FMT.format(model=name) if name else "")
+        self.model_label.setVisible(bool(name))
+
     def set_busy(self, busy: bool) -> None:
         """Disable editing while this slot is in flight."""
         self.english.setReadOnly(busy)
@@ -95,6 +109,28 @@ class CandidateCard(QFrame):
 
     def _refresh_stats(self) -> None:
         self.stats.setText(format_card_stats(self.english.toPlainText()))
+
+
+class CardsScrollArea(QScrollArea):
+    """Candidate-card viewport with a stable size hint.
+
+    A wrapping ``QLabel`` for 中文对照 grows with the text. Without a
+    capped scroll area that sizeHint bubbles to the dialog, the window
+    jumps to ``y=0`` and the title bar goes off-screen.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        return CARDS_SCROLL_HINT
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        return CARDS_SCROLL_MIN
 
 
 class PreviewPane(QLabel):

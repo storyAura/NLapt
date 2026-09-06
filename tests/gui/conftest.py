@@ -36,6 +36,7 @@ DEMO_KEYS: tuple[str, ...] = (
 def _isolated_data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Point app_data_dir() at a per-test directory (never the real one)."""
     monkeypatch.setenv("NLAPT_DATA_DIR", str(tmp_path / "appdata"))
+    monkeypatch.setenv("NLAPT_DOCUMENTS_DIR", str(tmp_path / "documents"))
 
 
 @pytest.fixture(autouse=True)

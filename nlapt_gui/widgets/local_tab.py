@@ -16,7 +16,7 @@ from PySide6.QtCore import Qt, QThreadPool, QUrl
 from PySide6.QtGui import QDesktopServices, QShowEvent
 from PySide6.QtWidgets import QFileDialog, QTreeWidgetItem, QWidget
 
-from nlapt.core.config import LLMProfile, load_config, save_config
+from nlapt.core.config import LLMProfile
 from nlapt.core.errors import NLaptError, StorageError, ValidationError
 from nlapt.diagnostics import get_logger
 from nlapt.local.advisor import RunAssessment, RunGrade, assess, estimate_memory
@@ -35,6 +35,7 @@ from nlapt.local.presets import PRESET_CUSTOM, presets_for
 from nlapt.local.runtime import LLAMA_CPP_TAG
 from nlapt.local.server import base_url as local_base_url
 
+from nlapt_gui.api_config import load_app_config, save_app_config
 from nlapt_gui.controller import AppController, TOAST_ERR, TOAST_OK, TOAST_WARN
 from nlapt_gui.local_bridge import (
     DOWNLOAD_CANCELLED,
@@ -47,8 +48,6 @@ from nlapt_gui.local_bridge import (
     default_models_dir,
     runtime_supported,
 )
-from nlapt_gui.resources import config_path
-
 _LOGGER = get_logger(__name__)
 
 LOCAL_PROFILE_NAME = "local"
@@ -715,7 +714,7 @@ class LocalTab(QWidget):
     def _apply_profile(self, family: ModelFamily) -> None:
         """Register/refresh the ``local`` profile and make it active."""
         try:
-            existing = load_config(config_path())
+            existing = load_app_config()
         except (ValidationError, StorageError):
             _LOGGER.exception("could not read config before applying local profile")
             self._toast(TOAST_CONFIG_UNREADABLE, TOAST_ERR)
@@ -737,7 +736,7 @@ class LocalTab(QWidget):
             request=_dc_replace(existing.request, concurrency=settings.parallel),
         )
         try:
-            save_config(config_path(), config)
+            save_app_config(config)
         except NLaptError as exc:
             _LOGGER.exception("could not save config while applying local profile")
             self._toast(TOAST_SETTINGS_FAILED.format(message=exc.message), TOAST_ERR)

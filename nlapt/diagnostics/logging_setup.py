@@ -55,12 +55,17 @@ def _remove_managed_handlers(logger: logging.Logger) -> None:
 
 
 def configure_logging(
-    log_dir: Path | None = None, level: str = "INFO", json_lines: bool = False
+    log_dir: Path | None = None,
+    level: str = "INFO",
+    json_lines: bool = False,
+    *,
+    console: bool = False,
 ) -> logging.Logger:
     """Configure the root ``nlapt`` logger. Idempotent (no duplicate handlers).
 
-    Adds a console handler always, plus a rotating file handler
-    (``nlapt.log``, 5 MB x 3) when ``log_dir`` is given.
+    Adds a rotating file handler (``nlapt.log``, 5 MB x 3) when ``log_dir``
+    is given. A console ``StreamHandler`` is added only when ``console`` is
+    true (the GUI 调试模式); file logging is independent of that flag.
     """
     numeric_level = _resolve_level(level)
     logger = logging.getLogger(LOGGER_ROOT)
@@ -70,10 +75,11 @@ def configure_logging(
         JsonLinesFormatter() if json_lines else logging.Formatter(LOG_FORMAT)
     )
 
-    console = logging.StreamHandler()
-    console.setFormatter(formatter)
-    setattr(console, _MANAGED_ATTR, True)
-    logger.addHandler(console)
+    if console:
+        stream = logging.StreamHandler()
+        stream.setFormatter(formatter)
+        setattr(stream, _MANAGED_ATTR, True)
+        logger.addHandler(stream)
 
     if log_dir is not None:
         directory = Path(log_dir)

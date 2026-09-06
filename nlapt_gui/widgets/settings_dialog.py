@@ -1,4 +1,4 @@
-"""设置 dialog - 翻译服务 / LLM 设置 / 提示词 / 本地推理 four-tab window.
+"""设置 dialog - 翻译服务 / LLM 设置 / 提示词 / 本地推理 / CHA标注 five-tab window.
 
 Spec module 3: the translation-service selection and the LLM profile are two
 separate tabs; the LLM tab supports a 统一 (one multimodal model for text +
@@ -8,8 +8,8 @@ tab manages the custom system/user prompts used before image inference; the
 本地推理 tab reserves the future in-app local-model module.
 
 Edits a single ``default`` profile of the core :class:`AppConfig`. 测试连接
-runs an async connectivity probe; 保存 persists ``app_data_dir()/config.json``
-via the core ``save_config`` and asks the controller to rebuild its translator.
+runs an async connectivity probe; 保存 writes LLM profiles to
+``Documents/NLapt/api.json`` and non-interface fields to ``config.json``.
 
 This dialog is the sanctioned exception to the "widgets only talk to the
 controller" rule: the migration contract routes config IO and the connection
@@ -38,41 +38,57 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from nlapt.core.config import AppConfig, LLMProfile, load_config, save_config
+from nlapt.core.config import AppConfig, LLMProfile
 from nlapt.core.errors import LLMError, NLaptError, StorageError, ValidationError
-from nlapt.diagnostics import get_logger
+from nlapt.diagnostics import configure_logging, get_logger
 from nlapt.llm.base import create_client
 from nlapt.llm.model_list import list_models
 from nlapt.llm.translate import Direction, Translator, detect_direction
 from nlapt.llm.web_translate import (
     PROVIDER_BAIDU,
+    PROVIDER_CUSTOM,
     PROVIDER_DEEPL,
+    PROVIDER_DEEPLX,
     PROVIDER_LLM,
+    PROVIDER_LOCAL_MT,
     REGISTRATION_INFO,
     create_provider,
 )
+from nlapt.local.mt_catalog import DEFAULT_TIER
 
+from nlapt_gui.api_config import load_app_config, save_app_config
+from nlapt_gui.cha_config import API_MODE_OWN, load_cha_settings, save_cha_settings
 from nlapt_gui.controller import AppController, TOAST_ERR, TOAST_OK, TOAST_WARN
+from nlapt_gui.mt_bridge import LocalMTProvider, is_tier_downloaded
 from nlapt_gui.prompt_store import load_vision_prompts, save_vision_prompts
-from nlapt_gui.resources import config_path
+from nlapt_gui.resources import app_data_dir, config_path
+from nlapt_gui.settings import load_ui_settings, save_ui_settings
 from nlapt_gui.translate_config import (
     KNOWN_PROVIDERS,
+    PROVIDER_LABELS,
     TranslationConfig,
     load_translation_config,
     save_translation_config,
 )
+from nlapt_gui.widgets.cha_tab import CHATab
 from nlapt_gui.widgets.dialogs import CenteredDialog
+from nlapt_gui.widgets.fallback_order import LABEL_FALLBACK, FallbackOrderEditor
 from nlapt_gui.widgets.local_tab import LocalTab
 from nlapt_gui.widgets.model_picker import ModelPickerDialog
+from nlapt_gui.widgets.mt_models_dialog import MTModelsDialog
+from nlapt_gui.widgets.mt_tier_picker import MtTierPicker
 from nlapt_gui.widgets.prompt_editor import PromptsTab
-from nlapt_gui.workers import run_async
+from nlapt_gui.workers import run_async, set_debug
+
+# Re-export so existing tests keep importing config_path from this module.
+_ = config_path
 
 _LOGGER = get_logger(__name__)
 
 DEFAULT_PROFILE_NAME = "default"
 DEFAULT_API_TYPES: tuple[str, ...] = ("openai", "anthropic", "ollama")
 DIALOG_WIDTH = 480
-DIALOG_MIN_HEIGHT = 460
+DIALOG_MIN_HEIGHT = 620
 SECTION_GAP = 10
 FORM_LABEL_MIN_W = 88
 FORM_V_GAP = 8
@@ -85,6 +101,7 @@ TAB_TRANSLATE = "翻译服务"
 TAB_LLM = "LLM 设置"
 TAB_PROMPTS = "提示词"
 TAB_LOCAL = "本地推理"
+TAB_CHA = "CHA标注"
 LABEL_API_TYPE = "接口类型"
 LABEL_BASE_URL = "Base URL"
 LABEL_API_KEY = "API Key"
@@ -114,23 +131,31 @@ LABEL_BAIDU_APPID = "百度 APPID"
 LABEL_BAIDU_KEY = "百度密钥"
 LABEL_DEEPL_KEY = "DeepL API Key"
 BUTTON_TEST_TRANSLATE = "测试翻译"
-TR_NOTE = "翻译服务用于工作区的 翻译 / 重译 与右栏的翻译对照;选择「大模型」时使用下方 LLM 设置中的档案。"
+TR_NOTE = (
+    "翻译服务用于工作区的 翻译 / 重译 与右栏的翻译对照;"
+    "选择「大模型」时使用下方 LLM 设置中的档案。"
+    "首选失败时按备选顺序继续尝试。"
+)
+LABEL_DEBUG = "调试模式"
+HINT_DEBUG = "打开后在启动器控制台打印详细日志（含异常堆栈）"
+LOG_DIR_NAME = "logs"
 TR_TEST_SAMPLE = "你好世界"
 TOAST_TR_TEST_OK = "翻译测试成功: {result}"
 TOAST_TR_TEST_FAIL = "翻译测试失败: {message}"
 TOAST_TR_NEED_KEY = "请先填写所选翻译服务所需的密钥"
-
-# Human-readable dropdown labels per provider id (UI stays Chinese).
-PROVIDER_LABELS: dict[str, str] = {
-    "llm": "大模型 (LLM)",
-    "google": "Google 翻译 (免费)",
-    "baidu": "百度翻译",
-    "deepl": "DeepL",
-}
+TOAST_TR_NEED_CUSTOM = "请填写自定义翻译的 Base URL 与模型"
+TOAST_TR_NEED_DEEPLX = "请填写 DeepLX 接口地址"
+TOAST_TR_NEED_LOCAL_MT = "请先下载所选档位的本地翻译模型"
+LABEL_DEEPLX_URL = "DeepLX 地址"
+LABEL_DEEPLX_TOKEN = "访问令牌"
+HINT_DEEPLX_URL = "http://127.0.0.1:1188"
+LABEL_CUSTOM_URL = "Base URL"
+LABEL_CUSTOM_KEY = "API Key"
+LABEL_CUSTOM_MODEL = "模型"
 
 
 class SettingsDialog(CenteredDialog):
-    """Modal 设置 dialog: four tabs, centered on the app with fade in/out."""
+    """Modal 设置 dialog: five tabs, centered on the app with fade in/out."""
 
     saved = Signal(object)  # AppConfig just persisted
 
@@ -156,7 +181,7 @@ class SettingsDialog(CenteredDialog):
         self._existing: AppConfig | None
         self._load_error: str | None
         try:
-            self._existing = load_config(config_path())
+            self._existing = load_app_config()
             self._load_error = None
         except (ValidationError, StorageError) as exc:
             self._existing = None
@@ -172,6 +197,14 @@ class SettingsDialog(CenteredDialog):
         self.tabs.addTab(self.prompts_tab, TAB_PROMPTS)
         self.local_tab = LocalTab(controller, pool=self._pool, parent=self)
         self.tabs.addTab(self.local_tab, TAB_LOCAL)
+        self.cha_tab = CHATab(
+            main_profile_provider=self.current_profile,
+            api_types=api_types,
+            pool=self._pool,
+            parent=self,
+        )
+        self.cha_tab.toast_requested.connect(self._controller.toast_requested.emit)
+        self.tabs.addTab(self.cha_tab, TAB_CHA)
 
         self.cancel_button = QPushButton(BUTTON_CANCEL, self)
         self.cancel_button.setProperty("variant", "outline")
@@ -189,6 +222,7 @@ class SettingsDialog(CenteredDialog):
         layout.addLayout(buttons)
 
         self._prefill()
+        self.cha_tab.prefill(load_cha_settings())
         self._prefill_translation()
         self._on_provider_changed()
         self._on_unified_toggled()
@@ -216,6 +250,16 @@ class SettingsDialog(CenteredDialog):
         self.baidu_key.setEchoMode(QLineEdit.EchoMode.Password)
         self.deepl_key = QLineEdit(tab)
         self.deepl_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.deeplx_url = QLineEdit(tab)
+        self.deeplx_url.setPlaceholderText(HINT_DEEPLX_URL)
+        self.deeplx_token = QLineEdit(tab)
+        self.deeplx_token.setEchoMode(QLineEdit.EchoMode.Password)
+        self.custom_base_url = QLineEdit(tab)
+        self.custom_api_key = QLineEdit(tab)
+        self.custom_api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.custom_model = QLineEdit(tab)
+        self.local_mt_tier = MtTierPicker(tab)
+        self.local_mt_tier.manage_button.clicked.connect(self._open_mt_models)
         self.registration_note = QLabel(tab)
         self.registration_note.setWordWrap(True)
         self.registration_note.setProperty("muted", True)
@@ -233,14 +277,31 @@ class SettingsDialog(CenteredDialog):
         self._baidu_appid_label = QLabel(LABEL_BAIDU_APPID, tab)
         self._baidu_key_label = QLabel(LABEL_BAIDU_KEY, tab)
         self._deepl_key_label = QLabel(LABEL_DEEPL_KEY, tab)
+        self._deeplx_url_label = QLabel(LABEL_DEEPLX_URL, tab)
+        self._deeplx_token_label = QLabel(LABEL_DEEPLX_TOKEN, tab)
+        self._custom_url_label = QLabel(LABEL_CUSTOM_URL, tab)
+        self._custom_key_label = QLabel(LABEL_CUSTOM_KEY, tab)
+        self._custom_model_label = QLabel(LABEL_CUSTOM_MODEL, tab)
         tr_form.addRow(self._baidu_appid_label, self.baidu_appid)
         tr_form.addRow(self._baidu_key_label, self.baidu_key)
         tr_form.addRow(self._deepl_key_label, self.deepl_key)
+        tr_form.addRow(self._deeplx_url_label, self.deeplx_url)
+        tr_form.addRow(self._deeplx_token_label, self.deeplx_token)
+        tr_form.addRow(self._custom_url_label, self.custom_base_url)
+        tr_form.addRow(self._custom_key_label, self.custom_api_key)
+        tr_form.addRow(self._custom_model_label, self.custom_model)
         self._tune_form(tr_form)
 
         note = QLabel(TR_NOTE, tab)
         note.setProperty("muted", True)
         note.setWordWrap(True)
+        self.debug_check = QCheckBox(LABEL_DEBUG, tab)
+        debug_hint = QLabel(HINT_DEBUG, tab)
+        debug_hint.setProperty("muted", True)
+        debug_hint.setWordWrap(True)
+
+        self.fallback_editor = FallbackOrderEditor(tab)
+        fallback_label = QLabel(LABEL_FALLBACK, tab)
 
         button_row = QHBoxLayout()
         button_row.addWidget(self.test_translate_button)
@@ -250,8 +311,13 @@ class SettingsDialog(CenteredDialog):
         column.setSpacing(SECTION_GAP)
         column.addLayout(tr_form)
         column.addWidget(self.registration_note)
+        column.addWidget(self.local_mt_tier)
+        column.addWidget(fallback_label)
+        column.addWidget(self.fallback_editor)
         column.addLayout(button_row)
         column.addWidget(note)
+        column.addWidget(self.debug_check)
+        column.addWidget(debug_hint)
         column.addStretch(1)
         return tab
 
@@ -334,6 +400,13 @@ class SettingsDialog(CenteredDialog):
             baidu_appid=self.baidu_appid.text().strip(),
             baidu_key=self.baidu_key.text().strip(),
             deepl_key=self.deepl_key.text().strip(),
+            deeplx_url=self.deeplx_url.text().strip(),
+            deeplx_token=self.deeplx_token.text().strip(),
+            custom_base_url=self.custom_base_url.text().strip(),
+            custom_api_key=self.custom_api_key.text().strip(),
+            custom_model=self.custom_model.text().strip(),
+            local_mt_tier=self._selected_mt_tier(),
+            fallback_order=self.fallback_editor.order(),
         )
 
     def is_unified(self) -> bool:
@@ -443,6 +516,10 @@ class SettingsDialog(CenteredDialog):
                 return
         elif not self._validate_web(provider_id):
             return
+        cha = self.cha_tab.current_settings()
+        if cha.api_mode == API_MODE_OWN and not cha.base_url:
+            self._toast(TOAST_NEED_BASE_URL, TOAST_WARN)
+            return
         # Refuse to overwrite an unreadable core config BEFORE writing anything.
         if write_llm and (self._load_error is not None or self._existing is None):
             self._toast(TOAST_LOAD_FAILED, TOAST_ERR)
@@ -455,6 +532,11 @@ class SettingsDialog(CenteredDialog):
             self._toast(str(exc), TOAST_ERR)
         # Local-inference tab persists its own file (errors toast internally).
         self.local_tab.persist()
+        try:
+            save_cha_settings(self.cha_tab.current_settings())
+        except NLaptError as exc:
+            _LOGGER.exception("could not persist CHA settings")
+            self._toast(str(exc), TOAST_ERR)
         saved_config: AppConfig | None = None
         if write_llm:
             profile = self.current_profile()
@@ -477,13 +559,14 @@ class SettingsDialog(CenteredDialog):
                 custom_templates=existing.custom_templates,
                 trigger_presets=existing.trigger_presets,
             )
-            save_config(config_path(), config)
+            save_app_config(config)
             self._controller.reload_config(config)
             saved_config = config
         else:
             # No LLM write: still drop the cached translator so a provider
             # switch away from/back to LLM re-resolves cleanly.
             self._controller.invalidate_translator()
+        self._persist_debug()
         _LOGGER.info("settings saved (translation provider=%s)", provider_id)
         self._toast(TOAST_SAVED, TOAST_OK)
         self.saved.emit(saved_config if saved_config is not None else self._existing)
@@ -504,13 +587,23 @@ class SettingsDialog(CenteredDialog):
 
     def _validate_web(self, provider_id: str) -> bool:
         """Ensure the selected web provider has its required credentials."""
+        if provider_id == PROVIDER_LOCAL_MT:
+            if not is_tier_downloaded(self._selected_mt_tier()):
+                self._toast(TOAST_TR_NEED_LOCAL_MT, TOAST_WARN)
+                return False
+            return True
         info = REGISTRATION_INFO.get(provider_id, {})
         if not info.get("needs_key"):
             return True
         try:
             create_provider(provider_id, self.translation_config().credentials())
         except LLMError:
-            self._toast(TOAST_TR_NEED_KEY, TOAST_WARN)
+            if provider_id == PROVIDER_CUSTOM:
+                self._toast(TOAST_TR_NEED_CUSTOM, TOAST_WARN)
+            elif provider_id == PROVIDER_DEEPLX:
+                self._toast(TOAST_TR_NEED_DEEPLX, TOAST_WARN)
+            else:
+                self._toast(TOAST_TR_NEED_KEY, TOAST_WARN)
             return False
         return True
 
@@ -526,6 +619,11 @@ class SettingsDialog(CenteredDialog):
             return lambda: translator.translate(
                 "settings-test", TR_TEST_SAMPLE, direction
             ).translated
+        if provider_id == PROVIDER_LOCAL_MT:
+            if not self._validate_web(PROVIDER_LOCAL_MT):
+                return None
+            provider = LocalMTProvider(self._selected_mt_tier(), retry_sleep=time.sleep)
+            return lambda: provider.translate(TR_TEST_SAMPLE, direction)
         provider = create_provider(
             provider_id, self.translation_config().credentials()
         )
@@ -544,9 +642,18 @@ class SettingsDialog(CenteredDialog):
         self.registration_note.setText(str(info.get("note_zh", "")))
         is_baidu = provider_id == PROVIDER_BAIDU
         is_deepl = provider_id == PROVIDER_DEEPL
+        is_deeplx = provider_id == PROVIDER_DEEPLX
+        is_custom = provider_id == PROVIDER_CUSTOM
         self._tr_form.setRowVisible(self.baidu_appid, is_baidu)
         self._tr_form.setRowVisible(self.baidu_key, is_baidu)
         self._tr_form.setRowVisible(self.deepl_key, is_deepl)
+        self._tr_form.setRowVisible(self.deeplx_url, is_deeplx)
+        self._tr_form.setRowVisible(self.deeplx_token, is_deeplx)
+        self._tr_form.setRowVisible(self.custom_base_url, is_custom)
+        self._tr_form.setRowVisible(self.custom_api_key, is_custom)
+        self._tr_form.setRowVisible(self.custom_model, is_custom)
+        self.fallback_editor.set_primary(provider_id)
+        self.local_mt_tier.refresh()
 
     def _on_unified_toggled(self, *_args: object) -> None:
         """统一模式: one shared model row + multimodal hint; otherwise split rows."""
@@ -558,6 +665,33 @@ class SettingsDialog(CenteredDialog):
     def _toast(self, text: str, kind: str) -> None:
         self._controller.toast_requested.emit(text, kind)
 
+    def _persist_debug(self) -> None:
+        """Write UISettings.debug and reconfigure console / worker stacks now."""
+        enabled = self.debug_check.isChecked()
+        self._controller.update_settings(debug=enabled)
+        try:
+            disk = load_ui_settings()
+            merged = _dc_replace(
+                self._controller.settings, theme=disk.theme, accent=disk.accent
+            )
+            save_ui_settings(merged)
+        except NLaptError as exc:
+            _LOGGER.warning("could not persist debug setting: %s", exc)
+        configure_logging(app_data_dir() / LOG_DIR_NAME, console=enabled)
+        set_debug(enabled)
+
+    def _selected_mt_tier(self) -> str:
+        data = self.local_mt_tier.currentData()
+        return str(data) if data is not None else DEFAULT_TIER
+
+    def _refresh_mt_tier_labels(self, selected: str | None = None) -> None:
+        self.local_mt_tier.refresh(selected)
+
+    def _open_mt_models(self) -> None:
+        dialog = MTModelsDialog(parent=self)
+        dialog.exec()
+        self.local_mt_tier.refresh()
+
     def _prefill_translation(self) -> None:
         config = self._translation_config
         index = self.provider.findData(config.provider)
@@ -566,6 +700,15 @@ class SettingsDialog(CenteredDialog):
         self.baidu_appid.setText(config.baidu_appid)
         self.baidu_key.setText(config.baidu_key)
         self.deepl_key.setText(config.deepl_key)
+        self.deeplx_url.setText(config.deeplx_url)
+        self.deeplx_token.setText(config.deeplx_token)
+        self.custom_base_url.setText(config.custom_base_url)
+        self.custom_api_key.setText(config.custom_api_key)
+        self.custom_model.setText(config.custom_model)
+        self._refresh_mt_tier_labels(config.local_mt_tier)
+        self.fallback_editor.set_primary(config.provider)
+        self.fallback_editor.set_order(config.fallback_order)
+        self.debug_check.setChecked(self._controller.settings.debug)
 
     def _prefill(self) -> None:
         config = self._existing

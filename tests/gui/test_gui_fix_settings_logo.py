@@ -25,9 +25,12 @@ from PySide6.QtWidgets import QFrame
 from nlapt.app import NLaptApp
 from nlapt.llm.web_translate import (
     PROVIDER_BAIDU,
+    PROVIDER_CUSTOM,
     PROVIDER_DEEPL,
+    PROVIDER_DEEPLX,
     PROVIDER_GOOGLE,
     PROVIDER_LLM,
+    PROVIDER_LOCAL_MT,
 )
 
 from nlapt_gui.controller import AppController
@@ -82,32 +85,110 @@ def _deepl_widgets(dialog: SettingsDialog) -> tuple[object, ...]:
     return (dialog._deepl_key_label, dialog.deepl_key)
 
 
+def _deeplx_widgets(dialog: SettingsDialog) -> tuple[object, ...]:
+    return (
+        dialog._deeplx_url_label,
+        dialog.deeplx_url,
+        dialog._deeplx_token_label,
+        dialog.deeplx_token,
+    )
+
+
+def _custom_widgets(dialog: SettingsDialog) -> tuple[object, ...]:
+    return (
+        dialog._custom_url_label,
+        dialog.custom_base_url,
+        dialog._custom_key_label,
+        dialog.custom_api_key,
+        dialog._custom_model_label,
+        dialog.custom_model,
+    )
+
+
+def _all_secret_widgets(dialog: SettingsDialog) -> tuple[object, ...]:
+    return (
+        _baidu_widgets(dialog)
+        + _deepl_widgets(dialog)
+        + _deeplx_widgets(dialog)
+        + _custom_widgets(dialog)
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Part A - provider dropdown row visibility
 # --------------------------------------------------------------------------- #
 class TestProviderRows:
     def test_llm_hides_all_key_rows(self, dialog: SettingsDialog) -> None:
         _select(dialog, PROVIDER_LLM)
-        for widget in _baidu_widgets(dialog) + _deepl_widgets(dialog):
+        for widget in _all_secret_widgets(dialog):
             assert not widget.isVisible()
 
     def test_google_hides_all_key_rows(self, dialog: SettingsDialog) -> None:
         _select(dialog, PROVIDER_GOOGLE)
-        for widget in _baidu_widgets(dialog) + _deepl_widgets(dialog):
+        for widget in _all_secret_widgets(dialog):
             assert not widget.isVisible()
 
     def test_baidu_shows_only_baidu_rows(self, dialog: SettingsDialog) -> None:
         _select(dialog, PROVIDER_BAIDU)
         for widget in _baidu_widgets(dialog):
             assert widget.isVisible()
-        for widget in _deepl_widgets(dialog):
+        for widget in (
+            _deepl_widgets(dialog)
+            + _deeplx_widgets(dialog)
+            + _custom_widgets(dialog)
+        ):
             assert not widget.isVisible()
 
     def test_deepl_shows_only_deepl_rows(self, dialog: SettingsDialog) -> None:
         _select(dialog, PROVIDER_DEEPL)
         for widget in _deepl_widgets(dialog):
             assert widget.isVisible()
-        for widget in _baidu_widgets(dialog):
+        for widget in (
+            _baidu_widgets(dialog)
+            + _deeplx_widgets(dialog)
+            + _custom_widgets(dialog)
+        ):
+            assert not widget.isVisible()
+
+    def test_deeplx_shows_only_deeplx_rows(self, dialog: SettingsDialog) -> None:
+        _select(dialog, PROVIDER_DEEPLX)
+        for widget in _deeplx_widgets(dialog):
+            assert widget.isVisible()
+        for widget in (
+            _baidu_widgets(dialog)
+            + _deepl_widgets(dialog)
+            + _custom_widgets(dialog)
+        ):
+            assert not widget.isVisible()
+
+    def test_local_mt_hides_key_rows(self, dialog: SettingsDialog) -> None:
+        _select(dialog, PROVIDER_LOCAL_MT)
+        assert dialog.local_mt_tier.isVisible()
+        for widget in (
+            _baidu_widgets(dialog)
+            + _deepl_widgets(dialog)
+            + _deeplx_widgets(dialog)
+            + _custom_widgets(dialog)
+        ):
+            assert not widget.isVisible()
+
+    def test_local_mt_picker_lists_three_tiers(self, dialog: SettingsDialog) -> None:
+        _select(dialog, PROVIDER_GOOGLE)
+        assert dialog.local_mt_tier.isVisible()
+        assert dialog.local_mt_tier.list.count() == 3
+        assert dialog.local_mt_tier.findData("fast") == 0
+        assert dialog.local_mt_tier.findData("balanced") == 1
+        assert dialog.local_mt_tier.findData("quality") == 2
+
+    def test_custom_shows_only_custom_rows(self, dialog: SettingsDialog) -> None:
+        _select(dialog, PROVIDER_CUSTOM)
+        for widget in _custom_widgets(dialog):
+            assert widget.isVisible()
+        for widget in (
+            _baidu_widgets(dialog)
+            + _deepl_widgets(dialog)
+            + _deeplx_widgets(dialog)
+        ):
             assert not widget.isVisible()
 
     def test_switch_away_and_back_restores_rows(self, dialog: SettingsDialog) -> None:

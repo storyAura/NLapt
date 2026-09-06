@@ -15,30 +15,24 @@ from __future__ import annotations
 from collections import OrderedDict
 
 from PySide6.QtCore import (
-    QEasingCurve,
     QEvent,
     QObject,
     QPointF,
     QRectF,
     QSize,
     Qt,
-    QThreadPool,
-    QVariantAnimation,
     Signal,
 )
 from PySide6.QtGui import (
     QColor,
     QFont,
-    QFontMetrics,
     QImage,
     QImageReader,
     QMouseEvent,
     QPainter,
-    QPainterPath,
     QPaintEvent,
     QPen,
     QPixmap,
-    QWheelEvent,
 )
 from PySide6.QtWidgets import (
     QFrame,
@@ -57,23 +51,39 @@ from shiboken6 import isValid
 from nlapt.core.errors import NLaptError
 from nlapt.diagnostics import get_logger
 
-from nlapt_gui import anim
 from nlapt_gui.controller import AppController, MULTI_PREVIEW_LIMIT
-from nlapt_gui.theme.tokens import EDITOR_H_RANGE, ZOOM_RANGE, ZOOM_STEP, ThemeTokens, accent_soft
+from nlapt_gui.theme.tokens import EDITOR_H_RANGE, ZOOM_RANGE, ZOOM_STEP, ThemeTokens
+from nlapt_gui.widgets.preview_views import (
+    PREVIEW_PAD as PREVIEW_PAD,
+    IMAGE_RADIUS as IMAGE_RADIUS,
+    MULTI_RADIUS as MULTI_RADIUS,
+    MULTI_BORDER_W as MULTI_BORDER_W,
+    MULTI_GLOW_W as MULTI_GLOW_W,
+    BADGE_MARGIN as BADGE_MARGIN,
+    DIRTY_DOT_PX as DIRTY_DOT_PX,
+    DIRTY_RING_W as DIRTY_RING_W,
+    DIRTY_RING_ALPHA as DIRTY_RING_ALPHA,
+    NAME_PILL_ALPHA as NAME_PILL_ALPHA,
+    WHEEL_NOTCH as WHEEL_NOTCH,
+    IMAGE_FADE_MS as IMAGE_FADE_MS,
+    IMAGE_FADE_FROM as IMAGE_FADE_FROM,
+    TEXT_EDITING as TEXT_EDITING,
+    _InfoBar,
+    _MultiCell,
+    _SingleView,
+)
 from nlapt_gui.widgets.thumb_cells import (
     make_icon,
     mono_font,
-    overlay_text_color,
-    scrim_color,
     tokens_for_settings,
     ui_font,
 )
+from nlapt_gui.widgets.thumbnails import get_decode_pool
 from nlapt_gui.widgets.window_chrome import (
     KIND_CLOSE,
     KIND_MAX,
     KIND_MIN,
     WindowButton,
-    WindowDragHelper,
     wire_window_buttons,
 )
 from nlapt_gui.workers import run_async
@@ -84,17 +94,7 @@ HEADER_H = 46
 NAV_BUTTON_PX = 28
 POS_MIN_W = 44
 DIVIDER_H = 18
-PREVIEW_PAD = 22
-IMAGE_RADIUS = 10.0
 MULTI_GAP = 14
-MULTI_RADIUS = 12.0
-MULTI_BORDER_W = 2.0
-MULTI_GLOW_W = 3.0
-BADGE_MARGIN = 10
-DIRTY_DOT_PX = 8
-DIRTY_RING_W = 2.5
-DIRTY_RING_ALPHA = 0.35
-NAME_PILL_ALPHA = 0.55
 ZOOM_BTN_PX = 26
 ZOOM_LABEL_MIN_W = 42
 ZOOM_PILL_MARGIN_X = 16
@@ -102,10 +102,11 @@ ZOOM_PILL_MARGIN_Y = 14
 OVERFLOW_MARGIN_X = 16
 OVERFLOW_MARGIN_Y = 12
 PREVIEW_CACHE_LIMIT = 8
+PREVIEW_CACHE_PIXEL_BUDGET = 64 * 1024 * 1024
+COARSE_PREVIEW_LIMIT = 16
+COARSE_PREVIEW_EDGE = 512
+PREVIEW_ACTIVE_LIMIT = 1
 ACTUAL_SIZE_ZOOM = 100  # 双击在适配与 100% 原始尺寸间切换
-WHEEL_NOTCH = 120  # one physical wheel notch == one ZOOM_STEP (finer devices accumulate)
-IMAGE_FADE_MS = 170  # cross-fade on image change (skip-safe: content is correct meanwhile)
-IMAGE_FADE_FROM = 0.55  # starting opacity of the fade-in (fully visible content, just faint)
 SPLITTER_H = 8
 GRIP_W = 44
 GRIP_H = 3
@@ -114,7 +115,6 @@ GRIP_H = 3
 TIP_PREV = "上一张 (Alt+↑)"
 TIP_NEXT = "下一张 (Alt+↓)"
 TEXT_DIRTY = "未保存"
-TEXT_EDITING = "编辑中"
 TEXT_FIT = "适应"
 TIP_ZOOM_IN = "放大"
 TIP_ZOOM_OUT = "缩小"
@@ -134,367 +134,18 @@ def _read_full(path: str) -> QImage:
     return image
 
 
-class _SingleView(QWidget):
-    """Centered single-image view with cursor-anchored zoom and drag-to-pan.
-
-    The widget lives inside the panel's non-resizable :class:`QScrollArea`; the
-    panel drives its size via :meth:`sync_size` (viewport-sized at 适应, or the
-    scaled image plus padding when zoomed so the scroll bars become the pan
-    surface). Wheel notches accumulate so high-resolution devices feel smooth
-    while a plain notch still equals one ``ZOOM_STEP``.
-    """
-
-    def __init__(self, panel: "PreviewPanel", parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self._panel = panel
-        self._pixmap: QPixmap | None = None
-        self._zoom: int | None = None  # None = fit
-        self._wheel_accum = 0
-        self._pan_origin: QPointF | None = None
-        self._pan_h0 = 0
-        self._pan_v0 = 0
-        # Paint-level fade alpha (1.0 = fully opaque). Deliberately NOT a
-        # QGraphicsOpacityEffect: a graphics effect on a view that is resized
-        # with the window re-renders through an effect buffer and hard-crashes
-        # Qt during native resizes.
-        self._fade_alpha = 1.0
-        self._fade_anim: QVariantAnimation | None = None
-
-    def set_pixmap(self, pixmap: QPixmap | None) -> None:
-        changed = pixmap is not self._pixmap
-        self._pixmap = pixmap
-        if changed and pixmap is not None and not pixmap.isNull() and self._zoom is None:
-            self._start_fade()
-        self.update()
-
-    def set_zoom(self, zoom: int | None) -> None:
-        self._zoom = zoom
-        self.update()
-
-    # -- cross-fade on image change (skip-safe) ----------------------------------------
-    def _start_fade(self) -> None:
-        """Fade the freshly-loaded image in via painter opacity.
-
-        Skip-safe: the new pixmap is already the painted content, so even if no
-        event loop advances the animation the image is correct (just a touch
-        faint). :meth:`finish_image_fade` jumps straight to the end state.
-        """
-        if not self.isVisible():
-            return
-        if not anim.animations_enabled():
-            self.finish_image_fade()
-            return
-        if self._fade_anim is not None:
-            self._fade_anim.stop()
-        self._fade_alpha = float(IMAGE_FADE_FROM)
-        fade = QVariantAnimation(self)
-        fade.setStartValue(float(IMAGE_FADE_FROM))
-        fade.setEndValue(1.0)
-        fade.setDuration(IMAGE_FADE_MS)
-        fade.setEasingCurve(QEasingCurve.Type.OutCubic)
-        fade.valueChanged.connect(self._on_fade_value)
-        fade.finished.connect(self.finish_image_fade)
-        self._fade_anim = fade
-        fade.start()
-
-    def _on_fade_value(self, value: object) -> None:
-        self._fade_alpha = float(value)  # type: ignore[arg-type]
-        self.update()
-
-    def finish_image_fade(self) -> None:
-        """Jump the fade to its end state synchronously (tests + safety net)."""
-        if self._fade_anim is not None:
-            self._fade_anim.stop()
-            self._fade_anim = None
-        self._fade_alpha = 1.0
-        self.update()
-
-    # -- sizing ------------------------------------------------------------------------
-    def fit_percent(self) -> int:
-        """Effective fit percentage (100 when unknown; never upscales)."""
-        if self._pixmap is None or self._pixmap.isNull():
-            return 100
-        avail_w = self.width() - 2 * PREVIEW_PAD
-        avail_h = self.height() - 2 * PREVIEW_PAD
-        if avail_w <= 0 or avail_h <= 0:
-            return 100
-        scale = min(1.0, avail_w / self._pixmap.width(), avail_h / self._pixmap.height())
-        return max(1, round(scale * 100))
-
-    def _scaled_size(self) -> QSize | None:
-        if self._pixmap is None or self._pixmap.isNull():
-            return None
-        scale = (self._zoom / 100.0) if self._zoom is not None else self.fit_percent() / 100.0
-        return QSize(
-            max(1, round(self._pixmap.width() * scale)),
-            max(1, round(self._pixmap.height() * scale)),
-        )
-
-    def _content_size(self, viewport: QSize) -> QSize:
-        """Widget size inside the scroll area: viewport at 适应, else scaled+pad."""
-        vw = max(1, viewport.width())
-        vh = max(1, viewport.height())
-        scaled = self._scaled_size()
-        if self._zoom is None or scaled is None:
-            return QSize(vw, vh)
-        return QSize(
-            max(vw, scaled.width() + 2 * PREVIEW_PAD),
-            max(vh, scaled.height() + 2 * PREVIEW_PAD),
-        )
-
-    def sync_size(self, viewport: QSize) -> None:
-        """Resize to match the current zoom against ``viewport`` (panel-driven)."""
-        size = self._content_size(viewport)
-        if size != self.size():
-            self.resize(size)
-        self._update_cursor()
-        self.update()
-
-    def image_rect(self) -> QRectF | None:
-        """Where the image is painted, in this widget's own coordinates."""
-        size = self._scaled_size()
-        if size is None:
-            return None
-        return QRectF(
-            (self.width() - size.width()) / 2.0,
-            (self.height() - size.height()) / 2.0,
-            float(size.width()),
-            float(size.height()),
-        )
-
-    def _update_cursor(self) -> None:
-        if self._pan_origin is not None:
-            self.setCursor(Qt.CursorShape.ClosedHandCursor)
-        elif self._panel.single_pannable():
-            self.setCursor(Qt.CursorShape.OpenHandCursor)
-        else:
-            self.unsetCursor()
-
-    # -- interaction -------------------------------------------------------------------
-    def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802 - Qt override
-        """Cursor-anchored wheel zoom over the single image (up = in, down = out).
-
-        Notches accumulate so trackpads step smoothly; a full ``WHEEL_NOTCH``
-        still equals one ``ZOOM_STEP`` (from 适应 the first step lands on 120%).
-        Ignored while the compare grid is showing.
-        """
-        if self._panel.controller.multi_mode():
-            event.ignore()
-            return
-        delta = event.angleDelta().y()
-        if delta == 0:
-            event.ignore()
-            return
-        self._wheel_accum += delta
-        steps = int(self._wheel_accum / WHEEL_NOTCH)
-        self._wheel_accum -= steps * WHEEL_NOTCH
-        if steps != 0:
-            self._panel.wheel_zoom(steps, event.position())
-        event.accept()
-
-    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt override
-        """Toggle 适应 <-> 100% on the single image (design 双击切换)."""
-        if event.button() == Qt.MouseButton.LeftButton and not self._panel.controller.multi_mode():
-            self._panel.toggle_actual_size(event.position())
-            event.accept()
-            return
-        super().mouseDoubleClickEvent(event)
-
-    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt override
-        if event.button() == Qt.MouseButton.LeftButton and self._panel.single_pannable():
-            hbar, vbar = self._panel.single_scrollbars()
-            self._pan_origin = event.globalPosition()
-            self._pan_h0 = hbar.value()
-            self._pan_v0 = vbar.value()
-            self.setCursor(Qt.CursorShape.ClosedHandCursor)
-            event.accept()
-            return
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt override
-        if self._pan_origin is not None:
-            hbar, vbar = self._panel.single_scrollbars()
-            delta = event.globalPosition() - self._pan_origin
-            hbar.setValue(round(self._pan_h0 - delta.x()))
-            vbar.setValue(round(self._pan_v0 - delta.y()))
-            event.accept()
-            return
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt override
-        if self._pan_origin is not None and event.button() == Qt.MouseButton.LeftButton:
-            self._pan_origin = None
-            self._update_cursor()
-            event.accept()
-            return
-        super().mouseReleaseEvent(event)
-
-    def paintEvent(self, event: QPaintEvent) -> None:  # noqa: N802 - Qt override
-        target = self.image_rect()
-        if target is None or self._pixmap is None:
-            return
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        if self._fade_alpha < 1.0:
-            painter.setOpacity(self._fade_alpha)
-        clip = QPainterPath()
-        clip.addRoundedRect(target, IMAGE_RADIUS, IMAGE_RADIUS)
-        painter.setClipPath(clip)
-        painter.drawPixmap(target.toRect(), self._pixmap)
-        painter.end()
-
-
-class _MultiCell(QWidget):
-    """One tile of the 2x2 compare grid (contain-fit, badges, click to edit)."""
-
-    def __init__(self, key: str, panel: "PreviewPanel", parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.key = key
-        self._panel = panel
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setMinimumSize(40, 40)
-
-    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt override
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._panel.controller.set_current(self.key)
-            event.accept()
-            return
-        super().mousePressEvent(event)
-
-    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt override
-        """Open this tile as the standalone large single preview.
-
-        Composes existing controller methods only: focus this image
-        (``set_current``) and collapse the selection (``clear_selection``)
-        so ``multi_mode()`` becomes false and the single large view shows it.
-        """
-        if event.button() == Qt.MouseButton.LeftButton:
-            controller = self._panel.controller
-            controller.set_current(self.key)
-            controller.clear_selection()
-            event.accept()
-            return
-        super().mouseDoubleClickEvent(event)
-
-    def paintEvent(self, event: QPaintEvent) -> None:  # noqa: N802 - Qt override
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        tokens = self._panel.current_tokens()
-        controller = self._panel.controller
-        is_current = controller.current_key == self.key
-        margin = MULTI_GLOW_W
-        frame = QRectF(self.rect()).adjusted(margin, margin, -margin, -margin)
-
-        if is_current:
-            soft = QColor(accent_soft(tokens))
-            pen = QPen(soft, MULTI_GLOW_W)
-            painter.setPen(pen)
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            offset = MULTI_GLOW_W / 2.0
-            painter.drawRoundedRect(
-                frame.adjusted(-offset, -offset, offset, offset),
-                MULTI_RADIUS + offset,
-                MULTI_RADIUS + offset,
-            )
-
-        border = QColor(tokens.accent if is_current else tokens.bd)
-        painter.setPen(QPen(border, MULTI_BORDER_W))
-        painter.setBrush(QColor(tokens.panel))
-        half = MULTI_BORDER_W / 2.0
-        painter.drawRoundedRect(frame.adjusted(half, half, -half, -half), MULTI_RADIUS, MULTI_RADIUS)
-
-        inner = frame.adjusted(MULTI_BORDER_W, MULTI_BORDER_W, -MULTI_BORDER_W, -MULTI_BORDER_W)
-        clip = QPainterPath()
-        clip.addRoundedRect(inner, MULTI_RADIUS - 1.0, MULTI_RADIUS - 1.0)
-        painter.save()
-        painter.setClipPath(clip)
-        pix = self._panel.pixmap_for(self.key)
-        if pix is not None and not pix.isNull():
-            scaled = pix.scaled(
-                inner.size().toSize(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            painter.drawPixmap(
-                QPointF(
-                    inner.x() + (inner.width() - scaled.width()) / 2.0,
-                    inner.y() + (inner.height() - scaled.height()) / 2.0,
-                ),
-                scaled,
-            )
-
-        # name pill (bottom-left, mono white on scrim)
-        name = self.key.rsplit("/", 1)[-1]
-        painter.setFont(mono_font(10.5))
-        metrics = QFontMetrics(painter.font())
-        pill_h = metrics.height() + 5
-        pill_w = metrics.horizontalAdvance(name) + 18
-        pill = QRectF(
-            inner.x() + BADGE_MARGIN, inner.bottom() - 8 - pill_h, pill_w, pill_h
-        )
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(scrim_color(NAME_PILL_ALPHA))
-        painter.drawRoundedRect(pill, pill_h / 2.0, pill_h / 2.0)
-        painter.setPen(overlay_text_color())
-        painter.drawText(pill, Qt.AlignmentFlag.AlignCenter, name)
-
-        # 编辑中 badge (top-right) on the current tile
-        if is_current:
-            painter.setFont(ui_font(10, QFont.Weight.Bold))
-            badge_metrics = QFontMetrics(painter.font())
-            badge_h = badge_metrics.height() + 5
-            badge_w = badge_metrics.horizontalAdvance(TEXT_EDITING) + 18
-            badge = QRectF(
-                inner.right() - BADGE_MARGIN - badge_w, inner.y() + 8, badge_w, badge_h
-            )
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(tokens.accent))
-            painter.drawRoundedRect(badge, badge_h / 2.0, badge_h / 2.0)
-            painter.setPen(QColor(tokens.onaccent))
-            painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, TEXT_EDITING)
-
-        # dirty dot (top-left)
-        if controller.record(self.key).dirty:
-            dot = QRectF(
-                inner.x() + BADGE_MARGIN, inner.y() + BADGE_MARGIN, DIRTY_DOT_PX, DIRTY_DOT_PX
-            )
-            painter.setPen(QPen(scrim_color(DIRTY_RING_ALPHA), DIRTY_RING_W))
-            painter.setBrush(QColor(tokens.warn))
-            painter.drawEllipse(dot)
-        painter.restore()
-        painter.end()
-
-
-class _InfoBar(QFrame):
-    """46px preview header: empty space drags the frameless window."""
-
-    def __init__(self, panel: "PreviewPanel") -> None:
-        super().__init__(panel)
-        self._drag = WindowDragHelper(self)
-
-    def _on_empty(self, event: QMouseEvent) -> bool:
-        return self.childAt(event.position().toPoint()) is None
-
-    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
-        if self._drag.press(event, self._on_empty(event)):
-            return
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
-        if self._drag.move(event):
-            return
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
-        self._drag.release()
-        super().mouseReleaseEvent(event)
-
-    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802
-        if self._drag.double_click(event, self._on_empty(event)):
-            return
-        super().mouseDoubleClickEvent(event)
+def _read_coarse(path: str, max_edge: int) -> QImage:
+    """Worker-side bounded decode used as an immediate preview frame."""
+    reader = QImageReader(path)
+    reader.setAutoTransform(True)
+    size = reader.size()
+    if size.isValid() and max(size.width(), size.height()) > max_edge:
+        scale = max_edge / max(size.width(), size.height())
+        reader.setScaledSize(QSize(max(1, round(size.width() * scale)), max(1, round(size.height() * scale))))
+    image = reader.read()
+    if image.isNull():
+        raise OSError(f"could not read image {path!r}: {reader.errorString()}")
+    return image
 
 
 class PreviewPanel(QFrame):
@@ -512,7 +163,12 @@ class PreviewPanel(QFrame):
         self._tokens = tokens if tokens is not None else tokens_for_settings(controller.settings)
         self._zoom: int | None = None
         self._pix_cache: OrderedDict[str, QPixmap] = OrderedDict()
+        self._pix_cache_pixels = 0
+        self._coarse_cache: OrderedDict[str, QPixmap] = OrderedDict()
         self._loading: set[str] = set()
+        self._loading_epoch: dict[str, int] = {}
+        self._preview_pending: OrderedDict[str, tuple[str, str, int]] = OrderedDict()
+        self._preview_active = False
         self._epoch = 0
         self._multi_cells: list[_MultiCell] = []
         self._scroll_viewport: QWidget | None = None
@@ -801,40 +457,78 @@ class PreviewPanel(QFrame):
         return None
 
     def _ensure_image(self, key: str) -> None:
-        if not key or key in self._pix_cache or key in self._loading:
+        if not key or key in self._pix_cache:
             return
         try:
             path = self.controller.image_path(key)
         except NLaptError:
             return
+        if key in self._preview_pending or self._loading_epoch.get(key) == self._epoch:
+            return
+        stage = "native" if key in self._coarse_cache else "coarse"
+        self._preview_pending[key] = (str(path), stage, self._epoch)
         self._loading.add(key)
-        epoch = self._epoch
+        self._loading_epoch[key] = self._epoch
+        self._pump_preview()
+
+    def _pump_preview(self) -> None:
+        if self._preview_active or not self._preview_pending:
+            return
+        key = self.controller.current_key
+        chosen = key if key in self._preview_pending else next(iter(self._preview_pending))
+        path, stage, epoch = self._preview_pending.pop(chosen)
+        self._preview_active = True
+        reader = _read_full if stage == "native" else _read_coarse
+        args = (path,) if stage == "native" else (path, COARSE_PREVIEW_EDGE)
+
+        def release() -> bool:
+            if not isValid(self):
+                return False
+            self._preview_active = False
+            current = epoch == self._epoch
+            if current:
+                self._loading.discard(chosen)
+                self._loading_epoch.pop(chosen, None)
+            return current
 
         def done(image: object) -> None:
-            # A queued reply can arrive after the panel's C++ object is gone
-            # (e.g. window closed while a load was in flight); ignore it.
-            if not isValid(self):
+            if not release() or not isinstance(image, QImage):
                 return
-            self._loading.discard(key)
-            if epoch != self._epoch or not isinstance(image, QImage):
-                return
-            self._store_pixmap(key, QPixmap.fromImage(image))
+            pixmap = QPixmap.fromImage(image)
+            if stage == "coarse":
+                self._coarse_cache[chosen] = pixmap
+                self._coarse_cache.move_to_end(chosen)
+                while len(self._coarse_cache) > COARSE_PREVIEW_LIMIT:
+                    self._coarse_cache.popitem(last=False)
+                if chosen == self.controller.current_key:
+                    self.single_view.set_pixmap(pixmap)
+                    self._sync_single_size()
+                self._ensure_image(chosen)
+                self._pump_preview()
+            else:
+                self._store_pixmap(chosen, pixmap)
+                self._pump_preview()
 
         def failed(message: str) -> None:
-            if not isValid(self):
-                return
-            self._loading.discard(key)
-            _LOGGER.warning("preview load failed for %r: %s", key, message)
+            if release():
+                _LOGGER.warning("preview load failed for %r: %s", chosen, message)
+            self._pump_preview()
 
-        run_async(
-            QThreadPool.globalInstance(), _read_full, str(path), on_done=done, on_error=failed
-        )
+        run_async(get_decode_pool(), reader, *args, on_done=done, on_error=failed)
 
     def _store_pixmap(self, key: str, pixmap: QPixmap) -> None:
+        previous = self._pix_cache.pop(key, None)
+        if previous is not None:
+            self._pix_cache_pixels -= previous.width() * previous.height()
         self._pix_cache[key] = pixmap
         self._pix_cache.move_to_end(key)
-        while len(self._pix_cache) > PREVIEW_CACHE_LIMIT:
-            self._pix_cache.popitem(last=False)
+        self._pix_cache_pixels += pixmap.width() * pixmap.height()
+        while (
+            len(self._pix_cache) > PREVIEW_CACHE_LIMIT
+            or self._pix_cache_pixels > PREVIEW_CACHE_PIXEL_BUDGET
+        ):
+            _old_key, old = self._pix_cache.popitem(last=False)
+            self._pix_cache_pixels -= old.width() * old.height()
         if key == self.controller.current_key:
             self.single_view.set_pixmap(pixmap)
             self._sync_single_size()
@@ -847,8 +541,13 @@ class PreviewPanel(QFrame):
     def _on_dataset_opened(self, _result: object) -> None:
         self._epoch += 1
         self._pix_cache.clear()
+        self._pix_cache_pixels = 0
+        self._coarse_cache.clear()
         self._loading.clear()
+        self._loading_epoch.clear()
+        self._preview_pending.clear()
         self.single_view.set_pixmap(None)
+        self.single_view.set_source_size(None)
         self._refresh_all()
 
     def _on_current_changed(self, _key: str) -> None:
@@ -857,14 +556,27 @@ class PreviewPanel(QFrame):
         # Each new image starts at 适应 (fit), mirroring the prototype's pick().
         self._set_zoom(None)
         key = self.controller.current_key
+        self._set_source_size(key)
         cached = self._pix_cache.get(key) if key else None
-        if cached is not None or not key:
-            self.single_view.set_pixmap(cached)
+        coarse = self._coarse_cache.get(key) if key else None
+        self.single_view.set_pixmap(cached or coarse)
         self._sync_single_size()
         if key:
             self._ensure_image(key)
         for cell in self._multi_cells:
             cell.update()
+
+    def _set_source_size(self, key: str | None) -> None:
+        """Use the cached header dimensions to keep coarse/native geometry stable."""
+        if not key:
+            self.single_view.set_source_size(None)
+            return
+        try:
+            first = self.controller.image_meta(key).split("·", 1)[0].strip()
+            width_text, height_text = first.split("×", 1)
+            self.single_view.set_source_size(QSize(int(width_text), int(height_text)))
+        except (NLaptError, ValueError):
+            self.single_view.set_source_size(None)
 
     def _on_selection_changed(self) -> None:
         self._refresh_mode()
@@ -931,6 +643,9 @@ class PreviewPanel(QFrame):
 
     def _refresh_pos(self) -> None:
         self.pos_label.setText(self.controller.pos_label())
+        enabled = self.controller.can_navigate()
+        self.prev_button.setEnabled(enabled)
+        self.next_button.setEnabled(enabled)
 
     def _rebuild_multi_cells(self) -> None:
         keys = self.controller.editor_keys()

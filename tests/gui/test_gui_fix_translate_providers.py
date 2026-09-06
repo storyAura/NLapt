@@ -21,16 +21,23 @@ from nlapt.llm.mock import MockLLMClient
 from nlapt_gui.controller import AppController
 from nlapt_gui.settings import UISettings
 from nlapt_gui.translate_bridge import TranslateBridge
+from nlapt_gui.api_config import api_config_path
 from nlapt_gui.translate_config import (
     DEFAULT_PROVIDER,
+    SUGGESTED_FALLBACK_ORDER,
     TranslationConfig,
     load_translation_config,
+    normalize_fallback_order,
+    provider_chain,
     save_translation_config,
     translation_config_path,
 )
 from nlapt_gui.widgets.settings_dialog import (
     TOAST_SAVED,
+    TOAST_TR_NEED_CUSTOM,
+    TOAST_TR_NEED_DEEPLX,
     TOAST_TR_NEED_KEY,
+    TOAST_TR_NEED_LOCAL_MT,
     SettingsDialog,
     config_path,
 )
@@ -101,7 +108,106 @@ class TestTranslationConfig:
             "baidu_appid": "a",
             "baidu_key": "b",
             "deepl_key": "c",
+            "deeplx_url": "",
+            "deeplx_token": "",
+            "custom_base_url": "",
+            "custom_api_key": "",
+            "custom_model": "",
         }
+
+    def test_normalize_drops_primary_unknowns_and_dupes(self) -> None:
+        assert normalize_fallback_order(
+            "deeplx",
+            ("google", "deeplx", "nope", "google", "baidu", "local_mt"),
+        ) == ("google", "baidu", "local_mt")
+
+    def test_provider_chain_puts_primary_first(self) -> None:
+        config = TranslationConfig(
+            provider="deeplx", fallback_order=("google", "baidu", "local_mt")
+        )
+        assert provider_chain(config) == (
+            "deeplx",
+            "google",
+            "baidu",
+            "local_mt",
+        )
+
+    def test_post_init_strips_primary_from_fallbacks(self) -> None:
+        config = TranslationConfig(
+            provider="google", fallback_order=("google", "baidu")
+        )
+        assert config.fallback_order == ("baidu",)
+
+    def test_fallback_order_round_trip(self) -> None:
+        original = TranslationConfig(
+            provider="deeplx",
+            deeplx_url="http://127.0.0.1:1188",
+            fallback_order=("google", "baidu", "local_mt"),
+        )
+        save_translation_config(original)
+        loaded = load_translation_config()
+        assert loaded.fallback_order == ("google", "baidu", "local_mt")
+        assert loaded.provider == "deeplx"
+
+    def test_missing_fallback_order_is_empty(self, tmp_path) -> None:
+        path = tmp_path / "t.json"
+        path.write_text('{"provider": "google"}', encoding="utf-8")
+        assert load_translation_config(path).fallback_order == ()
+
+    def test_invalid_fallback_order_is_empty(self, tmp_path) -> None:
+        path = tmp_path / "t.json"
+        path.write_text(
+            '{"provider": "google", "fallback_order": "google"}', encoding="utf-8"
+        )
+        assert load_translation_config(path).fallback_order == ()
+
+    def test_deeplx_secrets_live_in_documents_not_appdata(self) -> None:
+        original = TranslationConfig(
+            provider="deeplx",
+            deeplx_url="https://api.deeplx.org/secret-path/translate",
+            deeplx_token="tok-secret",
+        )
+        save_translation_config(original)
+        loaded = load_translation_config()
+        assert loaded == original
+        appdata_text = translation_config_path().read_text(encoding="utf-8")
+        assert "secret-path" not in appdata_text
+        assert "tok-secret" not in appdata_text
+        docs_text = api_config_path().read_text(encoding="utf-8")
+        assert "secret-path" in docs_text
+        assert "tok-secret" in docs_text
+
+    def test_migrates_legacy_deeplx_from_appdata(self, tmp_path) -> None:
+        path = tmp_path / "legacy.json"
+        path.write_text(
+            '{"provider": "deeplx", "deeplx_url": "http://old", "deeplx_token": "old-tok"}',
+            encoding="utf-8",
+        )
+        loaded = load_translation_config(path)
+        assert loaded.deeplx_url == "http://old"
+        assert loaded.deeplx_token == "old-tok"
+        save_translation_config(loaded, path)
+        saved = path.read_text(encoding="utf-8")
+        assert "deeplx_url" not in saved
+        assert "old-tok" not in saved
+        assert "http://old" in api_config_path().read_text(encoding="utf-8")
+
+    def test_custom_api_lives_in_documents_not_appdata(self) -> None:
+        original = TranslationConfig(
+            provider="custom",
+            custom_base_url="https://api.example.com/v1",
+            custom_api_key="sk-secret",
+            custom_model="mini",
+        )
+        save_translation_config(original)
+        loaded = load_translation_config()
+        assert loaded == original
+        appdata_text = translation_config_path().read_text(encoding="utf-8")
+        assert "sk-secret" not in appdata_text
+        assert "api.example.com" not in appdata_text
+        docs_text = api_config_path().read_text(encoding="utf-8")
+        assert "sk-secret" in docs_text
+        assert "mini" in docs_text
 
 
 # -- TranslateBridge provider selection --------------------------------------
@@ -147,6 +253,34 @@ class TestBridgeConfigured:
             config=TranslationConfig(provider="deepl", deepl_key="k"),
         )
         assert with_key.configured()
+
+    def test_custom_requires_url_and_model(self, qtbot, unconfigured_controller) -> None:
+        missing = TranslateBridge(
+            unconfigured_controller, config=TranslationConfig(provider="custom")
+        )
+        assert not missing.configured()
+        ready = TranslateBridge(
+            unconfigured_controller,
+            config=TranslationConfig(
+                provider="custom",
+                custom_base_url="https://api.example.com/v1",
+                custom_model="mini",
+            ),
+        )
+        assert ready.configured()
+
+    def test_deeplx_requires_url(self, qtbot, unconfigured_controller) -> None:
+        missing = TranslateBridge(
+            unconfigured_controller, config=TranslationConfig(provider="deeplx")
+        )
+        assert not missing.configured()
+        ready = TranslateBridge(
+            unconfigured_controller,
+            config=TranslationConfig(
+                provider="deeplx", deeplx_url="http://127.0.0.1:1188"
+            ),
+        )
+        assert ready.configured()
 
 
 class TestBridgeWebRequest:
@@ -229,6 +363,91 @@ class TestBridgeWebRequest:
         save_translation_config(TranslationConfig(provider="google"))
         assert bridge.configured()
 
+    def test_configured_when_only_fallback_is_ready(
+        self, unconfigured_controller
+    ) -> None:
+        bridge = TranslateBridge(
+            unconfigured_controller,
+            config=TranslationConfig(provider="llm", fallback_order=("google",)),
+        )
+        assert bridge.configured()
+
+    def test_deeplx_error_falls_back_to_google(
+        self, qtbot, unconfigured_controller
+    ) -> None:
+        seen: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(str(request.url))
+            if "googleapis" in str(request.url):
+                return httpx.Response(
+                    200, json=[[["a girl", "少女", None, None]], None, "zh-CN"]
+                )
+            return httpx.Response(400, json={"message": "nope"})
+
+        bridge = TranslateBridge(
+            unconfigured_controller,
+            config=TranslationConfig(
+                provider="deeplx",
+                deeplx_url="http://deeplx.test",
+                fallback_order=("google",),
+            ),
+            transport=httpx.MockTransport(handler),
+            retry_sleep=lambda _delay: None,
+        )
+        with qtbot.waitSignal(bridge.segment_ready, timeout=2000) as blocker:
+            bridge.request("0001.png", "少女")
+        assert blocker.args[2] == "a girl"
+        assert blocker.args[3] is True
+        assert any("deeplx.test" in url for url in seen)
+        assert any("googleapis" in url for url in seen)
+
+    def test_request_to_falls_back_to_google(
+        self, qtbot, unconfigured_controller
+    ) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "googleapis" in str(request.url):
+                return httpx.Response(
+                    200, json=[[["hello", "你好", None, None]], None, "en"]
+                )
+            return httpx.Response(400, json={"message": "nope"})
+
+        bridge = TranslateBridge(
+            unconfigured_controller,
+            config=TranslationConfig(
+                provider="deeplx",
+                deeplx_url="http://deeplx.test",
+                fallback_order=("google",),
+            ),
+            transport=httpx.MockTransport(handler),
+            retry_sleep=lambda _delay: None,
+        )
+        with qtbot.waitSignal(bridge.target_ready, timeout=2000) as blocker:
+            bridge.request_to("0001.png", "你好", "en")
+        assert blocker.args[3] == "hello"
+        assert blocker.args[4] is True
+
+    def test_all_providers_fail_emits_last_error(
+        self, qtbot, unconfigured_controller
+    ) -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(400, json={"message": "nope"})
+
+        bridge = TranslateBridge(
+            unconfigured_controller,
+            config=TranslationConfig(
+                provider="deeplx",
+                deeplx_url="http://deeplx.test",
+                fallback_order=("google",),
+            ),
+            transport=httpx.MockTransport(handler),
+            retry_sleep=lambda _delay: None,
+        )
+        with qtbot.waitSignal(bridge.segment_ready, timeout=2000) as blocker:
+            bridge.request("0001.png", "少女")
+        assert blocker.args[3] is False
+        assert "Google" in blocker.args[2]
+
 
 # -- SettingsDialog provider persistence -------------------------------------
 class TestSettingsDialogProviders:
@@ -304,3 +523,129 @@ class TestSettingsDialogProviders:
         assert dialog.selected_provider() == "deepl"
         assert dialog.deepl_key.text() == "dk-123"
         assert dialog.deepl_key.isVisibleTo(dialog)
+
+    def test_save_custom_without_fields_warns(
+        self, qtbot, unconfigured_controller
+    ) -> None:
+        dialog = self._dialog(qtbot, unconfigured_controller)
+        toasts = self._toasts(unconfigured_controller)
+        dialog.provider.setCurrentIndex(dialog.provider.findData("custom"))
+        dialog.save_button.click()
+        assert (TOAST_TR_NEED_CUSTOM, "warn") in toasts
+        assert not translation_config_path().exists()
+
+    def test_save_custom_writes_documents_file(
+        self, qtbot, unconfigured_controller
+    ) -> None:
+        dialog = self._dialog(qtbot, unconfigured_controller)
+        dialog.provider.setCurrentIndex(dialog.provider.findData("custom"))
+        dialog.custom_base_url.setText("https://api.example.com/v1")
+        dialog.custom_api_key.setText("sk-dialog")
+        dialog.custom_model.setText("mini")
+        with qtbot.waitSignal(dialog.saved, timeout=1000):
+            dialog.save_button.click()
+        loaded = load_translation_config()
+        assert loaded.provider == "custom"
+        assert loaded.custom_base_url == "https://api.example.com/v1"
+        assert loaded.custom_api_key == "sk-dialog"
+        assert loaded.custom_model == "mini"
+        assert "sk-dialog" not in translation_config_path().read_text(encoding="utf-8")
+        assert "sk-dialog" in api_config_path().read_text(encoding="utf-8")
+
+    def test_save_deeplx_without_url_warns(
+        self, qtbot, unconfigured_controller
+    ) -> None:
+        dialog = self._dialog(qtbot, unconfigured_controller)
+        toasts = self._toasts(unconfigured_controller)
+        dialog.provider.setCurrentIndex(dialog.provider.findData("deeplx"))
+        dialog.save_button.click()
+        assert (TOAST_TR_NEED_DEEPLX, "warn") in toasts
+        assert not translation_config_path().exists()
+
+    def test_save_deeplx_persists_url_and_token(
+        self, qtbot, unconfigured_controller
+    ) -> None:
+        dialog = self._dialog(qtbot, unconfigured_controller)
+        dialog.provider.setCurrentIndex(dialog.provider.findData("deeplx"))
+        dialog.deeplx_url.setText("http://127.0.0.1:1188")
+        dialog.deeplx_token.setText("tok-1")
+        with qtbot.waitSignal(dialog.saved, timeout=1000):
+            dialog.save_button.click()
+        loaded = load_translation_config()
+        assert loaded.provider == "deeplx"
+        assert loaded.deeplx_url == "http://127.0.0.1:1188"
+        assert loaded.deeplx_token == "tok-1"
+        assert "tok-1" not in translation_config_path().read_text(encoding="utf-8")
+        assert "tok-1" in api_config_path().read_text(encoding="utf-8")
+
+    def test_save_local_mt_without_download_warns(
+        self, qtbot, unconfigured_controller, tmp_path
+    ) -> None:
+        from nlapt_gui.local_bridge import LocalBridge
+
+        LocalBridge().update_settings(models_dir=str(tmp_path))
+        dialog = self._dialog(qtbot, unconfigured_controller)
+        toasts = self._toasts(unconfigured_controller)
+        dialog.provider.setCurrentIndex(dialog.provider.findData("local_mt"))
+        dialog.save_button.click()
+        assert (TOAST_TR_NEED_LOCAL_MT, "warn") in toasts
+        assert not translation_config_path().exists()
+
+    def test_save_local_mt_persists_tier(
+        self, qtbot, unconfigured_controller, tmp_path, monkeypatch
+    ) -> None:
+        from nlapt.local.mt_catalog import TIER_FAST, find_mt_model, mt_model_path
+        from nlapt_gui.local_bridge import LocalBridge
+
+        LocalBridge().update_settings(models_dir=str(tmp_path))
+        dest = mt_model_path(tmp_path, find_mt_model(TIER_FAST))
+        dest.parent.mkdir(parents=True)
+        dest.write_bytes(b"gguf")
+        monkeypatch.setattr(
+            "nlapt_gui.widgets.settings_dialog.is_tier_downloaded",
+            lambda *_a, **_k: True,
+        )
+        dialog = self._dialog(qtbot, unconfigured_controller)
+        dialog.provider.setCurrentIndex(dialog.provider.findData("local_mt"))
+        dialog.local_mt_tier.setCurrentIndex(dialog.local_mt_tier.findData(TIER_FAST))
+        with qtbot.waitSignal(dialog.saved, timeout=1000):
+            dialog.save_button.click()
+        loaded = load_translation_config()
+        assert loaded.provider == "local_mt"
+        assert loaded.local_mt_tier == TIER_FAST
+
+    def test_save_persists_fallback_order(
+        self, qtbot, unconfigured_controller
+    ) -> None:
+        dialog = self._dialog(qtbot, unconfigured_controller)
+        dialog.provider.setCurrentIndex(dialog.provider.findData("deeplx"))
+        dialog.deeplx_url.setText("http://127.0.0.1:1188")
+        dialog.fallback_editor.apply_suggested()
+        assert dialog.fallback_editor.order() == SUGGESTED_FALLBACK_ORDER
+        with qtbot.waitSignal(dialog.saved, timeout=1000):
+            dialog.save_button.click()
+        loaded = load_translation_config()
+        assert loaded.provider == "deeplx"
+        assert loaded.fallback_order == SUGGESTED_FALLBACK_ORDER
+
+    def test_prefill_restores_fallback_order(
+        self, qtbot, unconfigured_controller
+    ) -> None:
+        save_translation_config(
+            TranslationConfig(
+                provider="deeplx",
+                deeplx_url="http://127.0.0.1:1188",
+                fallback_order=("google", "baidu"),
+            )
+        )
+        dialog = self._dialog(qtbot, unconfigured_controller)
+        assert dialog.selected_provider() == "deeplx"
+        assert dialog.fallback_editor.order() == ("google", "baidu")
+
+    def test_changing_primary_drops_it_from_fallbacks(
+        self, qtbot, unconfigured_controller
+    ) -> None:
+        dialog = self._dialog(qtbot, unconfigured_controller)
+        dialog.fallback_editor.set_order(("google", "baidu"))
+        dialog.provider.setCurrentIndex(dialog.provider.findData("google"))
+        assert dialog.fallback_editor.order() == ("baidu",)

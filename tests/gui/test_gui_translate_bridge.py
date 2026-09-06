@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import threading
 from typing import Iterator
 
 import pytest
+from PySide6.QtCore import QThreadPool
 
 from nlapt.app import NLaptApp
 from nlapt.core.config import AppConfig, LLMProfile, RequestControl
@@ -14,7 +16,13 @@ from nlapt.llm.mock import MockLLMClient
 
 from nlapt_gui.controller import AppController
 from nlapt_gui.settings import UISettings
-from nlapt_gui.translate_bridge import NOTE_UNCONFIGURED, TranslateBridge, has_cjk
+from nlapt_gui.translate_bridge import (
+    NOTE_UNCONFIGURED,
+    TRANSLATE_POOL_MAX_THREADS,
+    TranslateBridge,
+    get_translate_pool,
+    has_cjk,
+)
 
 # Unique api_type for this test module (registry is process-global).
 API_TYPE = "gui-bridge-mock"
@@ -73,6 +81,48 @@ class TestHasCjk:
         assert has_cjk("long hair 少女")
         assert not has_cjk("long hair")
         assert not has_cjk("")
+
+
+class TestDedicatedPool:
+    def test_default_pool_is_not_global(self, bridge: TranslateBridge) -> None:
+        assert bridge._pool is get_translate_pool()
+        assert bridge._pool is not QThreadPool.globalInstance()
+        assert get_translate_pool().maxThreadCount() == TRANSLATE_POOL_MAX_THREADS
+
+
+class TestInvalidatePending:
+    def test_drops_in_flight_and_queued(
+        self, qtbot, monkeypatch
+    ) -> None:
+        controller = AppController(_configured_app(), settings=UISettings())
+        pool = QThreadPool()
+        pool.setMaxThreadCount(1)
+        bridge = TranslateBridge(controller, pool=pool)
+        started = threading.Event()
+        release = threading.Event()
+        seen: list[tuple[object, ...]] = []
+        bridge.segment_ready.connect(lambda *args: seen.append(args))
+
+        def slow(text: str, direction: object) -> str:
+            started.set()
+            assert release.wait(timeout=3)
+            return "译"
+
+        monkeypatch.setattr(bridge, "_resolve_translate_fn", lambda: slow)
+        bridge.request("a.png", "hello")
+        qtbot.waitUntil(started.is_set, timeout=2000)
+        bridge.request("b.png", "world")
+        bridge.invalidate_pending()
+        release.set()
+        qtbot.waitUntil(lambda: pool.activeThreadCount() == 0, timeout=2000)
+        assert seen == []
+
+    def test_dataset_opened_bumps_generation(self) -> None:
+        controller = AppController(_configured_app(), settings=UISettings())
+        bridge = TranslateBridge(controller)
+        assert bridge._generation == 0
+        controller.dataset_opened.emit(object())
+        assert bridge._generation == 1
 
 
 class TestConfigured:

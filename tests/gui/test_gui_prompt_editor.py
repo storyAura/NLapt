@@ -10,6 +10,8 @@ import pytest
 import nlapt_gui.widgets.prompt_editor as module
 from nlapt_gui.prompt_store import (
     DEFAULT_PROMPT_NAME,
+    PROMPT_OBJECTIVE_REPORT,
+    PROMPT_STRUCTURED_COMPILER,
     VisionPrompts,
     load_vision_prompts,
 )
@@ -64,6 +66,42 @@ class TestDefaultTemplate:
         assert snapshot.active == DEFAULT_PROMPT_NAME
         assert snapshot.system_text() == ""
         assert snapshot.user_prompt == "user text"
+
+
+class TestBuiltinTemplates:
+    def test_builtin_is_readonly_and_shows_body(self, qtbot) -> None:
+        tab = make_tab(qtbot, VisionPrompts(active=PROMPT_STRUCTURED_COMPILER))
+        assert tab.template_combo.currentText() == PROMPT_STRUCTURED_COMPILER
+        assert "Visual Prompt Compiler v2.1" in tab.system_edit.toPlainText()
+        assert tab.system_edit.isReadOnly()
+        assert not tab.save_template_button.isEnabled()
+        assert not tab.delete_button.isEnabled()
+        assert tab.hint.isVisibleTo(tab)
+
+    def test_current_prompts_keeps_builtin_active(self, qtbot) -> None:
+        tab = make_tab(qtbot, VisionPrompts(active=PROMPT_OBJECTIVE_REPORT))
+        snapshot = tab.current_prompts()
+        assert snapshot.active == PROMPT_OBJECTIVE_REPORT
+        assert "{NAME}" in snapshot.system_text()
+        assert PROMPT_OBJECTIVE_REPORT not in snapshot.prompts
+
+    def test_new_forks_builtin_text(self, qtbot, monkeypatch, toasts_list) -> None:
+        tab = make_tab(
+            qtbot, VisionPrompts(active=PROMPT_STRUCTURED_COMPILER), sink=toasts_list
+        )
+        _patch_input(monkeypatch, "我的编译")
+        tab.new_button.click()
+        assert tab.template_combo.currentText() == "我的编译"
+        assert not tab.system_edit.isReadOnly()
+        assert "Visual Prompt Compiler v2.1" in tab.system_edit.toPlainText()
+        stored = load_vision_prompts()
+        assert stored.prompts["我的编译"].startswith("You are Visual Prompt Compiler")
+
+    def test_new_rejects_builtin_name(self, qtbot, monkeypatch, toasts_list) -> None:
+        tab = make_tab(qtbot, sink=toasts_list)
+        _patch_input(monkeypatch, PROMPT_OBJECTIVE_REPORT)
+        tab.new_button.click()
+        assert any("已存在" in text for text, _ in toasts_list)
 
 
 class TestTemplateLifecycle:

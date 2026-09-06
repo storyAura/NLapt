@@ -1187,3 +1187,325 @@ reuses `AppController.run_caption_batch` (v1.7 snapshot / oplog / progress).
    `{n} 字符 · {m} 段 · 约 {t} tokens · {w} 词`
    using `layered_prompts.estimate_tokens` / `count_words` (`len//4` heuristic).
    Tab-row `_char_info` and per-block `_stat` follow automatically.
+
+## v1.20 — 人物卡 skill 外貌优先
+
+`CHARACTER_CARD_PROMPT` is assembled from two named skills:
+`CARD_APPEARANCE_SKILL` (hair / eyes / pupils / fixed face facts) then
+`CARD_CLOTHING_SKILL` (full outfit). The card paragraph must finish
+appearance before the first garment. Variant hints no longer ask the
+model to lead with outerwear or footwear.
+
+## v1.21 — 人物卡对照串行 + 调试模式
+
+1. **LayeredInferDialog** Chinese gloss: English cards enqueue `request_to`
+   and the wizard sends one Google/web translate at a time (`_zh_queue` /
+   `_zh_inflight`). Status stays `正在翻译对照…` while the queue is
+   nonempty. Failure writes `翻译失败: {message}` on the card — never the
+   `中文对照将显示在这里` placeholder.
+2. **`UISettings.debug`** defaults to `False` and is persisted in
+   `ui_settings.json`. The 翻译服务 tab has a 调试模式 checkbox. Save
+   calls `controller.update_settings(debug=…)` and immediately
+   `configure_logging(..., console=debug)` plus `workers.set_debug`.
+3. **`configure_logging(..., *, console=False)`**: file handler unchanged;
+   a console `StreamHandler` is added only when `console=True`.
+   `__main__` loads UI settings first and passes `console=settings.debug`.
+   `FunctionWorker.run` logs a one-line warning without traceback when
+   debug is off; `exception` (full stack) when on.
+
+## v1.22 — 自定义翻译 API
+
+The 翻译服务 dropdown adds **自定义 API** (`provider=custom`): an
+OpenAI-compatible `/chat/completions` endpoint (Base URL + 模型 + optional
+API Key). Provider selection still lives in `app_data_dir()/translate.json`.
+Custom credentials are written only to
+`Documents/NLapt/translate_api.json` (`NLAPT_DOCUMENTS_DIR` overrides the
+Documents root in tests). `CustomOpenAIProvider` in `web_translate.py`
+implements `translate` / `translate_to`.
+
+## v1.23 — DeepLX 免费接口
+
+The 翻译服务 dropdown adds **DeepLX (免费)** (`provider=deeplx`):
+`POST {url}/translate` with `{text, source_lang: auto, target_lang}` per
+https://deeplx.owo.network/endpoints/free.html . URL is required; optional
+access token is sent as `Authorization: Bearer`. Settings persist
+`deeplx_url` / `deeplx_token` in `translate.json`.
+
+## v1.24 — DeepLX 密钥隔离 + 本地 Hy-MT2
+
+DeepLX URL/token move to `Documents/NLapt/translate_api.json` (same file as
+the custom OpenAI key). AppData `translate.json` keeps only provider +
+Baidu/DeepL + `local_mt_tier`. Community instances are rate-limited in
+`DeepLXProvider` (shared 1 s gap + 429 backoff). Error toasts never echo
+a key embedded in the URL path.
+
+The dropdown adds **本地模型 (Hy-MT2)** (`provider=local_mt`): a tier
+combo (快速 / 均衡 / 高质量) and **管理模型**, which opens
+`MTModelsDialog` (download / cancel / delete). `configured()` is true only
+when the selected tier's GGUF is present. TranslateBridge treats
+`local_mt` like `llm` (GUI-owned server), not `create_provider`.
+
+## v1.25 — Dedicated worker pools
+
+Translation, model download, and image decode no longer share
+`QThreadPool.globalInstance()`. `TranslateBridge` uses a 3-thread pool
+and drops queued work on `dataset_opened` (`invalidate_pending`).
+Downloads run on a 1-thread pool in `download_hub`. Thumbnails and the
+preview panel decode on a 4-thread pool. The global pool remains for
+dataset scan and local inference. `FunctionWorker` swallows
+`RuntimeError` from `emit` when the signal QObject is already gone.
+
+## v1.26 — 分层推标 does not restore last card
+
+`LayeredMemory` still persists name / series / last card. The wizard
+prefills only name and series. Candidate cards start empty; a generate
+or 重新生成 clears the slot before the new reply arrives.
+
+## v1.27 — DeepLX 418 对用户可读
+
+分层推标 / 译文对照 on DeepLX no longer surface `I'm a teapot` or raw
+JSON. Busy replies (418 / 429 / 503) retry, then show
+`DeepLX 请求过于频繁，请稍后再试或换用自建实例`.
+
+## v1.28 — 翻译备选顺序
+
+`TranslationConfig.fallback_order` is a tuple of provider ids persisted
+in AppData `translate.json`. `provider_chain` is
+`(provider, *fallback_order)` after dropping the primary, unknowns, and
+duplicates. `TranslateBridge` builds one callable per usable id and
+runs `run_fallback_chain` for both `translate` and `translate_to`.
+`configured()` is true when any id in the chain can be built.
+
+设置 ▸ 翻译服务 shows a 备选顺序 list (`FallbackOrderEditor`): 上移 /
+下移 / 移除 / 添加 / 填入推荐 (Google → 百度 → 本地 Hy-MT2). Changing
+the 首选 dropdown removes that id from the list. Unconfigured fallbacks
+are skipped at runtime and do not block save.
+
+## v1.29 — Hy-MT2 picker always listed + completion cap
+
+The 翻译服务 tab always shows `MtTierPicker` (three Hy-MT2 rows +
+管理模型), not only when the primary provider is `local_mt`.
+`LocalMTProvider` posts `/v1/completions` with the official prompt and
+`max_tokens` (512–1024). `ensure_mt_server` uses `MT_CONTEXT_LENGTH`
+(4096), not the captioner's context setting.
+
+## v1.30 — Hy-MT2 chat protocol and complete translations
+
+`LocalMTProvider` posts `/v1/chat/completions` with a single user message,
+no system message, and `stream=False`, letting llama.cpp apply the GGUF's
+chat template. The model name is the GGUF filename. The official prompt
+separates instructions from source text with two newlines.
+
+Sampling uses `temperature=0.7`, `top_p=0.6`, `top_k=20`, and llama.cpp's
+`repeat_penalty=1.05`; `min_p=0` disables its additional default filter.
+The output budget is 4096 tokens and the dedicated MT context is 8192,
+leaving room for source tokens without inheriting caption-model settings.
+Only `choices[0].message.content` with `finish_reason="stop"` is accepted;
+missing, empty, reasoning-only, or truncated replies raise `LLMRequestError`.
+
+The provider constructor requires keyword-only `retry_sleep: Callable[[float], None]`.
+HTTP/transport failures log warnings and retry twice (1 s / 2 s); the final
+error propagates. Response-validation errors are not retried. The idle
+stopper brackets the whole operation, including retries, and is released
+on both success and failure. Production callers pass their sleep callable;
+tests inject a nonblocking callable.
+
+## v1.31 — 分组裁切动画与渐进式图片预览
+
+Folder groups animate an outer clipping viewport from the current visible
+height to the natural content height (or zero). The child list/grid keeps its
+natural row geometry throughout the animation. Folder and arrow animations
+are reused on re-entry, and `folder_open` persistence and existing click
+semantics remain unchanged.
+
+Thumbnail decoding keeps the existing dedicated four-thread pool but submits
+at most three thumbnail workers at once. `ThumbnailLoader.clear()` advances
+the active generation, invalidates old callbacks, preserves the disk cache,
+and suppresses repeated failures until the next clear. Thumbnail painters use
+source cropping directly rather than allocating a scaled pixmap per repaint.
+
+The main preview uses one decode slot and presents a cached or newly decoded
+coarse frame (maximum edge 512px) before loading the native frame. Original
+image dimensions drive fit and zoom geometry, so native-frame promotion does
+not move the image or change the scroll anchor. Dataset generations prevent
+late frames from replacing the current dataset; native preview cache limits
+remain eight entries and 64M pixels.
+
+## v1.32 - Stable folder collapse geometry
+
+Folder-group layouts stay top-aligned while animated content heights and
+parent layout requests settle on different frames. The clipping viewport's
+minimum height hint is zero, preserving header space on the first expanding
+frame while its body retains its natural height. The file panel reserves
+its vertical scrollbar width even at zero scroll range, so collapse/expand
+never shifts the header downward or resizes visible thumbnail rows mid-frame.
+
+## v1.33 - Wrapped chips and filtered selection
+
+Caption chips render plain text through QTextDocument using
+WrapAtWordBoundaryOrAnywhere, preserving explicit line breaks and wrapping
+unbroken tokens. FlowLayout bounds each item to its available width before
+evaluating heightForWidth. Short chips retain their natural width; delete
+buttons stay at the top right. InlineChipField remains a single-line editor
+with a content-based size hint, bounded by the same layout, and native cursor
+scrolling. Enter, Escape, focus-out commits, and caption serialization retain
+their existing meanings. ChipWidget and InlineChipField remain importable from
+chips_editor; their implementation now lives in chip_widgets.
+
+AppController.select_filtered() replaces selection with filtered_keys(),
+including matching items outside the viewport. Top-level selection coverage
+uses these matching keys, and the checkbox is disabled for zero matches.
+set_folder_selected() and folder_selection_state() likewise use matching keys
+inside that folder. folder_keys(), select_all(), the ALL row, and explicit
+whole-folder context-menu operations retain their full-dataset scopes. ALL
+tooltips state that hidden results are included. Clearing selection is global.
+
+set_filter() intersects existing selection with the new results before emitting
+filter_changed, then emits selection_changed only when membership changed.
+It preserves the current image. In single-image mode, pos_label() reports an
+index within the filtered results or `未匹配 / N` for a non-matching current
+image (`- / N` when there is no current image). nav(1)/nav(-1) enter the first/
+last result when current is unmatched; no results means no navigation, with no
+fallback to all images. can_navigate() reports whether this navigation order
+is nonempty. Multi-selection navigation continues to use the selected keys,
+including an explicit ALL selection. Preview navigation buttons follow this
+availability without changing the displayed image or its zoom on filtering.
+
+## v1.34 — Deferred chip/sentence drop commit
+
+`ChipsEditor` / `SentsEditor` drag-reorder must not commit or rebuild inside
+`QDrag.exec()`. `dropEvent` only records `_pending_drop = (from, to)`;
+`begin_drag` calls `_finish_drag()` after `exec` returns, which then
+`reorder`s (history label `拖拽排序`) and rebuilds. `refresh()` while
+`_drag_index` is set sets `_refresh_pending` and returns; `_finish_drag`
+applies that refresh and discards the drop (indices may be stale).
+
+`anim.pop_in` is geometry-only and never installs `QGraphicsOpacityEffect`.
+`flip_reflow` puts the slide and the pop in one group so
+`anim.finish_animation` lands both. `ChipsEditor.begin_drag` finishes any
+running reflow and clears leftover effects before starting a drag;
+`_rebuild` skips FLIP while a drag is active.
+
+## v1.35 — Chip rebuild must show before layout / drop FLIP
+
+`QWidgetItem.setGeometry` is a no-op on hidden children. `ChipsEditor._rebuild`
+must `show()` every flow item, then `invalidate()` + `activate()`, before
+`flip_reflow` snapshots end rects. Otherwise a wrapping chip still has the
+default `(0, 0, 100, 30)` and the drop animation flies it to the top-left.
+
+`SegmentEditorBase.reorder(from, to) -> bool` returns whether the caption was
+committed. `_finish_drag` rebuilds only when the drop did not commit: a
+successful `reorder` already rebuilt via synchronous `caption_changed` →
+`refresh()`, and a second `_rebuild` would `finish_animation` the drop FLIP.
+
+`anim.pop_in` keeps width fixed (`final.adjusted(0, dy, 0, -dy)`). A width
+tween reflows `_ChipText` every frame.
+
+## v1.36 — CHA标注（组合分层推标）改名 + 独立设置
+
+User-facing name: daily short form **CHA标注**; full name **组合分层推标**
+(English: Combined Hierarchical Annotation) appears only on the wizard
+title and the settings-tab hint. Code identifiers stay `layered_*`.
+
+- Wizard title `CHA标注 · 组合分层推标 (Combined Hierarchical Annotation)`;
+  confirm button `开始CHA标注`; file-panel menus `CHA标注此文件夹/已选/全部/这张图片`
+  (+ unlabeled variants); history / progress `CHA标注`.
+- `CHASettings` (`nlapt_gui/cha_config.py`) persists
+  `app_data_dir()/cha_annotation.json`; `api_key` lives in
+  `Documents/NLapt/cha_api.json`. Fields: `api_mode` (`sync`|`own`),
+  `api_type`, `base_url`, `api_key`, `card_models` (3 slots), `batch_model`.
+  Empty model strings inherit the resolved base profile's `vision_model`.
+- Resolvers: `resolve_base_profile`, `resolve_card_profile(settings, active, index)`,
+  `resolve_batch_profile`. Return `None` when no usable `base_url` /
+  `vision_model`.
+- `AppController.active_profile()`; `make_vision_captioner_or_none(*, profile=None)`.
+  `VisionBridge.configured` / `_make_captioner` / `request_custom` /
+  `request_layered_batch` accept `profile=`; `ENGINE_LOCAL` ignores it.
+- `LayeredInferDialog(..., cha_settings=None)` defaults to `load_cha_settings()`.
+  Each candidate card shows `模型: {name}`; confirm page shows
+  `整批画面模型: {name}` (`本地模型` when the local engine is selected).
+- Settings dialog fifth tab `CHA标注` (`CHATab`): checkbox
+  `同步 LLM 设置中的接口` (default on) hides the own-API rows;
+  four editable model combos (候选 1/2/3 + 整批画面段);
+  `获取模型` / `测试连接`. `save()` writes CHA settings; own mode
+  requires a Base URL. A CHA persist error toasts and does not
+  roll back the other tabs.
+
+## v1.37 — Built-in vision system-prompt schemes
+
+`VisionPrompts.names()` is `默认`, then `BUILTIN_PROMPT_ORDER`
+(`结构化视觉编译`, `客观视觉报告`), then custom names. Bodies live in
+`nlapt_gui/builtin_prompts.py` and are resolved by
+`VisionPrompts.system_text_of`; they are not written to
+`vision_prompts.json`. `load_vision_prompts` accepts a shipped name as
+`active` even when `prompts` is empty. A custom entry with the same name
+overrides the shipped body.
+
+`is_locked_template(name)` is true for 默认 and the shipped schemes.
+`PromptsTab` treats locked templates as read-only (save/delete disabled);
+新建自定义 forks the visible text. `current_prompts()` keeps a shipped
+`active` without copying the body into `prompts`.
+
+## v1.38 — Unified API config (`Documents/NLapt/api.json`)
+
+All interface settings (type / URL / key / model names) live in one file
+`user_documents_dir()/NLapt/api.json`. AppData files keep non-interface
+options only. `NLAPT_DOCUMENTS_DIR` isolates the Documents root in tests.
+
+```python
+# nlapt_gui/api_config.py
+API_FILE_NAME = "api.json"; API_FORMAT_VERSION = 1
+
+@dataclass(frozen=True)
+class TranslateCredentials:
+    baidu_appid: str = ""
+    baidu_key: str = ""
+    deepl_key: str = ""
+    deeplx_url: str = ""
+    deeplx_token: str = ""
+    custom_base_url: str = ""
+    custom_api_key: str = ""
+    custom_model: str = ""
+
+@dataclass(frozen=True)
+class CHAApi:
+    api_type: str = "openai"
+    base_url: str = ""
+    api_key: str = ""
+
+@dataclass(frozen=True)
+class ApiConfig:
+    profiles: tuple[LLMProfile, ...] = ()
+    active_profile: str = ""
+    translate: TranslateCredentials = TranslateCredentials()
+    cha: CHAApi = CHAApi()
+    def with_changes(**changes) -> ApiConfig
+
+def api_config_path() -> Path            # does not create the directory
+def load_api_config() -> ApiConfig       # missing -> legacy fallback; corrupt existing file -> defaults
+def save_api_config(config: ApiConfig) -> None
+def update_api_config(*, profiles=None, active_profile=None, translate=None, cha=None) -> ApiConfig
+def load_app_config() -> AppConfig       # AppData non-interface + api.json profiles
+def save_app_config(config: AppConfig) -> None  # profiles -> api.json; rest -> config.json (profiles emptied)
+def migrate_legacy_api_files() -> bool   # startup; best-effort; never raises
+```
+
+Field ownership:
+
+| File | Fields |
+|---|---|
+| `Documents/NLapt/api.json` | `llm.active_profile` / `llm.profiles`; translate credentials; CHA `api_type` / `base_url` / `api_key` |
+| `%APPDATA%/NLapt/config.json` | `request`, `snapshot_retention`, and other non-interface `AppConfig` fields (no `profiles` / `active_profile`) |
+| `%APPDATA%/NLapt/translate.json` | `provider` / `fallback_order` / `local_mt_tier` |
+| `%APPDATA%/NLapt/cha_annotation.json` | `api_mode` / `card_models` / `batch_model` |
+
+Startup (`nlapt_gui/__main__._load_app_config`) calls
+`migrate_legacy_api_files()` then `load_app_config()`. Migration runs only
+when `api.json` is absent and a legacy location has content: it writes
+`api.json`, strips secrets from the three AppData files, and deletes
+`Documents/NLapt/translate_api.json` and `cha_api.json`. A second call is
+a no-op. Settings / 本地推理 persist LLM profiles through
+`load_app_config` / `save_app_config`. `translate_config` and `cha_config`
+keep their public dataclasses; credentials go through `load_api_config` /
+`update_api_config`. This module must not import those two (legacy file
+names are duplicated strings to avoid a cycle).

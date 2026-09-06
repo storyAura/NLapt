@@ -236,24 +236,30 @@ def http_post_json(
     timeout: float,
     provider: str,
     transport: Any = None,
+    display_url: str | None = None,
 ) -> dict[str, Any]:
     """POST JSON and return the decoded JSON object.
 
     Raises LLMTimeoutError on timeout, LLMRequestError on transport errors,
     HTTP >= 400, or non-object JSON bodies. Error messages never include
-    request headers (and therefore never include API keys).
+    request headers (and therefore never include API keys). ``display_url``
+    replaces ``url`` in logs and exception text when the real URL may embed
+    a secret path segment.
     """
     httpx = require_httpx()
-    _LOGGER.debug("POST %s (provider=%s, model=%s)", url, provider, payload.get("model"))
+    shown = display_url if display_url else url
+    _LOGGER.debug(
+        "POST %s (provider=%s, model=%s)", shown, provider, payload.get("model")
+    )
     try:
         with httpx.Client(timeout=timeout, transport=transport) as http:
             response = http.post(url, json=payload, headers=headers)
     except httpx.TimeoutException as exc:
         raise LLMTimeoutError(
-            f"{provider} request to {url} timed out after {timeout}s"
+            f"{provider} request to {shown} timed out after {timeout}s"
         ) from exc
     except httpx.HTTPError as exc:
-        raise LLMRequestError(f"{provider} request to {url} failed: {exc}") from exc
+        raise LLMRequestError(f"{provider} request to {shown} failed: {exc}") from exc
     if response.status_code >= 400:
         body_preview = response.text[:ERROR_BODY_PREVIEW_CHARS]
         error = LLMRequestError(
@@ -265,7 +271,7 @@ def http_post_json(
         data = response.json()
     except ValueError as exc:
         raise LLMRequestError(
-            f"{provider} returned a non-JSON response from {url}"
+            f"{provider} returned a non-JSON response from {shown}"
         ) from exc
     if not isinstance(data, dict):
         raise LLMRequestError(

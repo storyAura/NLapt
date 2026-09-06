@@ -48,6 +48,23 @@ _LOGGER = get_logger(__name__)
 
 TokensProvider = Callable[[], ThemeTokens]
 
+
+def cover_source_rect(pixmap: QPixmap, target: QRectF) -> QRect:
+    """Return the centered source crop needed to cover ``target``."""
+    if pixmap.isNull() or target.width() <= 0 or target.height() <= 0:
+        return QRect()
+    source_ratio = pixmap.width() / pixmap.height()
+    target_ratio = target.width() / target.height()
+    if source_ratio > target_ratio:
+        source_h = pixmap.height()
+        source_w = max(1, round(source_h * target_ratio))
+        left = (pixmap.width() - source_w) // 2
+        return QRect(left, 0, source_w, source_h)
+    source_w = pixmap.width()
+    source_h = max(1, round(source_w / target_ratio))
+    top = (pixmap.height() - source_h) // 2
+    return QRect(0, top, source_w, source_h)
+
 # The design's photo-overlay colors are theme independent; these theme rows
 # carry exactly rgb(12,13,15) and pure white, so we source them from tokens.
 _SCRIM_BASE_THEME = "墨黑"
@@ -490,14 +507,7 @@ class ThumbCell(_BaseCell):
         painter.fillRect(inner, QColor(tokens.surface2))
         pix = self._thumb(max(1, int(inner.height())))
         if pix is not None and not pix.isNull():
-            scaled = pix.scaled(
-                inner.size().toSize(),
-                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            x = inner.x() + (inner.width() - scaled.width()) / 2.0
-            y = inner.y() + (inner.height() - scaled.height()) / 2.0
-            painter.drawPixmap(QPointF(x, y), scaled)
+            painter.drawPixmap(inner, pix, cover_source_rect(pix, inner))
 
         # bottom gradient overlay + name + segment count
         overlay = QRectF(
@@ -612,18 +622,7 @@ class ListRow(_BaseCell):
         painter.fillRect(thumb, QColor(tokens.surface2))
         pix = self._thumb(LIST_THUMB_H)
         if pix is not None and not pix.isNull():
-            scaled = pix.scaled(
-                thumb.size().toSize(),
-                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            painter.drawPixmap(
-                QPointF(
-                    thumb.x() + (thumb.width() - scaled.width()) / 2.0,
-                    thumb.y() + (thumb.height() - scaled.height()) / 2.0,
-                ),
-                scaled,
-            )
+            painter.drawPixmap(thumb, pix, cover_source_rect(pix, thumb))
         painter.restore()
 
         # right-aligned segment count

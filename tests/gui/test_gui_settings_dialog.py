@@ -5,17 +5,22 @@ from __future__ import annotations
 from typing import Iterator
 
 import pytest
-from PySide6.QtWidgets import QDialog, QLineEdit
+from PySide6.QtWidgets import QDialog, QLabel, QLineEdit
 
 from nlapt.app import NLaptApp
-from nlapt.core.config import AppConfig, LLMProfile, load_config, save_config
+from nlapt.core.config import AppConfig, LLMProfile
 from nlapt.core.errors import LLMRequestError
 from nlapt.llm.base import register_client
 from nlapt.llm.mock import MockLLMClient
 
+from nlapt_gui.api_config import load_app_config, save_app_config
+from nlapt_gui.cha_config import API_MODE_OWN, load_cha_settings
 from nlapt_gui.controller import AppController
-from nlapt_gui.settings import UISettings
+from nlapt_gui.settings import UISettings, load_ui_settings
 from nlapt_gui.widgets.settings_dialog import (
+    HINT_DEBUG,
+    LABEL_DEBUG,
+    TAB_CHA,
     TOAST_NEED_BASE_URL,
     TOAST_NEED_TEXT_MODEL,
     TOAST_SAVED,
@@ -23,6 +28,7 @@ from nlapt_gui.widgets.settings_dialog import (
     SettingsDialog,
     config_path,
 )
+from nlapt_gui.workers import debug_enabled, set_debug
 
 # Unique api_types for this test module.
 API_TYPE = "gui-settings-mock"
@@ -109,7 +115,7 @@ class TestSave:
         with qtbot.waitSignal(dialog.saved, timeout=1000):
             dialog.save_button.click()
         assert config_path().exists()
-        config = load_config(config_path())
+        config = load_app_config()
         assert config.active_profile == "default"
         profile = config.profiles[0]
         assert profile.api_type == API_TYPE
@@ -117,8 +123,25 @@ class TestSave:
         assert profile.api_key == "sk-test-123456789"
         assert profile.text_model == "text-model-1"
         assert profile.vision_model == "vision-model-1"
+        assert "sk-test-123456789" not in config_path().read_text(encoding="utf-8")
         assert (TOAST_SAVED, "ok") in dlg_toasts
         assert dialog.result() == QDialog.DialogCode.Accepted
+
+    def test_save_writes_cha_annotation(self, qtbot, dlg_controller, dlg_toasts) -> None:
+        dialog = _make_dialog(qtbot, dlg_controller)
+        _fill(dialog)
+        assert dialog.tabs.tabText(dialog.tabs.indexOf(dialog.cha_tab)) == TAB_CHA
+        dialog.cha_tab.sync_check.setChecked(False)
+        dialog.cha_tab.base_url.setText("http://cha.local")
+        dialog.cha_tab.card_combos[0].setCurrentText("card-a")
+        dialog.cha_tab.batch_combo.setCurrentText("batch-b")
+        dialog.save_button.click()
+        loaded = load_cha_settings()
+        assert loaded.api_mode == API_MODE_OWN
+        assert loaded.base_url == "http://cha.local"
+        assert loaded.card_models[0] == "card-a"
+        assert loaded.batch_model == "batch-b"
+        assert (TOAST_SAVED, "ok") in dlg_toasts
 
     def test_save_reloads_controller_translator(self, qtbot, dlg_controller) -> None:
         assert dlg_controller.make_translator_or_none() is None
@@ -133,14 +156,13 @@ class TestSave:
         self, qtbot, dlg_controller
     ) -> None:
         other = LLMProfile(name="alt", api_type="openai", base_url="http://alt")
-        save_config(
-            config_path(),
+        save_app_config(
             AppConfig(profiles=(other,), active_profile="alt", snapshot_retention=7),
         )
         dialog = _make_dialog(qtbot, dlg_controller)
         _fill(dialog)
         dialog.save_button.click()
-        config = load_config(config_path())
+        config = load_app_config()
         names = [p.name for p in config.profiles]
         assert names == ["default", "alt"]
         assert config.active_profile == "default"
@@ -154,8 +176,7 @@ class TestSave:
             api_key="sk-old",
             text_model="old-model",
         )
-        save_config(
-            config_path(),
+        save_app_config(
             AppConfig(profiles=(existing,), active_profile="default"),
         )
         dialog = _make_dialog(qtbot, dlg_controller)
@@ -203,3 +224,28 @@ class TestConnectionProbe:
         dialog = _make_dialog(qtbot, dlg_controller)
         dialog.test_button.click()
         assert (TOAST_NEED_BASE_URL, "warn") in dlg_toasts
+
+
+class TestDebugMode:
+    def test_checkbox_defaults_off(self, qtbot, dlg_controller) -> None:
+        dialog = _make_dialog(qtbot, dlg_controller)
+        assert dialog.debug_check.text() == LABEL_DEBUG
+        assert not dialog.debug_check.isChecked()
+        assert any(
+            isinstance(child, QLabel) and child.text() == HINT_DEBUG
+            for child in dialog.findChildren(QLabel)
+        )
+
+    def test_save_persists_debug_and_gates_workers(
+        self, qtbot, dlg_controller
+    ) -> None:
+        dialog = _make_dialog(qtbot, dlg_controller)
+        _fill(dialog)
+        dialog.debug_check.setChecked(True)
+        try:
+            dialog.save_button.click()
+            assert dlg_controller.settings.debug is True
+            assert load_ui_settings().debug is True
+            assert debug_enabled() is True
+        finally:
+            set_debug(False)

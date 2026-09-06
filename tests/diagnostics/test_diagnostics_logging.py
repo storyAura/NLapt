@@ -61,20 +61,32 @@ def test_configure_creates_log_file_on_first_record(tmp_path: Path) -> None:
 
 
 def test_configure_is_idempotent_no_duplicate_handlers(tmp_path: Path) -> None:
-    configure_logging(log_dir=tmp_path)
-    configure_logging(log_dir=tmp_path)
-    configure_logging(log_dir=tmp_path)
+    configure_logging(log_dir=tmp_path, console=True)
+    configure_logging(log_dir=tmp_path, console=True)
+    configure_logging(log_dir=tmp_path, console=True)
     assert len(_managed_handlers()) == 2  # console + file, never more
     get_logger("nlapt.test.once").warning("only-once-marker")
     content = (tmp_path / LOG_FILE_NAME).read_text(encoding="utf-8")
     assert content.count("only-once-marker") == 1
 
 
-def test_configure_without_log_dir_console_only() -> None:
-    configure_logging()
+def test_configure_default_omits_console(tmp_path: Path) -> None:
+    configure_logging(log_dir=tmp_path)
     handlers = _managed_handlers()
     assert len(handlers) == 1
-    assert isinstance(handlers[0], logging.StreamHandler)
+    assert type(handlers[0]) is not logging.StreamHandler
+
+
+def test_configure_without_log_dir_is_silent_by_default() -> None:
+    configure_logging()
+    assert _managed_handlers() == []
+
+
+def test_configure_console_only_when_requested() -> None:
+    configure_logging(console=True)
+    handlers = _managed_handlers()
+    assert len(handlers) == 1
+    assert type(handlers[0]) is logging.StreamHandler
 
 
 def test_level_filtering(tmp_path: Path) -> None:

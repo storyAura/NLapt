@@ -42,6 +42,20 @@ HEIGHT_BUCKET_PX = 64
 THUMB_DISK_DIR_NAME = "thumbs"
 # Cache files are PNG so alpha survives (thumbs are tiny, size is fine).
 _DISK_FORMAT = "PNG"
+# Dedicated decode pool: never share the global pool with translation jobs.
+DECODE_POOL_MAX_THREADS = 4
+THUMB_ACTIVE_LIMIT = 3
+_DECODE_POOL: QThreadPool | None = None
+
+
+def get_decode_pool() -> QThreadPool:
+    """Pool for thumbnail and preview image decodes."""
+    global _DECODE_POOL
+    if _DECODE_POOL is None:
+        pool = QThreadPool()
+        pool.setMaxThreadCount(DECODE_POOL_MAX_THREADS)
+        _DECODE_POOL = pool
+    return _DECODE_POOL
 
 
 def bucket_height(target_h: int) -> int:
@@ -119,13 +133,17 @@ class ThumbnailLoader(QObject):
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
-        self._pool = pool if pool is not None else QThreadPool.globalInstance()
+        self._pool = pool if pool is not None else get_decode_pool()
         self._cache_limit = max(1, cache_limit)
         self._disk_cache_dir = (
             disk_cache_dir if disk_cache_dir is not None else default_disk_cache_dir()
         )
         self._cache: OrderedDict[tuple[str, int], QPixmap] = OrderedDict()
         self._in_flight: set[tuple[str, int]] = set()
+        self._pending: OrderedDict[tuple[str, int], tuple[str, str, int, int]] = OrderedDict()
+        self._failed: set[tuple[str, int]] = set()
+        self._generation = 0
+        self._active = 0
 
     def pixmap(self, key: str, target_h: int) -> QPixmap | None:
         """Cached pixmap for ``key`` at the bucketed height, or ``None``."""
@@ -146,15 +164,48 @@ class ThumbnailLoader(QObject):
         cached = self.pixmap(key, target_h)
         if cached is not None:
             return cached
-        if cache_key in self._in_flight:
+        if cache_key in self._in_flight or cache_key in self._pending or cache_key in self._failed:
             return None
-        self._in_flight.add(cache_key)
+        generation = self._generation
+        self._pending[cache_key] = (key, str(path), height, generation)
+        self._pump()
+        return None
+
+    def _pump(self) -> None:
+        """Submit a bounded number of decodes so visible work stays responsive."""
+        while self._active < THUMB_ACTIVE_LIMIT and self._pending:
+            cache_key, item = self._pending.popitem(last=False)
+            key, path, height, generation = item
+            self._in_flight.add(cache_key)
+            self._active += 1
+
+            self._submit(cache_key, key, path, height, generation)
+
+    def _submit(
+        self,
+        cache_key: tuple[str, int],
+        key: str,
+        path: str,
+        height: int,
+        generation: int,
+    ) -> None:
+        """Submit one decode with callbacks bound to its immutable request."""
+
+        def _release_current() -> bool:
+            if not shiboken6.isValid(self):
+                return False
+            self._active = max(0, self._active - 1)
+            if generation == self._generation:
+                self._in_flight.discard(cache_key)
+            return generation == self._generation
 
         def _done(image: object) -> None:
-            if not shiboken6.isValid(self):
-                return  # loader torn down while the decode was in flight
-            self._in_flight.discard(cache_key)
-            if not isinstance(image, QImage):  # defensive; worker returns QImage
+            current = _release_current()
+            self._pump()
+            if not current:
+                return
+            if not isinstance(image, QImage):
+                self._failed.add(cache_key)
                 _LOGGER.warning("unexpected thumbnail payload for %r", key)
                 return
             pix = QPixmap.fromImage(image)
@@ -162,26 +213,32 @@ class ThumbnailLoader(QObject):
             self.ready.emit(key, pix)
 
         def _failed(message: str) -> None:
-            if not shiboken6.isValid(self):
+            current = _release_current()
+            self._pump()
+            if not current:
                 return
-            self._in_flight.discard(cache_key)
+            self._failed.add(cache_key)
             _LOGGER.warning("thumbnail load failed for %r: %s", key, message)
 
         run_async(
             self._pool,
             _read_scaled,
-            str(path),
+            path,
             height,
             self._disk_cache_dir,
             on_done=_done,
             on_error=_failed,
         )
-        return None
 
     def clear(self) -> None:
         """Drop every cached pixmap (memory only — the disk cache stays, so
         a dataset refresh re-fills from tiny PNGs instead of re-decoding)."""
         self._cache.clear()
+        self._generation += 1
+        self._pending.clear()
+        self._in_flight.clear()
+        self._failed.clear()
+        self._pump()
 
     def cache_size(self) -> int:
         """Number of cached entries (test/diagnostic helper)."""

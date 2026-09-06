@@ -19,6 +19,20 @@ _LOGGER = get_logger(__name__)
 
 # Strong references to in-flight workers (released when done/error fires).
 _ACTIVE_WORKERS: set["FunctionWorker"] = set()
+# When False (default), failures log one warning line — no traceback in the
+# launcher console. 调试模式 turns this on via :func:`set_debug`.
+_DEBUG = False
+
+
+def set_debug(enabled: bool) -> None:
+    """Gate worker exception tracebacks (on = log full stacks)."""
+    global _DEBUG
+    _DEBUG = bool(enabled)
+
+
+def debug_enabled() -> bool:
+    """True when worker failures should log a full traceback."""
+    return _DEBUG
 
 
 class _WorkerSignals(QObject):
@@ -32,7 +46,8 @@ class FunctionWorker(QRunnable):
     """Run ``fn(*args)`` on a QThreadPool thread.
 
     Emits ``signals.done(result)`` on success or ``signals.error(str)``
-    when ``fn`` raises; the exception is also logged with traceback.
+    when ``fn`` raises. Failures log a one-line warning unless debug
+    mode is on, in which case the full traceback is logged.
     """
 
     def __init__(self, fn: Callable[..., Any], *args: Any) -> None:
@@ -47,10 +62,22 @@ class FunctionWorker(QRunnable):
         try:
             result = self._fn(*self._args)
         except Exception as exc:
-            _LOGGER.exception("worker %r failed", getattr(self._fn, "__name__", self._fn))
-            self.signals.error.emit(str(exc) or type(exc).__name__)
+            name = getattr(self._fn, "__name__", self._fn)
+            if _DEBUG:
+                _LOGGER.exception("worker %r failed", name)
+            else:
+                _LOGGER.warning("worker %r failed: %s", name, exc)
+            self._emit(self.signals.error, str(exc) or type(exc).__name__)
         else:
-            self.signals.done.emit(result)
+            self._emit(self.signals.done, result)
+
+    def _emit(self, signal: Signal, payload: object) -> None:
+        """Deliver ``payload``; a torn-down QObject must not become a crash."""
+        try:
+            signal.emit(payload)
+        except RuntimeError:
+            _LOGGER.debug("worker signal dropped (receiver gone)")
+            _ACTIVE_WORKERS.discard(self)
 
 
 def run_async(

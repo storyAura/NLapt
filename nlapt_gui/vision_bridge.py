@@ -31,6 +31,7 @@ from typing import Callable
 
 from PySide6.QtCore import QObject, QThreadPool, Signal
 
+from nlapt.core.config import LLMProfile
 from nlapt.core.errors import NLaptError
 from nlapt.diagnostics import get_logger
 from nlapt.local.catalog import ENGINE_FLORENCE, find_family
@@ -109,7 +110,9 @@ class VisionBridge(QObject):
         return load_vision_prompts()
 
     # -- readiness ---------------------------------------------------------------------
-    def configured(self, engine: str = ENGINE_LLM) -> bool:
+    def configured(
+        self, engine: str = ENGINE_LLM, *, profile: LLMProfile | None = None
+    ) -> bool:
         """Whether ``engine`` could serve a caption request right now."""
         if engine == ENGINE_LOCAL:
             try:
@@ -117,16 +120,22 @@ class VisionBridge(QObject):
             except NLaptError:
                 return False
             return True
-        return self._controller.make_vision_captioner_or_none() is not None
+        return self._controller.make_vision_captioner_or_none(profile=profile) is not None
 
-    def _make_captioner(self, engine: str) -> tuple[Captioner | None, str]:
-        """(captioner, error message) — exactly one side is meaningful."""
+    def _make_captioner(
+        self, engine: str, profile: LLMProfile | None = None
+    ) -> tuple[Captioner | None, str]:
+        """(captioner, error message) — exactly one side is meaningful.
+
+        ``profile`` overrides the active LLM archive. The local engine
+        ignores it (the running local model is the model).
+        """
         if engine == ENGINE_LOCAL:
             try:
                 return self._local_captioner_factory(), ""
             except NLaptError as exc:
                 return None, str(exc)
-        captioner = self._controller.make_vision_captioner_or_none()
+        captioner = self._controller.make_vision_captioner_or_none(profile=profile)
         if captioner is None:
             return None, NOTE_VISION_UNCONFIGURED
         return captioner, ""
@@ -183,15 +192,17 @@ class VisionBridge(QObject):
         *,
         system: str,
         user_prompt: str,
+        profile: LLMProfile | None = None,
     ) -> bool:
         """Caption ``key`` with caller-supplied prompts; emit ``custom_ready``.
 
-        Bypasses ``load_vision_prompts``. Used by the 分层推标 wizard to
+        Bypasses ``load_vision_prompts``. Used by the CHA标注 wizard to
         generate character-card candidates. Returns False (and emits a
         failed ``custom_ready``) when the engine is not ready or the key
         has no image. Local idle-stopper pairing matches :meth:`request`.
+        ``profile`` overrides the active LLM archive; ignored for local.
         """
-        captioner, error = self._make_captioner(engine)
+        captioner, error = self._make_captioner(engine, profile)
         if captioner is None:
             self.custom_ready.emit(request_id, error, False)
             return False
@@ -234,15 +245,17 @@ class VisionBridge(QObject):
         card_text: str,
         scene_system: str,
         scene_user: str,
+        profile: LLMProfile | None = None,
     ) -> bool:
         """Batch-caption ``keys`` as 人物卡 + blank + 画面段.
 
         Reuses :meth:`AppController.run_caption_batch` so snapshot / progress
         / cancel / history stay on the existing 推标 path. Returns False
         (with a warn toast) when the engine is not ready or a batch is
-        already running.
+        already running. ``profile`` overrides the active LLM archive;
+        ignored for local.
         """
-        captioner, error = self._make_captioner(engine)
+        captioner, error = self._make_captioner(engine, profile)
         if captioner is None:
             self._controller.toast_requested.emit(error, "warn")
             return False

@@ -78,6 +78,71 @@ class TestHeader:
         assert controller.current_key == K1
         assert panel.pos_label.text() == "1 / 4"
 
+
+class TestFilteredNavigation:
+    def test_empty_filter_results_disable_navigation_and_keep_preview(
+        self, qtbot, panel: PreviewPanel, controller: AppController
+    ) -> None:
+        qtbot.waitUntil(lambda: panel.pixmap_for(K1) is not None, timeout=2000)
+        pixmap = panel.single_view._pixmap
+        panel._set_zoom(200)
+        controller.set_filter("no-matching-file-or-caption")
+
+        assert controller.current_key == K1
+        assert panel.name_label.text() == K1
+        assert panel.pos_label.text() == "未匹配 / 0"
+        assert panel.single_view._pixmap is pixmap
+        assert panel.zoom_label() == "200%"
+        assert not panel.prev_button.isEnabled()
+        assert not panel.next_button.isEnabled()
+        qtbot.mouseClick(panel.next_button, Qt.MouseButton.LeftButton)
+        qtbot.mouseClick(panel.prev_button, Qt.MouseButton.LeftButton)
+        assert controller.current_key == K1
+
+        controller.set_filter("")
+        assert panel.prev_button.isEnabled()
+        assert panel.next_button.isEnabled()
+        assert panel.pos_label.text() == "1 / 4"
+
+    @pytest.mark.parametrize(
+        ("button_name", "target", "position"),
+        (("next_button", K1, "1 / 3"), ("prev_button", K3, "3 / 3")),
+    )
+    def test_unmatched_current_enters_result_boundary(
+        self, qtbot, panel: PreviewPanel, controller: AppController,
+        button_name: str, target: str, position: str,
+    ) -> None:
+        controller.set_current(K4)
+        controller.set_filter("1girl")
+        assert controller.current_key == K4
+        assert panel.name_label.text() == "0004.png"
+        assert panel.pos_label.text() == "未匹配 / 3"
+        assert panel.prev_button.isEnabled()
+        assert panel.next_button.isEnabled()
+
+        qtbot.mouseClick(getattr(panel, button_name), Qt.MouseButton.LeftButton)
+        assert controller.current_key == target
+        assert panel.pos_label.text() == position
+
+    def test_matching_multi_selection_keeps_navigation_and_wraps(
+        self, qtbot, panel: PreviewPanel, controller: AppController
+    ) -> None:
+        for key in (K1, K2, K3):
+            controller.toggle_selected(key)
+        controller.set_filter("1girl")
+        assert panel.current_view() == "multi"
+        assert panel.prev_button.isEnabled()
+        assert panel.next_button.isEnabled()
+
+        qtbot.mouseClick(panel.prev_button, Qt.MouseButton.LeftButton)
+        assert controller.current_key == K3
+        assert panel.pos_label.text() == "3 / 3"
+        qtbot.mouseClick(panel.next_button, Qt.MouseButton.LeftButton)
+        assert controller.current_key == K1
+        assert panel.pos_label.text() == "1 / 3"
+        assert [cell.key for cell in panel.multi_cells()] == [K1, K2, K3]
+
+
 class TestZoom:
     def test_default_is_fit(self, panel: PreviewPanel) -> None:
         assert panel.zoom_label() == TEXT_FIT
@@ -265,14 +330,13 @@ class TestTheme:
         assert not panel.grab().isNull()
 
 
-class TestKeepPreviousImage:
-    def test_uncached_switch_keeps_old_pixmap(self, qtbot, panel, controller) -> None:
+class TestProgressiveImage:
+    def test_uncached_switch_clears_identity_until_current_frame(self, qtbot, panel, controller) -> None:
         qtbot.waitUntil(lambda: panel.pixmap_for(K1) is not None, timeout=2000)
-        first = panel.single_view._pixmap
-        assert first is not None
         panel._pix_cache.pop(K2, None)
+        panel._coarse_cache.pop(K2, None)
         panel._loading.discard(K2)
         controller.set_current(K2)
-        assert panel.single_view._pixmap is first
+        assert panel.single_view._pixmap is None
         qtbot.waitUntil(lambda: panel.pixmap_for(K2) is not None, timeout=2000)
         assert panel.single_view._pixmap is panel._pix_cache[K2]

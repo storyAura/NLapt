@@ -9,9 +9,9 @@ never blocks.
 The active provider comes from :class:`nlapt_gui.translate_config`: ``"llm"``
 (default) translates via the controller's configured LLM profile, while
 ``"google"`` / ``"baidu"`` / ``"deepl"`` use the built-in web providers in
-:mod:`nlapt.llm.web_translate`. ``configured()`` reflects whether the selected
-provider is usable right now (Google always is; Baidu/DeepL need keys; the LLM
-needs an active profile).
+:mod:`nlapt.llm.web_translate`. ``configured()`` is true when any provider in
+the fallback chain is usable (Google always is; Baidu/DeepL need keys; the
+LLM needs an active profile; unconfigured fallbacks are skipped).
 
 Caching: results live in a core :class:`TranslationCache` keyed by a hash of
 the source text, so identical tags across files/segments share one LLM call.
@@ -30,6 +30,7 @@ from PySide6.QtCore import QObject, QThreadPool, Signal
 
 from nlapt.core.errors import LLMError
 from nlapt.diagnostics import get_logger
+from nlapt.llm.fallback import run_fallback_chain
 from nlapt.llm.retry import RetryPolicy, with_retry
 from nlapt.llm.translate import (
     CJK_CHAR_RANGES,
@@ -38,10 +39,15 @@ from nlapt.llm.translate import (
     TranslationCache,
     detect_direction,
 )
-from nlapt.llm.web_translate import PROVIDER_LLM, create_provider
+from nlapt.llm.web_translate import PROVIDER_LLM, PROVIDER_LOCAL_MT, create_provider
 
 from nlapt_gui.controller import AppController
-from nlapt_gui.translate_config import TranslationConfig, load_translation_config
+from nlapt_gui.mt_bridge import LocalMTProvider, is_tier_downloaded
+from nlapt_gui.translate_config import (
+    TranslationConfig,
+    load_translation_config,
+    provider_chain,
+)
 from nlapt_gui.workers import run_async
 
 # A resolved single-segment translation callable ``(text, direction) -> str``.
@@ -53,6 +59,21 @@ _LOGGER = get_logger(__name__)
 _CACHE_KEY_PREFIX = "seg::"
 # Shown by rows when no LLM profile is configured (design guided state).
 NOTE_UNCONFIGURED = "(未配置翻译 API)"
+# Dedicated pool so DeepLX/LLM segments cannot starve downloads or previews.
+TRANSLATE_POOL_MAX_THREADS = 3
+_TRANSLATE_POOL: QThreadPool | None = None
+# Returned by a worker whose generation was invalidated; never cached or emitted.
+_STALE_TRANSLATION = object()
+
+
+def get_translate_pool() -> QThreadPool:
+    """Pool for caption/segment translation (capped, never the global pool)."""
+    global _TRANSLATE_POOL
+    if _TRANSLATE_POOL is None:
+        pool = QThreadPool()
+        pool.setMaxThreadCount(TRANSLATE_POOL_MAX_THREADS)
+        _TRANSLATE_POOL = pool
+    return _TRANSLATE_POOL
 
 
 def has_cjk(text: str) -> bool:
@@ -91,9 +112,10 @@ class TranslateBridge(QObject):
     ) -> None:
         super().__init__(parent)
         self._controller = controller
-        self._pool = pool if pool is not None else QThreadPool.globalInstance()
+        self._pool = pool if pool is not None else get_translate_pool()
         self._cache = TranslationCache()
         self._sequence = count()
+        self._generation = 0
         # When a config is injected (tests) it is fixed; otherwise the active
         # provider selection is read fresh from disk so a 设置 save is picked
         # up without any explicit wiring. ``transport`` lets tests drive web
@@ -102,6 +124,11 @@ class TranslateBridge(QObject):
         self._fixed_config = config
         self._transport = transport
         self._retry_sleep = retry_sleep
+        controller.dataset_opened.connect(self.invalidate_pending)
+
+    def invalidate_pending(self, *_args: object) -> None:
+        """Drop queued and in-flight translations (dataset switch / close)."""
+        self._generation += 1
 
     def _web_retry_policy(self) -> RetryPolicy:
         """Spec-8 parity for web providers (they have no internal retry):
@@ -116,17 +143,41 @@ class TranslateBridge(QObject):
         return load_translation_config()
 
     def configured(self) -> bool:
-        """True when the selected provider is usable right now.
+        """True when any provider in the fallback chain is usable right now.
 
         The LLM provider needs an active profile; Baidu/DeepL need their keys;
-        Google is always usable.
+        Google is always usable. Unconfigured fallbacks are skipped.
         """
         return self._resolve_translate_fn() is not None
 
     def _resolve_translate_fn(self) -> TranslateFn | None:
-        """Build the callable for the selected provider, or None if unusable."""
+        """Build a chained callable, or None if no provider in the chain works."""
         config = self._config()
-        if config.provider == PROVIDER_LLM:
+        resolved: list[tuple[str, TranslateFn]] = []
+        for provider_id in provider_chain(config):
+            fn = self._fn_for_provider(provider_id, config)
+            if fn is not None:
+                resolved.append((provider_id, fn))
+        if not resolved:
+            return None
+
+        def translate(text: str, direction: Direction) -> str:
+            attempts: list[tuple[str, Callable[[], str]]] = []
+            for name, fn in resolved:
+
+                def thunk(fn: TranslateFn = fn) -> str:
+                    return fn(text, direction)
+
+                attempts.append((name, thunk))
+            return run_fallback_chain(attempts)
+
+        return translate
+
+    def _fn_for_provider(
+        self, provider_id: str, config: TranslationConfig
+    ) -> TranslateFn | None:
+        """One provider's ``(text, direction) -> str``, or None if unusable."""
+        if provider_id == PROVIDER_LLM:
             translator = self._controller.make_translator_or_none()
             if translator is None:
                 return None
@@ -139,14 +190,19 @@ class TranslateBridge(QObject):
                 return translator.translate(request_key, text, direction).translated
 
             return llm_translate
+        if provider_id == PROVIDER_LOCAL_MT:
+            provider = self._local_mt_provider(config.local_mt_tier)
+            if provider is None:
+                return None
+            return provider.translate
         try:
             provider = create_provider(
-                config.provider,
+                provider_id,
                 config.credentials(),
                 transport=self._transport,
             )
         except LLMError as exc:
-            _LOGGER.info("translation provider %r unusable: %s", config.provider, exc)
+            _LOGGER.info("translation provider %r unusable: %s", provider_id, exc)
             return None
         policy = self._web_retry_policy()
 
@@ -159,6 +215,14 @@ class TranslateBridge(QObject):
 
         return web_translate
 
+    def _local_mt_provider(self, tier: str) -> LocalMTProvider | None:
+        """A ready Hy-MT2 provider, or None when the GGUF is not downloaded."""
+        if not is_tier_downloaded(tier):
+            return None
+        return LocalMTProvider(
+            tier, transport=self._transport, retry_sleep=self._retry_sleep
+        )
+
     def request(self, key: str, text: str, *, fresh: bool = False) -> None:
         """Translate one segment asynchronously; emits ``segment_ready``.
 
@@ -168,27 +232,56 @@ class TranslateBridge(QObject):
         self._start(key, text, fresh=fresh, on_finish=None)
 
     def _resolve_target_fn(self, target_lang: str) -> Callable[[str], str] | None:
-        """A ``text -> translated`` callable for a target language, or None."""
+        """A chained ``text -> translated`` callable, or None if none work."""
         config = self._config()
-        if config.provider == PROVIDER_LLM:
+        resolved: list[tuple[str, Callable[[str], str]]] = []
+        for provider_id in provider_chain(config):
+            fn = self._target_fn_for_provider(provider_id, config, target_lang)
+            if fn is not None:
+                resolved.append((provider_id, fn))
+        if not resolved:
+            return None
+
+        def translate(text: str) -> str:
+            attempts: list[tuple[str, Callable[[], str]]] = []
+            for name, fn in resolved:
+
+                def thunk(fn: Callable[[str], str] = fn) -> str:
+                    return fn(text)
+
+                attempts.append((name, thunk))
+            return run_fallback_chain(attempts)
+
+        return translate
+
+    def _target_fn_for_provider(
+        self, provider_id: str, config: TranslationConfig, target_lang: str
+    ) -> Callable[[str], str] | None:
+        """One provider's ``text -> translated`` for ``target_lang``, or None."""
+        if provider_id == PROVIDER_LLM:
             translator = self._controller.make_translator_or_none()
             if translator is None:
                 return None
             return lambda text: translator.translate_to(
                 f"{_text_cache_key(text)}::{target_lang}", text, target_lang
             ).translated
+        if provider_id == PROVIDER_LOCAL_MT:
+            provider = self._local_mt_provider(config.local_mt_tier)
+            if provider is None:
+                return None
+            return lambda text: provider.translate_to(text, target_lang)
         try:
             provider = create_provider(
-                config.provider,
+                provider_id,
                 config.credentials(),
                 transport=self._transport,
             )
         except LLMError as exc:
-            _LOGGER.info("translation provider %r unusable: %s", config.provider, exc)
+            _LOGGER.info("translation provider %r unusable: %s", provider_id, exc)
             return None
         translate_to = getattr(provider, "translate_to", None)
         if translate_to is None:  # defensive: every built-in provider has it
-            _LOGGER.error("provider %r lacks translate_to", config.provider)
+            _LOGGER.error("provider %r lacks translate_to", provider_id)
             return None
         return lambda text: translate_to(text, target_lang)
 
@@ -215,10 +308,16 @@ class TranslateBridge(QObject):
                 self.target_ready.emit(key, text, target_lang, cached.translated, True)
                 return
 
-        def work() -> str:
+        generation = self._generation
+
+        def work() -> object:
+            if generation != self._generation:
+                return _STALE_TRANSLATION
             return translate_fn(stripped)
 
         def done(result: object) -> None:
+            if generation != self._generation or result is _STALE_TRANSLATION:
+                return
             if isinstance(result, str) and result.strip():
                 entry = CachedTranslation(
                     source_text=stripped,
@@ -233,6 +332,8 @@ class TranslateBridge(QObject):
                 self.target_ready.emit(key, text, target_lang, "", False)
 
         def failed(message: str) -> None:
+            if generation != self._generation:
+                return
             _LOGGER.warning("caption translation failed for %r: %s", key, message)
             self.target_ready.emit(key, text, target_lang, message, False)
 
@@ -284,11 +385,16 @@ class TranslateBridge(QObject):
                 self._finish(key, text, cached.translated, True, on_finish)
                 return
         direction = detect_direction(stripped)
+        generation = self._generation
 
-        def work() -> str:
+        def work() -> object:
+            if generation != self._generation:
+                return _STALE_TRANSLATION
             return translate_fn(stripped, direction)
 
         def done(result: object) -> None:
+            if generation != self._generation or result is _STALE_TRANSLATION:
+                return
             if isinstance(result, str) and result.strip():
                 entry = CachedTranslation(
                     source_text=stripped,
@@ -303,6 +409,8 @@ class TranslateBridge(QObject):
                 self._finish(key, text, "", False, on_finish)
 
         def failed(message: str) -> None:
+            if generation != self._generation:
+                return
             _LOGGER.warning("translation failed for %r: %s", stripped, message)
             self._finish(key, text, message, False, on_finish)
 

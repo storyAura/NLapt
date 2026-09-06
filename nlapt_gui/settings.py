@@ -49,6 +49,7 @@ class UISettings:
     folder_open: Mapping[str, bool] = field(default_factory=dict)
     last_root: str = ""
     sections: Mapping[str, bool] = field(default_factory=_default_sections)
+    debug: bool = False
 
 
 def _default_path() -> Path:
@@ -64,6 +65,10 @@ def _coerce_int(value: Any, default: int, bounds: tuple[int, int]) -> int:
         return default
     low, high = bounds
     return max(low, min(high, value))
+
+
+def _coerce_bool(value: Any, default: bool) -> bool:
+    return value if isinstance(value, bool) else default
 
 
 def _coerce_bool_map(value: Any, default: Mapping[str, bool]) -> dict[str, bool]:
@@ -101,6 +106,7 @@ def load_ui_settings(path: Path | None = None) -> UISettings:
         folder_open=_coerce_bool_map(data.get("folder_open"), {}),
         last_root=data.get("last_root") if isinstance(data.get("last_root"), str) else "",
         sections=merged_sections,
+        debug=_coerce_bool(data.get("debug"), defaults.debug),
     )
 
 
@@ -116,6 +122,7 @@ def save_ui_settings(settings: UISettings, path: Path | None = None) -> None:
         "folder_open": dict(settings.folder_open),
         "last_root": settings.last_root,
         "sections": dict(settings.sections),
+        "debug": settings.debug,
     }
     atomic_write_text(target, json.dumps(payload, ensure_ascii=False, indent=2))
     _LOGGER.debug("ui settings saved to %s", target)

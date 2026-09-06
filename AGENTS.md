@@ -93,9 +93,11 @@ ModelScope APIs) — update the data AND `CATALOG_SNAPSHOT_DATE` /
 `RUNTIME_SNAPSHOT_DATE` together.
 
 Per-user state lives in `%APPDATA%/NLapt` (override with env `NLAPT_DATA_DIR`; GUI tests
-isolate it automatically): `config.json` (LLM profiles — the only file with API keys),
-`ui_settings.json`, `translate.json`, `vision_prompts.json`, `local_llm.json`, plus the
-`thumbs/` thumbnail cache and `runtime/` (auto-provisioned llama.cpp).
+isolate it automatically): `config.json` (non-interface AppConfig), `ui_settings.json`,
+`translate.json` (provider / fallback / MT tier), `vision_prompts.json`, `local_llm.json`,
+plus the `thumbs/` thumbnail cache and `runtime/` (auto-provisioned llama.cpp). All
+interface credentials (LLM profiles, translate channels, CHA own-API) live in
+`Documents/NLapt/api.json` (`NLAPT_DOCUMENTS_DIR` isolates the Documents root in tests).
 
 ## Hard rules (enforced by tests or bitter experience)
 

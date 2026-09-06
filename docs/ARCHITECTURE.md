@@ -1211,3 +1211,79 @@ those names.
 (`NLAPT_DATA_DIR` / `%APPDATA%/NLapt` / `~/.config/nlapt`).
 `nlapt_gui.resources.app_data_dir` delegates to it.
 
+## v1.16 addendum — console logging is opt-in
+
+`configure_logging` gained `*, console: bool = False`. The rotating file
+handler is unchanged. A `StreamHandler` is attached only when
+`console=True` (GUI 调试模式). Default is quiet so launchers are not
+flooded with worker stacks.
+
+## v1.17 addendum — custom OpenAI-compatible translate provider
+
+`nlapt.llm.web_translate` adds `PROVIDER_CUSTOM` / `CustomOpenAIProvider`:
+POST `{base_url}/chat/completions` (or a full completions URL) with a
+caption-translation prompt. Base URL and model are required; API key is
+optional. GUI credentials for this provider persist under
+`user_documents_app_dir()/translate_api.json`
+(`Documents/NLapt`, overridable via `NLAPT_DOCUMENTS_DIR`).
+
+## v1.18 addendum — DeepLX free translate provider
+
+`PROVIDER_DEEPLX` / `DeepLXProvider` posts JSON to `{base}/translate`
+(`source_lang=auto`, `target_lang` ZH/EN/JA). A full URL already ending in
+`/translate` is kept. Optional token uses `Bearer`. Response `code` other
+than 200, or a missing `data` string, raises `LLMRequestError`.
+
+## v1.19 addendum — DeepLX throttle + Hy-MT2 local MT
+
+`http_post_json` accepts optional `display_url` used in logs and exception
+text (DeepLX redacts secret path/query segments). `DeepLXProvider` shares a
+process-wide `MinIntervalLimiter` (1 s) and retries HTTP/body `429` up to
+3 times (1 s / 2 s / 4 s). DeepLX URL + token persist in
+`Documents/NLapt/translate_api.json` (one-time migrate from AppData).
+
+`nlapt.local.mt_catalog` snapshots three official Hy-MT2 GGUF tiers
+(`fast` / `balanced` / `quality`) with exact LFS sizes and SHA256.
+`nlapt_gui.mt_bridge.LocalMTProvider` serves them on `settings.port + 1`
+via a second `LocalServerManager` + idle stopper, using the official
+Hy-MT2 user prompt and `temperature=0.7` / `top_p=0.6`. Downloads reuse
+`local_bridge.launch_download_jobs` into `models_dir/mt/<tier>/`.
+
+## v1.20 addendum — DeepLX 418 busy
+
+Community DeepLX hosts often answer HTTP 418 (`I'm a teapot`) as a
+rate-limit. `DeepLXProvider` retries 418 / 429 / 503 with the same
+backoff as 429, then raises a Chinese busy message (no teapot / JSON
+body) so the 分层推标 cards and 译文对照 stay readable.
+
+## v1.21 addendum — translate fallback chain
+
+`nlapt.llm.fallback.run_fallback_chain` tries `(name, thunk)` pairs in
+order. `LLMConfigError` skips an unusable provider; other `LLMError`
+values continue to the next name. The last error is re-raised. Empty
+input raises `LLMRequestError("所有翻译备选均失败")`.
+
+## v1.22 addendum — Hy-MT2 chat inference
+
+`LocalMTProvider` uses the single-user-message chat protocol and inference
+parameters documented by [Tencent](https://huggingface.co/tencent/Hy-MT2-1.8B).
+The llama.cpp-specific request and response contract is maintained in
+`docs/UI_ARCHITECTURE.md` v1.30, alongside the GUI-owned MT server lifecycle.
+
+## v1.23 addendum — public profile parsers + Known Folder Documents
+
+`nlapt.core.config` exposes the profile parsers used by the GUI's unified
+`api.json` (see `docs/UI_ARCHITECTURE.md` v1.38). `load_config` /
+`save_config` still accept `profiles` / `active_profile` so migration and
+core tests can read leftover AppData files.
+
+```python
+def profile_from_dict(data: Any, index: int = 0) -> LLMProfile
+def profiles_from_list(raw: Any) -> tuple[LLMProfile, ...]
+```
+
+`user_documents_dir()` resolution order: `NLAPT_DOCUMENTS_DIR` (tests and
+portable installs), then Windows `SHGetKnownFolderPath(FOLDERID_Documents)`
+so OneDrive / redirected folders resolve, then `Path.home()/Documents`.
+`windows_known_documents_dir()` returns `None` off Windows or when the
+shell call fails.

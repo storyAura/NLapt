@@ -22,7 +22,7 @@ from nlapt.app import NLaptApp
 from nlapt.batch.progress import BatchController, BatchReport
 from nlapt.captions.chips import join_chips, split_chips
 from nlapt.captions.store import CaptionRecord
-from nlapt.core.config import AppConfig, get_active_profile
+from nlapt.core.config import AppConfig, LLMProfile, get_active_profile
 from nlapt.core.errors import LLMConfigError, NLaptError, ValidationError
 from nlapt.core.events import EVT_ENCODING_ISSUES, EVT_TXT_CONFLICT, Event
 from nlapt.core.models import DatasetScanResult, ImageFile
@@ -80,6 +80,7 @@ POSITION_PREFIX = "prefix"
 POSITION_SUFFIX = "suffix"
 WORD_PREFIX = "添加前缀"
 WORD_SUFFIX = "添加后缀"
+POSITION_UNMATCHED = "未匹配 / {count}"
 
 # stat/meta separators from the design.
 _DOT = " · "
@@ -277,10 +278,16 @@ class AppController(QObject):
         return tuple(matches)
 
     def set_filter(self, text: str) -> None:
+        """Filter results and selection while preserving the current image."""
         if text == self._filter:
             return
         self._filter = text
+        selected = self._selected.intersection(self.filtered_keys())
+        selection_changed = selected != self._selected
+        self._selected = selected
         self.filter_changed.emit(text)
+        if selection_changed:
+            self.selection_changed.emit()
 
     @property
     def filter_text(self) -> str:
@@ -374,15 +381,22 @@ class AppController(QObject):
     def _nav_order(self) -> tuple[str, ...]:
         if self.multi_mode():
             return self.selected_keys()
-        filtered = self.filtered_keys()
-        return filtered if filtered else self._keys
+        return self.filtered_keys()
+
+    def can_navigate(self) -> bool:
+        """Whether the active filtered or multi-selection order has a target."""
+        return bool(self._nav_order())
 
     def nav(self, delta: int) -> None:
         """Prev/next within selection (multi) or filtered list; wraps around."""
         order = self._nav_order()
         if not order:
             return
-        index = order.index(self._current) if self._current in order else 0
+        if self._current not in order:
+            if delta:
+                self.set_current(order[0] if delta > 0 else order[-1])
+            return
+        index = order.index(self._current)
         self.set_current(order[(index + delta) % len(order)])
 
     def pos_label(self) -> str:
@@ -396,12 +410,8 @@ class AppController(QObject):
         if self._current is None:
             return f"- / {len(filtered)}"
         if self._current in filtered:
-            position = filtered.index(self._current) + 1
-        elif self._current in self._keys:
-            position = self._keys.index(self._current) + 1
-        else:
-            return f"- / {len(filtered)}"
-        return f"{position} / {len(filtered)}"
+            return f"{filtered.index(self._current) + 1} / {len(filtered)}"
+        return POSITION_UNMATCHED.format(count=len(filtered))
 
     # -- selection --------------------------------------------------------------------
     def selected_keys(self) -> tuple[str, ...]:
@@ -445,6 +455,11 @@ class AppController(QObject):
         self._selected = set(self._keys)
         self._after_selection_change()
 
+    def select_filtered(self) -> None:
+        """Replace the selection with every matching result, including offscreen ones."""
+        self._selected = set(self.filtered_keys())
+        self._after_selection_change()
+
     def folder_keys(self, folder: str) -> tuple[str, ...]:
         """All keys inside one relative folder (根目录 for root files)."""
         return tuple(k for k in self._keys if self.folder_of(k) == folder)
@@ -456,16 +471,16 @@ class AppController(QObject):
         )
 
     def folder_selection_state(self, folder: str) -> str:
-        """'all' | 'some' | 'none' — selection coverage of one folder."""
-        keys = self.folder_keys(folder)
+        """'all' | 'some' | 'none' over a folder's matching results."""
+        keys = self._filtered_folder_keys(folder)
         selected = sum(1 for k in keys if k in self._selected)
         if keys and selected == len(keys):
             return "all"
         return "some" if selected else "none"
 
     def set_folder_selected(self, folder: str, selected: bool) -> None:
-        """Select/deselect every file of a folder (文件夹多选 checkbox)."""
-        keys = self.folder_keys(folder)
+        """Select/deselect a folder's matching results (文件夹多选 checkbox)."""
+        keys = self._filtered_folder_keys(folder)
         if not keys:
             return
         if selected:
@@ -475,6 +490,9 @@ class AppController(QObject):
         else:
             self._selected.difference_update(keys)
             self.selection_changed.emit()
+
+    def _filtered_folder_keys(self, folder: str) -> tuple[str, ...]:
+        return tuple(k for k in self.filtered_keys() if self.folder_of(k) == folder)
 
     def clear_selection(self) -> None:
         if not self._selected:
@@ -971,15 +989,23 @@ class AppController(QObject):
         self._translator = None
         self._translator_resolved = False
 
+    def active_profile(self) -> LLMProfile | None:
+        """The currently selected LLM profile, or None when unconfigured."""
+        return get_active_profile(self._app.config)
+
     def make_vision_captioner_or_none(
-        self, *, retry_sleep: Callable[[float], None] = time.sleep
+        self,
+        *,
+        profile: LLMProfile | None = None,
+        retry_sleep: Callable[[float], None] = time.sleep,
     ) -> Callable[[Path, str, str], str] | None:
         """A ``(image_path, system, user_prompt) -> caption`` callable, or None.
 
         None when no active profile / base URL / vision model is configured
         (统一模式 saves the shared model into ``vision_model`` too, so that
-        field alone decides vision availability). The callable blocks on the
-        HTTP round-trip — run it on the worker pool.
+        field alone decides vision availability). Pass ``profile`` to override
+        the active archive (CHA标注 per-scheme models). The callable blocks
+        on the HTTP round-trip — run it on the worker pool.
 
         Requests run under the spec-8 controls (``config.request``): retries
         with exponential backoff on transient request errors and one shared
@@ -990,24 +1016,24 @@ class AppController(QObject):
         so tests never really wait.
         """
         config = self._app.config
-        profile = get_active_profile(config)
-        if profile is None or not profile.base_url or not profile.vision_model:
+        resolved = profile if profile is not None else get_active_profile(config)
+        if resolved is None or not resolved.base_url or not resolved.vision_model:
             return None
         request_control = config.request
         max_edge = config.image_max_edge
         limiter = MinIntervalLimiter(request_control.min_interval)
 
         def caption(image_path: Path, system: str, user_prompt: str) -> str:
-            client = create_client(profile)
+            client = create_client(resolved)
             image = prepare_image(image_path, max_edge=max_edge)
             request = LLMRequest(
                 messages=(
                     LLMMessage(role="user", text=user_prompt, images=(image,)),
                 ),
-                model=profile.vision_model,
-                system=system if system else profile.system_prompt,
-                temperature=profile.temperature,
-                max_tokens=profile.max_tokens,
+                model=resolved.vision_model,
+                system=system if system else resolved.system_prompt,
+                temperature=resolved.temperature,
+                max_tokens=resolved.max_tokens,
                 timeout=request_control.timeout,
             )
             response = _paced_complete(

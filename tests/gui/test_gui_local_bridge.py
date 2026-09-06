@@ -202,7 +202,7 @@ class TestReuseDirs:
         def must_not_download(*args, **kwargs):  # noqa: ANN002, ANN003
             raise AssertionError("download_file must not be called for reused files")
 
-        monkeypatch.setattr("nlapt_gui.local_bridge.download_file", must_not_download)
+        monkeypatch.setattr("nlapt_gui.download_hub.download_file", must_not_download)
         with qtbot.waitSignal(bridge.download_finished, timeout=2000) as blocker:
             assert bridge.start_download(FAMILY_ID, QUANT_LABEL)
         assert blocker.args[2] == DOWNLOAD_OK
@@ -220,7 +220,7 @@ class TestStartDownload:
                 progress(int(expected_bytes or 0), int(expected_bytes or 0))
             return dest
 
-        monkeypatch.setattr("nlapt_gui.local_bridge.download_file", fake_download)
+        monkeypatch.setattr("nlapt_gui.download_hub.download_file", fake_download)
         seen: list[tuple[object, object]] = []
         bridge.download_progress.connect(
             lambda _f, _q, done, total: seen.append((done, total))
@@ -240,7 +240,7 @@ class TestStartDownload:
         def broken_download(url, dest, **kw):  # noqa: ANN001, ANN003
             raise DownloadError("磁盘已满")
 
-        monkeypatch.setattr("nlapt_gui.local_bridge.download_file", broken_download)
+        monkeypatch.setattr("nlapt_gui.download_hub.download_file", broken_download)
         with qtbot.waitSignal(bridge.download_finished, timeout=2000) as blocker:
             assert bridge.start_download(FAMILY_ID, QUANT_LABEL)
         assert blocker.args[2] == DOWNLOAD_ERROR
@@ -257,7 +257,7 @@ class TestStartDownload:
             assert cancel.wait(timeout=2)
             raise DownloadCancelledError("下载已取消")
 
-        monkeypatch.setattr("nlapt_gui.local_bridge.download_file", blocking_download)
+        monkeypatch.setattr("nlapt_gui.download_hub.download_file", blocking_download)
         assert bridge.start_download(FAMILY_ID, QUANT_LABEL)
         assert not bridge.start_download(FAMILY_ID, QUANT_LABEL)
         # A FRESH bridge (e.g. the dialog was closed and reopened) must also
@@ -283,7 +283,7 @@ class TestStartDownload:
             assert cancel.wait(timeout=2)
             raise DownloadCancelledError("下载已取消")
 
-        monkeypatch.setattr("nlapt_gui.local_bridge.download_file", blocking_download)
+        monkeypatch.setattr("nlapt_gui.download_hub.download_file", blocking_download)
         assert bridge.start_download(FAMILY_ID, QUANT_LABEL)
         assert started.wait(timeout=2)
 
@@ -310,7 +310,7 @@ class TestStartDownload:
             dest.write_bytes(b"x" * int(expected_bytes or 0))
             return dest
 
-        monkeypatch.setattr("nlapt_gui.local_bridge.download_file", fake_download)
+        monkeypatch.setattr("nlapt_gui.download_hub.download_file", fake_download)
         with qtbot.waitSignal(bridge.download_finished, timeout=2000):
             assert bridge.start_download(FAMILY_ID, QUANT_LABEL)
         with qtbot.waitSignal(bridge.download_finished, timeout=2000):
@@ -471,8 +471,8 @@ class TestRuntimeResolution:
                 progress(int(expected_bytes or 0), int(expected_bytes or 0))
             return dest
 
-        monkeypatch.setattr("nlapt_gui.local_bridge.ensure_runtime", fake_ensure)
-        monkeypatch.setattr("nlapt_gui.local_bridge.download_file", fake_download)
+        monkeypatch.setattr("nlapt_gui.download_hub.ensure_runtime", fake_ensure)
+        monkeypatch.setattr("nlapt_gui.download_hub.download_file", fake_download)
         seen: list[tuple[object, object]] = []
         bridge.download_progress.connect(
             lambda _f, _q, done, total: seen.append((done, total))
@@ -829,7 +829,7 @@ class TestFlorenceDownload:
         # the llama.cpp runtime.
         bridge.update_settings(server_path="")
         monkeypatch.setattr(
-            "nlapt_gui.local_bridge.ensure_runtime",
+            "nlapt_gui.download_hub.ensure_runtime",
             lambda *a, **k: (_ for _ in ()).throw(
                 AssertionError("runtime must not be provisioned for florence")
             ),
@@ -842,7 +842,7 @@ class TestFlorenceDownload:
             dest.write_bytes(b"x" * int(expected_bytes or 0))
             return dest
 
-        monkeypatch.setattr("nlapt_gui.local_bridge.download_file", fake_download)
+        monkeypatch.setattr("nlapt_gui.download_hub.download_file", fake_download)
         with qtbot.waitSignal(bridge.download_finished, timeout=2000) as blocker:
             assert bridge.start_download(FAMILY_ID, QUANT_LABEL)
         assert blocker.args[2] == DOWNLOAD_OK
@@ -1038,7 +1038,7 @@ class TestLoraDownload:
             dest.write_bytes(b"x" * int(expected_bytes or 0))
             return dest
 
-        monkeypatch.setattr("nlapt_gui.local_bridge.download_file", fake_download)
+        monkeypatch.setattr("nlapt_gui.download_hub.download_file", fake_download)
         entry = find_lora(self.LORA_ID)
         assert not bridge.is_lora_downloaded(entry)
         with qtbot.waitSignal(bridge.download_finished, timeout=2000) as blocker:
@@ -1062,7 +1062,7 @@ class TestLoraDownload:
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(b"x" * file.size_bytes)
         monkeypatch.setattr(
-            "nlapt_gui.local_bridge.download_file",
+            "nlapt_gui.download_hub.download_file",
             lambda *a, **k: (_ for _ in ()).throw(AssertionError("no download")),
         )
         with qtbot.waitSignal(bridge.download_finished, timeout=2000) as blocker:
@@ -1072,12 +1072,11 @@ class TestLoraDownload:
     def test_refused_while_another_download_runs(
         self, qtbot, bridge: LocalBridge, monkeypatch
     ) -> None:
-        import nlapt_gui.local_bridge as lb
+        from nlapt_gui.download_hub import _ActiveDownload
 
         monkeypatch.setattr(
-            lb,
-            "_ACTIVE_TASK",
-            lb._ActiveDownload(
+            "nlapt_gui.download_hub._ACTIVE_TASK",
+            _ActiveDownload(
                 family_id="other", quant_label="Q4", cancel=threading.Event()
             ),
         )

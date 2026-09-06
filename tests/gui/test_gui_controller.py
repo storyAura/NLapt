@@ -185,12 +185,15 @@ class TestNavigation:
         controller.nav(1)
         assert controller.current_key == K1
 
-    def test_nav_falls_back_to_all_keys_when_filter_empty(
+    def test_nav_does_nothing_when_filter_has_no_matches(
         self, controller: AppController
     ) -> None:
         controller.set_filter("zzz-no-match")
         controller.nav(1)
-        assert controller.current_key == K2
+        assert controller.current_key == K1
+        controller.nav(-1)
+        assert controller.current_key == K1
+        assert not controller.can_navigate()
 
     def test_nav_locked_to_selection_in_multi_mode(self, controller: AppController) -> None:
         controller.toggle_selected(K2)
@@ -214,10 +217,10 @@ class TestNavigation:
         controller.set_current(K4)
         assert controller.pos_label() == "2 / 2"
 
-    def test_pos_label_filter_fallback(self, controller: AppController) -> None:
+    def test_pos_label_current_outside_filter(self, controller: AppController) -> None:
         controller.set_current(K2)
         controller.set_filter("0003")  # current not in filtered list
-        assert controller.pos_label() == "2 / 1"
+        assert controller.pos_label() == "未匹配 / 1"
 
 
 class TestEditing:
@@ -523,6 +526,44 @@ class TestServices:
         assert controller.make_translator_or_none() is None
         controller.invalidate_translator()
         assert controller.make_translator_or_none() is None
+
+    def test_vision_captioner_uses_override_profile(
+        self, qtbot, demo_dataset: Path
+    ) -> None:
+        recorded: list[MockLLMClient] = []
+        api_type = "mock-gui-controller-vision"
+
+        def factory(profile: LLMProfile) -> MockLLMClient:
+            client = MockLLMClient(["ok-caption"])
+            recorded.append(client)
+            return client
+
+        register_client(api_type, factory)
+        active = LLMProfile(
+            name="default",
+            api_type=api_type,
+            base_url="http://active",
+            text_model="t",
+            vision_model="active-vis",
+        )
+        override = LLMProfile(
+            name="cha",
+            api_type=api_type,
+            base_url="http://override",
+            text_model="t",
+            vision_model="card-vis",
+        )
+        config = AppConfig(profiles=(active,), active_profile="default")
+        ctrl = AppController(NLaptApp(config=config), settings=UISettings())
+        with qtbot.waitSignal(ctrl.dataset_opened, timeout=2000):
+            ctrl.open_dataset(demo_dataset)
+        assert ctrl.active_profile() is not None
+        assert ctrl.active_profile().vision_model == "active-vis"
+        captioner = ctrl.make_vision_captioner_or_none(profile=override)
+        assert captioner is not None
+        captioner(ctrl.image_path(K1), "sys", "user")
+        assert recorded
+        assert recorded[0].requests[0].model == "card-vis"
 
 
 class TestClose:

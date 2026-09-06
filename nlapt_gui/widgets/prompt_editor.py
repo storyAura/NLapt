@@ -2,13 +2,15 @@
 
 Layout follows the 自动标注器设置 reference: a template dropdown with
 新建自定义 / 保存模板 / 删除 / 导出当前 / 导出全部 actions, the system-prompt
-editor (the built-in 默认 template is intentionally empty — the user pastes
-their own later) and the 用户提示词 editor below it.
+editor (默认 is empty; 结构化视觉编译 / 客观视觉报告 are shipped read-only
+schemes — 新建自定义 forks them) and the 用户提示词 editor below it.
 
 The tab edits an in-memory :class:`VisionPrompts`; the parent dialog calls
 :meth:`current_prompts` on 保存 and persists it together with the rest of the
 settings. 保存模板 / 新建自定义 / 删除 additionally persist immediately so a
-template operation is never lost by a later 取消.
+template operation is never lost by a later 取消. The empty 默认 template and
+the shipped schemes (结构化视觉编译 / 客观视觉报告) are read-only; 新建自定义
+forks the visible text.
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ from nlapt.diagnostics import get_logger
 from nlapt_gui.prompt_store import (
     DEFAULT_PROMPT_NAME,
     VisionPrompts,
+    is_locked_template,
     save_vision_prompts,
 )
 
@@ -49,7 +52,7 @@ NOTE_SHARED = (
     "系统 / 用户提示词;取消下方勾选后可为本地推理单独设置一套。"
 )
 LABEL_TEMPLATE = "推理提示词模板"
-LABEL_SYSTEM = "系统提示词(推理图片前发送,默认留空)"
+LABEL_SYSTEM = "系统提示词(推理图片前发送;「默认」为空,内置方案可直接选用)"
 LABEL_USER = "用户提示词(留空使用内置指令)"
 LABEL_LOCAL_BLOCK = "本地推理提示词"
 LABEL_LOCAL_UNIFIED = "本地推理共用上方提示词(统一管线)"
@@ -67,7 +70,7 @@ EXPORT_CURRENT_CAPTION = "导出当前系统提示词"
 EXPORT_ALL_CAPTION = "导出全部自定义模板"
 EXPORT_TXT_FILTER = "文本文件 (*.txt)"
 EXPORT_JSON_FILTER = "JSON 文件 (*.json)"
-HINT_DEFAULT_READONLY = "「默认」模板为内置空模板 — 新建自定义模板后可编辑并保存。"
+HINT_LOCKED_READONLY = "内置模板只读 — 点「新建自定义」可复制当前内容后编辑。"
 TOAST_TEMPLATE_SAVED = "已保存模板「{name}」"
 TOAST_TEMPLATE_DELETED = "已删除模板「{name}」"
 TOAST_EXPORTED = "已导出到 {path}"
@@ -125,7 +128,7 @@ class PromptsTab(QWidget):
         self.system_edit = QPlainTextEdit(self)
         self.system_edit.setMinimumHeight(SYSTEM_EDIT_MIN_H)
         column.addWidget(self.system_edit, 3)
-        self.hint = QLabel(HINT_DEFAULT_READONLY, self)
+        self.hint = QLabel(HINT_LOCKED_READONLY, self)
         self.hint.setProperty("muted", True)
         self.hint.setWordWrap(True)
         column.addWidget(self.hint)
@@ -194,14 +197,15 @@ class PromptsTab(QWidget):
         """The VisionPrompts value reflecting the tab's current UI state.
 
         Unsaved edits of the active CUSTOM template are captured; edits while
-        默认 is active are ignored (默认 stays the built-in empty template).
+        a locked template (默认 or a shipped scheme) is active are ignored.
         """
         active = self.template_combo.currentText() or DEFAULT_PROMPT_NAME
         prompts = dict(self._prompts.prompts)
-        if active != DEFAULT_PROMPT_NAME and active in prompts:
+        if not is_locked_template(active) and active in prompts:
             prompts[active] = self.system_edit.toPlainText()
+        known = is_locked_template(active) or active in prompts
         return VisionPrompts(
-            active=active if active == DEFAULT_PROMPT_NAME or active in prompts else DEFAULT_PROMPT_NAME,
+            active=active if known else DEFAULT_PROMPT_NAME,
             prompts=prompts,
             user_prompt=self.user_edit.toPlainText(),
             local_unified=self.local_unified_box.isChecked(),
@@ -230,13 +234,12 @@ class PromptsTab(QWidget):
 
     def _sync_editor(self) -> None:
         name = self.template_combo.currentText()
-        is_default = name == DEFAULT_PROMPT_NAME
-        text = "" if is_default else self._prompts.prompts.get(name, "")
-        self.system_edit.setPlainText(text)
-        self.system_edit.setReadOnly(is_default)
-        self.hint.setVisible(is_default)
-        self.save_template_button.setEnabled(not is_default)
-        self.delete_button.setEnabled(not is_default)
+        locked = is_locked_template(name)
+        self.system_edit.setPlainText(self._prompts.system_text_of(name))
+        self.system_edit.setReadOnly(locked)
+        self.hint.setVisible(locked)
+        self.save_template_button.setEnabled(not locked)
+        self.delete_button.setEnabled(not locked)
 
     def _on_template_changed(self, _index: int) -> None:
         if not self._loading:
@@ -263,7 +266,7 @@ class PromptsTab(QWidget):
 
     def _on_save_template(self) -> None:
         name = self.template_combo.currentText()
-        if name == DEFAULT_PROMPT_NAME:
+        if is_locked_template(name):
             return
         prompts = dict(self._prompts.prompts)
         prompts[name] = self.system_edit.toPlainText()
@@ -276,7 +279,7 @@ class PromptsTab(QWidget):
 
     def _on_delete(self) -> None:
         name = self.template_combo.currentText()
-        if name == DEFAULT_PROMPT_NAME:
+        if is_locked_template(name):
             return
         prompts = dict(self._prompts.prompts)
         prompts.pop(name, None)

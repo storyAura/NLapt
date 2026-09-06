@@ -391,8 +391,7 @@ class SentsEditor(SegmentEditorBase):
         mime.setData(MIME_SEGMENT, str(index).encode("ascii"))
         drag.setMimeData(mime)
         drag.exec(Qt.DropAction.MoveAction)
-        self._drag_index = None
-        self._rebuild()
+        self._finish_drag()
 
     def _row_index_at(self, pos: QPoint) -> int | None:
         for row in self._rows:
@@ -430,7 +429,7 @@ class SentsEditor(SegmentEditorBase):
         to_index = target if target is not None else len(self.segments())
         event.acceptProposedAction()
         self._set_indicator(None)
-        self.reorder(self._drag_index, to_index)
+        self._pending_drop = (self._drag_index, to_index)
 
 
 # INSERT_PLACEHOLDER is applied through _create_field; re-exported for tests.

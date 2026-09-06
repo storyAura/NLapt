@@ -8,14 +8,19 @@ import pytest
 
 from nlapt.storage.paths import (
     DATASETS_DIR_NAME,
+    DOCUMENTS_FOLDER_NAME,
     ENV_DATA_DIR,
+    ENV_DOCUMENTS_DIR,
     LEGACY_BACKUP_DIR_NAME,
     LEGACY_SESSION_DIR_NAME,
     STATE_BACKUPS_DIR_NAME,
+    WINDOWS_DIR_NAME,
     app_state_dir,
     dataset_state_dir,
     dataset_state_key,
     migrate_legacy_dataset_state,
+    user_documents_app_dir,
+    user_documents_dir,
 )
 from nlapt.storage.session import SESSION_FILE_NAME
 
@@ -26,6 +31,42 @@ class TestAppStateDir:
         monkeypatch.setenv(ENV_DATA_DIR, str(target))
         assert app_state_dir() == target
         assert target.is_dir()
+
+
+class TestUserDocumentsDir:
+    def test_honours_env_override(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        target = tmp_path / "docs-home"
+        monkeypatch.setenv(ENV_DOCUMENTS_DIR, str(target))
+        monkeypatch.setattr(
+            "nlapt.storage.paths.windows_known_documents_dir",
+            lambda: tmp_path / "known-should-lose",
+        )
+        assert user_documents_dir() == target
+        app_dir = user_documents_app_dir()
+        assert app_dir == target / WINDOWS_DIR_NAME
+        assert app_dir.is_dir()
+
+    def test_known_folder_used_when_env_unset(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv(ENV_DOCUMENTS_DIR, raising=False)
+        known = tmp_path / "known-docs"
+        monkeypatch.setattr(
+            "nlapt.storage.paths.windows_known_documents_dir", lambda: known
+        )
+        assert user_documents_dir() == known
+
+    def test_falls_back_to_home_documents(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv(ENV_DOCUMENTS_DIR, raising=False)
+        monkeypatch.setattr(
+            "nlapt.storage.paths.windows_known_documents_dir", lambda: None
+        )
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        assert user_documents_dir() == tmp_path / DOCUMENTS_FOLDER_NAME
 
 
 class TestDatasetStateDir:

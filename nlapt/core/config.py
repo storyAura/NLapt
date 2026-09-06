@@ -116,7 +116,8 @@ def _get_bool(data: Mapping[str, Any], key: str, default: bool, context: str) ->
     return bool(_expect_type(value, bool, f"{context}.{key}"))
 
 
-def _profile_from_dict(data: Any, index: int) -> LLMProfile:
+def profile_from_dict(data: Any, index: int = 0) -> LLMProfile:
+    """Parse one LLM profile object (unknown ``api_type`` is tolerated)."""
     context = f"profiles[{index}]"
     _expect_type(data, dict, context)
     profile = LLMProfile(
@@ -140,6 +141,12 @@ def _profile_from_dict(data: Any, index: int) -> LLMProfile:
     return profile
 
 
+def profiles_from_list(raw: Any) -> tuple[LLMProfile, ...]:
+    """Parse a JSON list of profile objects. ``raw`` must be a list."""
+    _expect_type(raw, list, "profiles")
+    return tuple(profile_from_dict(item, i) for i, item in enumerate(raw))
+
+
 def _request_from_dict(data: Any) -> RequestControl:
     context = "request"
     _expect_type(data, dict, context)
@@ -154,8 +161,7 @@ def _request_from_dict(data: Any) -> RequestControl:
 def _config_from_dict(data: Mapping[str, Any]) -> AppConfig:
     defaults = AppConfig()
     raw_profiles = data.get("profiles", [])
-    _expect_type(raw_profiles, list, "profiles")
-    profiles = tuple(_profile_from_dict(item, i) for i, item in enumerate(raw_profiles))
+    profiles = profiles_from_list(raw_profiles)
 
     raw_templates = data.get("custom_templates", {})
     _expect_type(raw_templates, dict, "custom_templates")

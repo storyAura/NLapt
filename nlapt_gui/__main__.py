@@ -12,13 +12,16 @@ from pathlib import Path
 from typing import Sequence
 
 from nlapt.app import NLaptApp
-from nlapt.core.config import AppConfig, load_config
+from nlapt.core.config import AppConfig
 from nlapt.core.errors import NLaptError
 from nlapt.diagnostics import configure_logging, get_logger
 from nlapt.diagnostics.crash import install_crash_handler
 
 from nlapt_gui import __version__
+from nlapt_gui.api_config import load_app_config, migrate_legacy_api_files
 from nlapt_gui.resources import app_data_dir
+from nlapt_gui.settings import load_ui_settings
+from nlapt_gui.workers import set_debug
 
 APP_NAME = "NLapt"
 ORG_NAME = "NLapt"
@@ -46,23 +49,20 @@ def _set_windows_app_id() -> None:
 
 def _load_app_config() -> AppConfig:
     """The persisted core config (LLM profiles); defaults when absent/corrupt."""
-    # Imported lazily so config_path stays single-sourced with the dialog.
-    from nlapt_gui.widgets.settings_dialog import config_path
-
-    path = config_path()
-    if not path.exists():
-        return AppConfig()
+    migrate_legacy_api_files()
     try:
-        return load_config(path)
+        return load_app_config()
     except NLaptError:
-        _LOGGER.exception("corrupt app config %s; starting with defaults", path)
+        _LOGGER.exception("corrupt app config; starting with defaults")
         return AppConfig()
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Build and run the NLapt GUI application."""
     log_dir = app_data_dir() / LOG_DIR_NAME
-    configure_logging(log_dir)
+    ui_settings = load_ui_settings()
+    configure_logging(log_dir, console=ui_settings.debug)
+    set_debug(ui_settings.debug)
     install_crash_handler(log_dir)
     _LOGGER.info("NLapt GUI %s starting", __version__)
 
@@ -70,7 +70,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     from PySide6.QtWidgets import QApplication
 
     from nlapt_gui.controller import AppController
-    from nlapt_gui.settings import load_ui_settings
     from nlapt_gui.theme.logo import load_app_icon
     from nlapt_gui.theme.manager import ThemeManager
     from nlapt_gui.widgets.main_window import MainWindow
@@ -81,7 +80,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     app.setOrganizationName(ORG_NAME)
     app.setApplicationVersion(__version__)
 
-    ui_settings = load_ui_settings()
     controller = AppController(NLaptApp(config=_load_app_config()), settings=ui_settings)
     theme_manager = ThemeManager(app)
     theme_manager.apply(ui_settings.theme, ui_settings.accent or None)

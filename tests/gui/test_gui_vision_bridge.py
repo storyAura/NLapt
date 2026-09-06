@@ -403,6 +403,28 @@ class TestRequestCustom:
         assert blocker.args[0] == "card-0"
         assert blocker.args[2] is False
 
+    def test_profile_override_reaches_captioner(self, qtbot, vision_controller) -> None:
+        override = LLMProfile(
+            name="cha",
+            api_type=API_TYPE,
+            base_url="http://mock",
+            text_model="m-text",
+            vision_model="card-vis",
+        )
+        bridge = VisionBridge(vision_controller)
+        with qtbot.waitSignal(bridge.custom_ready, timeout=3000):
+            assert bridge.request_custom(
+                "card-0",
+                "0001.png",
+                ENGINE_LLM,
+                system="sys",
+                user_prompt="user",
+                profile=override,
+            )
+        assert _Recorder.last is not None
+        assert _Recorder.last.requests[0].model == "card-vis"
+        assert bridge.configured(profile=override)
+
 
 class TestRequestLayeredBatch:
     def test_writes_card_blank_scene_and_history(
@@ -421,7 +443,7 @@ class TestRequestLayeredBatch:
             )
         for key in keys:
             assert vision_controller.record(key).text == "locked card\n\nscene paragraph"
-            assert vision_controller.history.entries(key)[0].label == "分层推标"
+            assert vision_controller.history.entries(key)[0].label == "CHA标注"
         request = _Recorder.last.requests[0]
         assert request.system == "scene-sys"
         assert request.messages[0].text == "scene-user"

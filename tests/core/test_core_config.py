@@ -16,6 +16,8 @@ from nlapt.core.config import (
     load_config,
     mask_secret,
     masked_config_dict,
+    profile_from_dict,
+    profiles_from_list,
     save_config,
 )
 from nlapt.core.errors import StorageError, ValidationError
@@ -69,6 +71,27 @@ def test_app_config_defends_against_shared_mutable_input() -> None:
     assert cfg.custom_templates["a"] == "b"
     assert cfg.profiles == ()
     assert cfg.trigger_presets == ("t",)
+
+
+def test_profile_from_dict_and_profiles_from_list() -> None:
+    parsed = profile_from_dict(
+        {
+            "name": "p",
+            "api_type": "openai",
+            "base_url": "http://x",
+            "api_key": "k",
+        },
+        0,
+    )
+    assert parsed.name == "p"
+    assert parsed.api_key == "k"
+    batch = profiles_from_list(
+        [{"name": "a", "api_type": "openai", "base_url": "u"}]
+    )
+    assert len(batch) == 1
+    assert batch[0].name == "a"
+    with pytest.raises(ValidationError):
+        profiles_from_list("nope")
 
 
 def test_defaults_match_contract() -> None:

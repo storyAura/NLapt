@@ -5,9 +5,10 @@ LLM ``system`` message and the user prompt as the request text before the
 image. Prompts live in ``app_data_dir()/vision_prompts.json`` (atomic write,
 corrupt file -> defaults) so they survive restarts and can be exported.
 
-The built-in ``默认`` template is intentionally EMPTY — the user supplies the
-real system prompt later; an empty system prompt is valid (the request simply
-carries no system message beyond the profile's own).
+The built-in ``默认`` template is intentionally EMPTY. Shipped schemes
+(结构化视觉编译 / 客观视觉报告) live in :mod:`nlapt_gui.builtin_prompts` and
+are always listed after 默认; they are not written to the JSON file unless
+the user later saves an override under the same name.
 """
 
 from __future__ import annotations
@@ -21,13 +22,45 @@ from nlapt.core.errors import StorageError
 from nlapt.diagnostics import get_logger
 from nlapt.storage.atomic import atomic_write_text
 
+from nlapt_gui.builtin_prompts import (
+    BUILTIN_PROMPT_ORDER,
+    PROMPT_OBJECTIVE_REPORT,
+    PROMPT_STRUCTURED_COMPILER,
+    builtin_system_text,
+    is_builtin_prompt,
+)
 from nlapt_gui.resources import app_data_dir
+
+# Re-export so callers / tests import from this module only.
+__all__ = (
+    "BUILTIN_PROMPT_ORDER",
+    "DEFAULT_PROMPT_NAME",
+    "DEFAULT_USER_PROMPT",
+    "ENGINE_LLM",
+    "ENGINE_LOCAL",
+    "PROMPT_OBJECTIVE_REPORT",
+    "PROMPT_STRUCTURED_COMPILER",
+    "PROMPTS_FILE_NAME",
+    "VisionPrompts",
+    "is_builtin_prompt",
+    "is_locked_template",
+    "load_vision_prompts",
+    "save_vision_prompts",
+    "vision_prompts_path",
+)
 
 _LOGGER = get_logger(__name__)
 
 PROMPTS_FILE_NAME = "vision_prompts.json"
 # The built-in template: empty system prompt, cannot be deleted.
 DEFAULT_PROMPT_NAME = "默认"
+
+
+def is_locked_template(name: str) -> bool:
+    """True for 默认 and the shipped schemes (not deletable in the editor)."""
+    return name == DEFAULT_PROMPT_NAME or is_builtin_prompt(name)
+
+
 # Fallback user instruction used when the user prompt is left empty, so 重译
 # works out of the box (the system prompt may legitimately be empty).
 DEFAULT_USER_PROMPT = (
@@ -60,14 +93,29 @@ class VisionPrompts:
         object.__setattr__(self, "prompts", dict(self.prompts))
 
     def names(self) -> tuple[str, ...]:
-        """Every selectable template name, 默认 first."""
-        return (DEFAULT_PROMPT_NAME, *self.prompts)
+        """Every selectable template name: 默认, shipped schemes, then customs."""
+        extras = tuple(
+            name
+            for name in self.prompts
+            if name != DEFAULT_PROMPT_NAME and name not in BUILTIN_PROMPT_ORDER
+        )
+        return (DEFAULT_PROMPT_NAME, *BUILTIN_PROMPT_ORDER, *extras)
+
+    def system_text_of(self, name: str) -> str:
+        """System prompt for ``name`` ('' for 默认 / unknown). Custom overrides win."""
+        if name == DEFAULT_PROMPT_NAME:
+            return ""
+        if name in self.prompts:
+            return self.prompts[name]
+        return builtin_system_text(name)
 
     def system_text(self) -> str:
         """The active template's system prompt ('' for 默认 / unknown names)."""
-        if self.active == DEFAULT_PROMPT_NAME:
-            return ""
-        return self.prompts.get(self.active, "")
+        return self.system_text_of(self.active)
+
+    def is_known_name(self, name: str) -> bool:
+        """True when ``name`` is 默认, a shipped scheme, or a custom template."""
+        return is_locked_template(name) or name in self.prompts
 
     def effective_user_prompt(self) -> str:
         """The user prompt, falling back to the built-in instruction."""
@@ -122,7 +170,9 @@ def load_vision_prompts(path: Path | None = None) -> VisionPrompts:
     )
     active = raw.get("active", DEFAULT_PROMPT_NAME)
     if not isinstance(active, str) or (
-        active != DEFAULT_PROMPT_NAME and active not in prompts
+        active != DEFAULT_PROMPT_NAME
+        and active not in prompts
+        and not is_builtin_prompt(active)
     ):
         active = DEFAULT_PROMPT_NAME
     user_prompt = raw.get("user_prompt", "")

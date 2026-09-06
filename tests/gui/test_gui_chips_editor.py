@@ -2,15 +2,25 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QAbstractAnimation, QEvent, QPoint, Qt
-from PySide6.QtGui import QFocusEvent
-from PySide6.QtWidgets import QLabel, QPushButton
+from PySide6.QtCore import (
+    QAbstractAnimation,
+    QEvent,
+    QMimeData,
+    QParallelAnimationGroup,
+    QPoint,
+    QPointF,
+    QRect,
+    Qt,
+)
+from PySide6.QtGui import QDrag, QDropEvent, QFocusEvent
+from PySide6.QtWidgets import QLabel, QPushButton, QWidget
 
 from nlapt_gui import anim
 from nlapt_gui.widgets.chips_editor import (
     ADD_CHIP_TEXT,
     EMPTY_STATE_TEXT,
     INSERT_PLACEHOLDER,
+    MIME_SEGMENT,
     TOAST_FINISH_INSERT_FIRST,
     TOAST_PUT_CURSOR,
     TOAST_SPLIT_DONE,
@@ -23,6 +33,17 @@ KEY = "0001.png"
 # demo caption: "1girl, solo, long hair, 少女站在樱花树下。masterpiece"
 SEGS = ("1girl", "solo", "long hair", "少女站在樱花树下。masterpiece")
 EMPTY_KEY = "10_concept/0004.png"
+# No commas: join_chips keeps this as a single wrapping chip.
+LONG_CHIP = (
+    "and a curved pink ahoge protruding from the top of her head. "
+    "Her eyes feature red irises with round dark pupils. A dark intricate "
+    "mark is located on her upper chest. Her outfit includes a dark navy "
+    "headband with a side bow"
+)
+LONG_CAPTION = (
+    f"side locks, {LONG_CHIP}, light blue drop earrings, "
+    "choker, ribbon"
+)
 
 
 def make_editor(qtbot, controller, key: str = KEY) -> ChipsEditor:
@@ -96,9 +117,10 @@ class TestChipsView:
     def test_inline_editor_auto_width_grows(self, qtbot, controller) -> None:
         editor = make_editor(qtbot, controller)
         editor.start_edit(0)
+        qtbot.waitUntil(lambda: editor._field.isVisible())
         narrow = editor._field.width()
         editor.set_editor_text("a much longer chip text value")
-        assert editor._field.width() > narrow
+        qtbot.waitUntil(lambda: editor._field.width() > narrow)
 
 
 class TestEditCommit:
@@ -234,6 +256,158 @@ class TestReorder:
                 editor.layout().activate()
             finals = [chip.geometry() for chip in editor.chips()]
             assert all(not rect.isEmpty() for rect in finals)
+        finally:
+            anim.set_animations_enabled(False)
+
+    def test_drop_defers_commit_until_exec_returns(
+        self, qtbot, controller, monkeypatch
+    ) -> None:
+        editor = make_editor(qtbot, controller)
+        qtbot.waitUntil(lambda: editor.chips()[0].width() > 20, timeout=2000)
+        source = editor.chips()[0]
+        source_id = id(source)
+        during: dict[str, object] = {}
+
+        def fake_exec(_self: QDrag, *_args: object, **_kwargs: object) -> Qt.DropAction:
+            target = editor.chips()[2]
+            mime = QMimeData()
+            mime.setData(MIME_SEGMENT, b"0")
+            event = QDropEvent(
+                QPointF(target.geometry().center()),
+                Qt.DropAction.MoveAction,
+                mime,
+                Qt.MouseButton.LeftButton,
+                Qt.KeyboardModifier.NoModifier,
+            )
+            editor.dropEvent(event)
+            during["segs"] = controller.segments(KEY)
+            during["source_alive"] = source.parent() is editor
+            during["same_widget"] = any(id(chip) == source_id for chip in editor.chips())
+            return Qt.DropAction.MoveAction
+
+        monkeypatch.setattr(QDrag, "exec", fake_exec)
+        editor.begin_drag(0, source)
+        assert during["segs"] == SEGS
+        assert during["source_alive"] is True
+        assert during["same_widget"] is True
+        assert controller.segments(KEY)[:3] == ("solo", "1girl", "long hair")
+        assert controller.history.entries(KEY)[0].label == "拖拽排序"
+
+    def test_refresh_during_drag_is_deferred(
+        self, qtbot, controller, monkeypatch
+    ) -> None:
+        editor = make_editor(qtbot, controller)
+        qtbot.waitUntil(lambda: editor.chips()[0].width() > 20, timeout=2000)
+        source = editor.chips()[0]
+
+        def fake_exec(_self: QDrag, *_args: object, **_kwargs: object) -> Qt.DropAction:
+            controller.set_caption(KEY, "a, b", "测试")
+            editor.refresh()
+            assert tuple(chip.chip_text for chip in editor.chips()) == SEGS
+            assert editor._refresh_pending is True
+            return Qt.DropAction.IgnoreAction
+
+        monkeypatch.setattr(QDrag, "exec", fake_exec)
+        editor.begin_drag(0, source)
+        assert tuple(chip.chip_text for chip in editor.chips()) == ("a", "b")
+        assert editor._refresh_pending is False
+        assert editor._drag_index is None
+
+    def test_cancelled_drag_leaves_no_artifacts(
+        self, qtbot, controller, monkeypatch
+    ) -> None:
+        editor = make_editor(qtbot, controller)
+        qtbot.waitUntil(lambda: editor.chips()[0].width() > 20, timeout=2000)
+        history_before = len(controller.history.entries(KEY))
+        before = controller.record(KEY).text
+
+        def fake_exec(_self: QDrag, *_args: object, **_kwargs: object) -> Qt.DropAction:
+            return Qt.DropAction.IgnoreAction
+
+        monkeypatch.setattr(QDrag, "exec", fake_exec)
+        editor.begin_drag(0, editor.chips()[0])
+        assert controller.record(KEY).text == before
+        assert len(controller.history.entries(KEY)) == history_before
+        assert editor._drag_index is None
+        assert editor._pending_drop is None
+        for chip in editor.chips():
+            assert chip.graphicsEffect() is None
+        assert tuple(chip.chip_text for chip in editor.chips()) == SEGS
+
+    def test_reorder_leaves_no_overlap_or_effects(self, qtbot, controller) -> None:
+        editor = make_editor(qtbot, controller)
+        qtbot.waitUntil(lambda: editor.chips()[0].width() > 20, timeout=2000)
+        anim.set_animations_enabled(True)
+        try:
+            editor.reorder(0, 2)
+            editor.refresh()
+            anim.finish_animation(editor._reflow_anim)
+            for chip in editor.chips():
+                assert chip.graphicsEffect() is None
+        finally:
+            anim.set_animations_enabled(False)
+        editor.refresh()
+        editor.resize(500, 240)
+        qtbot.waitUntil(
+            lambda: editor.chips()[0].geometry().topLeft()
+            != editor.chips()[1].geometry().topLeft(),
+            timeout=2000,
+        )
+        chips = editor.chips()
+        assert [chip.chip_text for chip in chips] == list(controller.segments(KEY))
+        for i, left in enumerate(chips):
+            for right in chips[i + 1 :]:
+                assert not left.geometry().intersects(right.geometry())
+
+    def test_rebuild_lays_out_chips_without_event_loop(self, qtbot, controller) -> None:
+        editor = make_editor(qtbot, controller)
+        editor.resize(900, 400)
+        controller.set_caption(KEY, LONG_CAPTION, "测试")
+        editor._rebuild()
+        chips = editor.chips()
+        assert [chip.chip_text for chip in chips] == list(controller.segments(KEY))
+        assert all(chip.width() != 100 for chip in chips)
+        long_chip = next(chip for chip in chips if chip.chip_text == LONG_CHIP)
+        assert long_chip.width() == editor.width()
+        assert long_chip.height() > 26
+
+    def test_drop_flip_uses_laid_out_end_rects(self, qtbot, controller) -> None:
+        editor = make_editor(qtbot, controller)
+        editor.resize(900, 400)
+        controller.set_caption(KEY, LONG_CAPTION, "测试")
+        editor.refresh()
+        controller.caption_changed.connect(editor.refresh)
+        anim.set_animations_enabled(True)
+        try:
+            editor._drag_index = 1
+            editor._pending_drop = (1, 3)
+            editor._finish_drag()
+            motion = editor._reflow_anim
+            assert isinstance(motion, QParallelAnimationGroup)
+            ends: list[tuple[QWidget, QRect]] = []
+            for i in range(motion.animationCount()):
+                child = motion.animationAt(i)
+                target = child.targetObject()
+                end = QRect(child.endValue())
+                assert end != QRect(0, 0, 100, 30)
+                ends.append((target, end))
+            anim.finish_animation(motion)
+            for widget, end in ends:
+                assert widget.geometry() == end
+        finally:
+            anim.set_animations_enabled(False)
+
+    def test_pop_in_keeps_width(self, qtbot) -> None:
+        anim.set_animations_enabled(True)
+        try:
+            widget = QWidget()
+            qtbot.addWidget(widget)
+            widget.setGeometry(10, 10, 400, 80)
+            widget.show()
+            motion = anim.pop_in(widget, ms=140)
+            assert isinstance(motion, QAbstractAnimation)
+            assert motion.startValue().width() == motion.endValue().width() == 400
+            assert motion.startValue().height() < motion.endValue().height()
         finally:
             anim.set_animations_enabled(False)
 

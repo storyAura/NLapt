@@ -20,14 +20,10 @@ import re
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QAbstractAnimation, QMimeData, QPoint, Qt, Signal
-from PySide6.QtGui import QDrag, QFocusEvent, QKeyEvent, QMouseEvent, QPainter, QPaintEvent, QPalette
+from PySide6.QtGui import QDrag, QMouseEvent, QPalette
 from PySide6.QtWidgets import (
-    QApplication,
-    QFrame,
     QGraphicsOpacityEffect,
-    QHBoxLayout,
     QLabel,
-    QLineEdit,
     QPushButton,
     QWidget,
 )
@@ -36,6 +32,13 @@ from nlapt.diagnostics import get_logger
 
 from nlapt_gui import anim
 from nlapt_gui.theme.tokens import DEFAULT_THEME, THEMES, ThemeTokens
+from nlapt_gui.widgets.chip_widgets import (
+    CHIP_DELETE_TOOLTIP as CHIP_DELETE_TOOLTIP,
+    CHIP_EDIT_TOOLTIP as CHIP_EDIT_TOOLTIP,
+    DROP_INDICATOR_PX as DROP_INDICATOR_PX,
+    ChipWidget as ChipWidget,
+    InlineChipField as InlineChipField,
+)
 from nlapt_gui.widgets.flow_layout import FlowLayout
 
 if TYPE_CHECKING:
@@ -50,8 +53,6 @@ LABEL_DELETE_EMPTY = "删除分段"  # empty inline commit (prototype _applyEdit
 INSERT_PLACEHOLDER = "新片段…"
 ADD_CHIP_TEXT = "+ 标签"
 EMPTY_STATE_TEXT = "暂无内容,点击「+ 标签」添加"
-CHIP_EDIT_TOOLTIP = "点击编辑 · 可拖拽排序"
-CHIP_DELETE_TOOLTIP = "删除"
 TOAST_FINISH_INSERT_FIRST = "先完成插入内容"
 TOAST_PUT_CURSOR = "把光标放在要打断的位置"
 TOAST_SPLIT_DONE = "已打断为两段"
@@ -70,17 +71,10 @@ SHORT_LABEL_LIMIT = 12
 MIME_SEGMENT = "application/x-nlapt-segment"
 # Opacity of the chip/row being dragged (prototype 0.45).
 DRAG_SOURCE_OPACITY = 0.45
-# Width of the accent drop-indicator bar (prototype 3px box-shadow).
-DROP_INDICATOR_PX = 3
 
 # Split-at-cursor comma tidy rules (prototype tbSplit).
 _TRAILING_COMMA = re.compile(r"[,，]\s*$")
 _LEADING_COMMA = re.compile(r"^[,，]\s*")
-
-# Inline chip editor sizing.
-_CHIP_FIELD_MIN_W = 64
-_CHIP_FIELD_PAD_W = 34
-
 
 def short_label(text: str) -> str:
     """Prototype ``_short``: truncate to 12 chars + ``…`` for 「x」 labels."""
@@ -116,32 +110,6 @@ def split_segment_text(text: str, pos: int) -> tuple[str, str] | None:
     return (left, right)
 
 
-class InlineChipField(QLineEdit):
-    """Single-line inline editor: Enter commits, Esc cancels, blur commits."""
-
-    submitted = Signal()
-    cancelled = Signal()
-    focus_lost = Signal()
-
-    def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802 - Qt override
-        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            event.accept()
-            self.submitted.emit()
-            return
-        if event.key() == Qt.Key.Key_Escape:
-            event.accept()
-            self.cancelled.emit()
-            return
-        super().keyPressEvent(event)
-
-    def focusOutEvent(self, event: QFocusEvent) -> None:  # noqa: N802 - Qt override
-        super().focusOutEvent(event)
-        self.focus_lost.emit()
-
-    def cursor_index(self) -> int:
-        return self.cursorPosition()
-
-
 class SegmentEditorBase(QWidget):
     """Shared select/edit/insert/commit/drag state machine for chips & sents.
 
@@ -168,6 +136,8 @@ class SegmentEditorBase(QWidget):
         self._selected_index: int | None = None
         self._field: QWidget | None = None
         self._drag_index: int | None = None
+        self._pending_drop: tuple[int, int] | None = None
+        self._refresh_pending = False
         self._reflow_pop_index: int | None = None
 
     # -- identity / state ------------------------------------------------------------
@@ -259,6 +229,10 @@ class SegmentEditorBase(QWidget):
     # -- refresh (external caption change) ---------------------------------------------
     def refresh(self) -> None:
         """Re-read segments and rebuild the view (called on caption_changed)."""
+        if self._drag_index is not None:
+            # Destroying chips inside QDrag.exec() deletes the drag source.
+            self._refresh_pending = True
+            return
         changed = False
         count = len(self.segments())
         if self._edit_index is not None and self._edit_index >= count:
@@ -471,13 +445,18 @@ class SegmentEditorBase(QWidget):
         self.edit_state_changed.emit()
 
     # -- drag reorder -----------------------------------------------------------------------
-    def reorder(self, from_index: int | None, to_index: int | None) -> None:
-        """Prototype ``_reorder``: move a segment, commit label 拖拽排序."""
+    def reorder(self, from_index: int | None, to_index: int | None) -> bool:
+        """Prototype ``_reorder``: move a segment, commit label 拖拽排序.
+
+        Returns ``True`` when the caption was committed. A successful
+        commit synchronously emits ``caption_changed``, which rebuilds
+        the view (with the drop FLIP). Callers must not rebuild again.
+        """
         if from_index is None or to_index is None:
-            return
+            return False
         segs = self.segments()
         if from_index == to_index or from_index >= len(segs):
-            return
+            return False
         # A reorder invalidates the selection's index mapping — drop it.
         if self._selected_index is not None:
             self._selected_index = None
@@ -487,6 +466,31 @@ class SegmentEditorBase(QWidget):
         segs.insert(min(insert_index, len(segs)), item)
         self._reflow_pop_index = min(insert_index, len(segs) - 1) if segs else None
         self._commit(segs, LABEL_REORDER)
+        return True
+
+    def _finish_drag(self) -> None:
+        """Commit a deferred drop after ``QDrag.exec`` returns.
+
+        ``dropEvent`` only records ``_pending_drop``. Committing (and
+        rebuilding) inside the drag's nested event loop would
+        ``deleteLater`` the drag-source widget mid-``exec``.
+        A successful ``reorder`` already rebuilt via ``caption_changed``;
+        rebuilding again would ``finish_animation`` the drop FLIP.
+        """
+        self._drag_index = None
+        pending = self._pending_drop
+        self._pending_drop = None
+        refresh_pending = self._refresh_pending
+        self._refresh_pending = False
+        if refresh_pending:
+            # Caption changed while the drag ran — drop indices may be stale.
+            self.refresh()
+            return
+        committed = False
+        if pending is not None:
+            committed = self.reorder(pending[0], pending[1])
+        if not committed:
+            self._rebuild()
 
     # -- internals ------------------------------------------------------------------------
     def _commit_edit(self) -> None:
@@ -577,85 +581,6 @@ class SegmentEditorBase(QWidget):
         return None
 
 
-class ChipWidget(QFrame):
-    """One caption pill: mono text + × delete; click selects (again: edits),
-    drag reorders."""
-
-    def __init__(
-        self, editor: "ChipsEditor", index: int, text: str, *, selected: bool = False
-    ) -> None:
-        super().__init__(editor)
-        self._editor = editor
-        self._index = index
-        self._text = text
-        self._press_pos: QPoint | None = None
-        self._drop_indicator = False
-        self.setProperty("chip", "true")
-        self.setProperty("chipSelected", "true" if selected else "false")
-        self.setCursor(Qt.CursorShape.OpenHandCursor)
-        row = QHBoxLayout(self)
-        row.setContentsMargins(12, 5, 7, 5)
-        row.setSpacing(7)
-        label = QLabel(text, self)
-        label.setProperty("mono", "true")
-        label.setStyleSheet("font-size: 12.5px;")
-        label.setToolTip(CHIP_EDIT_TOOLTIP)
-        row.addWidget(label)
-        remove = QPushButton("×", self)
-        remove.setProperty("variant", "danger-ghost")
-        remove.setFixedSize(16, 16)
-        remove.setStyleSheet("padding: 0; border-radius: 8px; font-size: 13px;")
-        remove.setToolTip(CHIP_DELETE_TOOLTIP)
-        remove.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        remove.clicked.connect(lambda: self._editor.delete_segment(self._index))
-        row.addWidget(remove)
-
-    @property
-    def index(self) -> int:
-        return self._index
-
-    @property
-    def chip_text(self) -> str:
-        return self._text
-
-    def set_drop_indicator(self, on: bool) -> None:
-        if on != self._drop_indicator:
-            self._drop_indicator = on
-            self.update()
-
-    def paintEvent(self, event: QPaintEvent) -> None:  # noqa: N802 - Qt override
-        super().paintEvent(event)
-        if self._drop_indicator:
-            painter = QPainter(self)
-            accent = self.palette().color(QPalette.ColorRole.Highlight)
-            painter.fillRect(0, 0, DROP_INDICATOR_PX, self.height(), accent)
-            painter.end()
-
-    # click (release without drag) -> select/edit; move past threshold -> drag.
-    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt override
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._press_pos = event.position().toPoint()
-            # Consume the press: it must not bubble to the editor background
-            # handler, which clears the selection on empty-area clicks.
-            event.accept()
-            return
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt override
-        if self._press_pos is None:
-            return
-        distance = (event.position().toPoint() - self._press_pos).manhattanLength()
-        if distance >= QApplication.startDragDistance():
-            self._press_pos = None
-            self._editor.begin_drag(self._index, self)
-
-    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt override
-        if self._press_pos is not None and event.button() == Qt.MouseButton.LeftButton:
-            self._press_pos = None
-            self._editor.on_segment_clicked(self._index)
-        super().mouseReleaseEvent(event)
-
-
 class ChipsEditor(SegmentEditorBase):
     """胶囊 mode: flow-layout pills with inline edit / insert / drag reorder."""
 
@@ -718,9 +643,19 @@ class ChipsEditor(SegmentEditorBase):
                 self._flow.addWidget(empty)
         layout = self.layout()
         if layout is not None:
+            # Hidden widgets skip QWidgetItem.setGeometry, so FLIP would
+            # treat the default (0, 0, 100, 30) as the landing rect.
+            for i in range(layout.count()):
+                item = layout.itemAt(i)
+                widget = item.widget() if item is not None else None
+                if widget is not None:
+                    widget.show()
+            layout.invalidate()
             layout.activate()
         pop_index = self._reflow_pop_index
         self._reflow_pop_index = None
+        if self._drag_index is not None:
+            return
         pop = (
             self._chips[pop_index]
             if pop_index is not None and 0 <= pop_index < len(self._chips)
@@ -728,10 +663,19 @@ class ChipsEditor(SegmentEditorBase):
         )
         self._reflow_anim = anim.flip_reflow(self._chip_keys(), previous, pop=pop)
         if self._reflow_anim is not None:
-            self._reflow_anim.finished.connect(lambda: setattr(self, "_reflow_anim", None))
+            self._reflow_anim.finished.connect(self._on_reflow_finished)
+
+    def _on_reflow_finished(self) -> None:
+        """Hand chip geometry back to FlowLayout after FLIP/pop ends."""
+        self._reflow_anim = None
+        layout = self.layout()
+        if layout is not None:
+            layout.invalidate()
+            layout.activate()
 
     def _create_field(self, initial: str, placeholder: str) -> QWidget:
         field = InlineChipField(self)
+        field.setObjectName("chipInlineEditor")
         field.setProperty("chipEditor", "true")
         field.setText(initial)
         if placeholder:
@@ -741,13 +685,20 @@ class ChipsEditor(SegmentEditorBase):
         return field
 
     def _autosize_field(self, field: InlineChipField) -> None:
-        """Auto width from content (prototype chW: grows while typing)."""
-        text = field.text() or field.placeholderText()
-        width = field.fontMetrics().horizontalAdvance(text) + _CHIP_FIELD_PAD_W
-        field.setFixedWidth(max(_CHIP_FIELD_MIN_W, width))
+        """Request content width while leaving the available-width limit to layout."""
+        field.updateGeometry()
+        self._flow.invalidate()
+        self._flow.activate()
 
     # -- drag & drop ---------------------------------------------------------------------
     def begin_drag(self, index: int, chip: ChipWidget) -> None:
+        anim.finish_animation(self._reflow_anim)
+        self._reflow_anim = None
+        layout = self.layout()
+        if layout is not None:
+            layout.activate()
+        for existing in self._chips:
+            existing.setGraphicsEffect(None)
         self._drag_index = index
         effect = QGraphicsOpacityEffect(chip)
         effect.setOpacity(DRAG_SOURCE_OPACITY)
@@ -758,8 +709,7 @@ class ChipsEditor(SegmentEditorBase):
         mime.setData(MIME_SEGMENT, str(index).encode("ascii"))
         drag.setMimeData(mime)
         drag.exec(Qt.DropAction.MoveAction)
-        self._drag_index = None
-        self._rebuild()
+        self._finish_drag()
 
     def _chip_index_at(self, pos: QPoint) -> int | None:
         for chip in self._chips:
@@ -797,4 +747,4 @@ class ChipsEditor(SegmentEditorBase):
         to_index = target if target is not None else len(self.segments())
         event.acceptProposedAction()
         self._set_indicator(None)
-        self.reorder(self._drag_index, to_index)
+        self._pending_drop = (self._drag_index, to_index)

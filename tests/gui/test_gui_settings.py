@@ -23,6 +23,7 @@ class TestDefaults:
         assert dict(settings.sections) == {"fr": True, "ps": False, "tr": False, "hist": True}
         assert settings.last_root == ""
         assert dict(settings.folder_open) == {}
+        assert settings.debug is False
 
 
 class TestRoundTrip:
@@ -37,6 +38,7 @@ class TestRoundTrip:
             folder_open={"根目录": False, "10_concept": True},
             last_root="D:/data/set1",
             sections={"fr": False, "ps": True, "tr": True, "hist": False},
+            debug=True,
         )
         save_ui_settings(original, path)
         loaded = load_ui_settings(path)
@@ -76,6 +78,7 @@ class TestCorruption:
             "folder_open": "nope",         # wrong type
             "sections": {"fr": 0},
             "last_root": None,
+            "debug": "yes",
         }
         path.write_text(json.dumps(payload), encoding="utf-8")
         loaded = load_ui_settings(path)
@@ -88,6 +91,7 @@ class TestCorruption:
         assert loaded.last_root == ""
         # sections merge over defaults
         assert dict(loaded.sections) == {"fr": False, "ps": False, "tr": False, "hist": True}
+        assert loaded.debug is False
 
     def test_thumb_min_clamped_to_range(self, tmp_path: Path) -> None:
         path = tmp_path / "ui.json"

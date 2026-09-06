@@ -30,7 +30,7 @@ import shiboken6
 from PySide6.QtCore import QObject, QThreadPool, Signal
 
 from nlapt.core.config import LLMProfile
-from nlapt.core.errors import DownloadCancelledError, LocalInferenceError, NLaptError
+from nlapt.core.errors import LocalInferenceError, NLaptError
 from nlapt.diagnostics import get_logger
 from nlapt.llm.base import LLMMessage, LLMRequest, create_client
 from nlapt.llm.cleaning import clean_llm_output, ensure_not_refusal
@@ -52,7 +52,6 @@ from nlapt.local.catalog import (
     mmproj_path,
     quant_path,
 )
-from nlapt.local.download import download_file
 from nlapt.local.florence import FlorenceEngine
 from nlapt.local.gguf import read_block_count
 from nlapt.local.lora import MSG_LORA_FILE_MISSING
@@ -74,8 +73,24 @@ from nlapt.local.settings import (
     save_local_settings,
 )
 
+from nlapt_gui import download_hub as _download_hub
+from nlapt_gui import idle_server as _idle_server
+from nlapt_gui.idle_server import get_idle_stopper
 from nlapt_gui.resources import app_data_dir, resource_path
 from nlapt_gui.workers import run_async
+
+# Public download-slot API — implementation lives in download_hub so this
+# module stays under the 800-line cap. Tests/UI keep importing these names.
+DOWNLOAD_OK = _download_hub.DOWNLOAD_OK
+DOWNLOAD_CANCELLED = _download_hub.DOWNLOAD_CANCELLED
+DOWNLOAD_ERROR = _download_hub.DOWNLOAD_ERROR
+_ActiveDownload = _download_hub._ActiveDownload
+active_download = _download_hub.active_download
+cancel_active_download = _download_hub.cancel_active_download
+get_download_hub = _download_hub.get_download_hub
+launch_download_jobs = _download_hub.launch_download_jobs
+IDLE_STOP_DELAY_SECONDS = _idle_server.IDLE_STOP_DELAY_SECONDS
+IdleServerStopper = _idle_server.IdleServerStopper
 
 _LOGGER = get_logger(__name__)
 
@@ -86,8 +101,6 @@ RUNTIME_DIR_NAME = "runtime"
 LOCAL_VISION_TIMEOUT_SECONDS = 300.0
 LOCAL_VISION_PROFILE_NAME = "local-vision"
 LOCAL_VISION_API_TYPE = "openai"
-# Emit a progress signal at most every this many new bytes (UI flood guard).
-PROGRESS_EMIT_STEP_BYTES = 8 * 1024 * 1024
 
 # Actionable guidance when local inference is not ready yet.
 MSG_NO_MODEL_SELECTED = "未选择本地模型 — 打开 设置 ▸ 本地推理,选择并下载一个模型"
@@ -98,11 +111,6 @@ SERVER_STOPPED = "stopped"
 SERVER_STARTING = "starting"
 SERVER_RUNNING = "running"
 SERVER_ERROR = "error"
-
-# download_finished statuses — a user cancel is NOT a failure.
-DOWNLOAD_OK = "ok"
-DOWNLOAD_CANCELLED = "cancelled"
-DOWNLOAD_ERROR = "error"
 
 # family_id sentinel prefix in download-hub signals for curated LoRAs.
 LORA_FAMILY_PREFIX = "lora:"
@@ -117,157 +125,6 @@ def get_server_manager() -> LocalServerManager:
         _SHARED_MANAGER = LocalServerManager()
         atexit.register(_SHARED_MANAGER.stop)
     return _SHARED_MANAGER
-
-
-# -- idle auto-stop (推理完先不卸载,空闲 30 秒后再卸载) -----------------------------
-# Inference that started the server used to stop it the moment it finished;
-# repeated runs then reloaded multi-GB weights every time. The stop is now
-# armed on an idle timer: any new local request cancels it, and only a full
-# idle window actually unloads the model. Servers the USER started
-# (启动本地服务) are never auto-stopped.
-IDLE_STOP_DELAY_SECONDS = 30.0
-
-
-class IdleServerStopper:
-    """Delays the post-inference llama-server stop by an idle window.
-
-    ``note_request``/``note_finished`` bracket every local inference run
-    (single request or whole batch). The timer only arms once no run is in
-    flight AND the server was loaded by inference (not by the user), and any
-    new run cancels it — so back-to-back runs keep the model warm.
-    ``timer_factory`` is injectable so tests never wait.
-    """
-
-    def __init__(
-        self,
-        manager: LocalServerManager,
-        *,
-        delay: float = IDLE_STOP_DELAY_SECONDS,
-        timer_factory: Callable[[float, Callable[[], None]], threading.Timer] = threading.Timer,
-    ) -> None:
-        self._manager = manager
-        self._delay = delay
-        self._timer_factory = timer_factory
-        self._lock = threading.Lock()
-        self._timer: threading.Timer | None = None
-        self._active = 0
-        self._auto_started = False
-
-    def note_request(self) -> None:
-        """A local inference run is starting: cancel any pending stop.
-
-        When the server is not running yet, the coming run is the one that
-        loads the model — remember that so only inference-loaded servers get
-        idle-stopped.
-        """
-        with self._lock:
-            self._cancel_locked()
-            if self._active == 0 and not self._manager.is_running():
-                self._auto_started = True
-            self._active += 1
-
-    def note_finished(self) -> None:
-        """A run ended: arm the idle stop once nothing else is in flight."""
-        with self._lock:
-            self._active = max(0, self._active - 1)
-            if self._active > 0 or not self._auto_started:
-                return
-            self._cancel_locked()
-            timer = self._timer_factory(self._delay, self._fire)
-            timer.daemon = True  # never delay interpreter exit by the window
-            timer.start()
-            self._timer = timer
-
-    def note_user_control(self) -> None:
-        """The user started/stopped the server manually: no auto stop."""
-        with self._lock:
-            self._cancel_locked()
-            self._auto_started = False
-
-    def pending(self) -> bool:
-        """Whether an idle stop is currently armed (tests/diagnostics)."""
-        with self._lock:
-            return self._timer is not None
-
-    def _cancel_locked(self) -> None:
-        if self._timer is not None:
-            self._timer.cancel()
-            self._timer = None
-
-    def _fire(self) -> None:
-        with self._lock:
-            self._timer = None
-            if self._active > 0:
-                return  # a run raced in; it re-arms on finish
-            self._auto_started = False
-        try:
-            if self._manager.is_running():
-                _LOGGER.info(
-                    "stopping llama-server after %.0fs idle", self._delay
-                )
-            self._manager.stop()
-        except Exception:  # timer thread: never let a stop failure propagate
-            _LOGGER.exception("idle llama-server stop failed")
-
-
-_IDLE_STOPPER: IdleServerStopper | None = None
-
-
-def get_idle_stopper() -> IdleServerStopper:
-    """Process-wide idle stopper bound to the shared server manager."""
-    global _IDLE_STOPPER
-    if _IDLE_STOPPER is None:
-        _IDLE_STOPPER = IdleServerStopper(get_server_manager())
-    return _IDLE_STOPPER
-
-
-# -- process-wide download state ----------------------------------------------------
-# A download outlives the dialog (and bridge) that started it: the settings
-# dialog is recreated on every open, but the worker keeps writing. All
-# progress/finish signals therefore go through ONE process-wide hub that
-# every live bridge forwards from, and the current task snapshot lets a
-# freshly opened dialog re-attach (progress bar + cancel) instead of only
-# seeing a "download busy" toast. One download runs at a time.
-class _DownloadHub(QObject):
-    """Fan-out point for download signals; outlives every dialog/bridge."""
-
-    progress = Signal(str, str, object, object)  # family_id, quant_label, done, total
-    finished = Signal(str, str, str, str)  # family_id, quant_label, status, message
-
-
-@dataclass(frozen=True)
-class _ActiveDownload:
-    """Snapshot of the single in-flight download (replaced, never mutated)."""
-
-    family_id: str
-    quant_label: str
-    cancel: threading.Event
-    done: int = 0
-    total: int | None = None
-
-
-_HUB: _DownloadHub | None = None
-_ACTIVE_TASK: _ActiveDownload | None = None
-_ACTIVE_LOCK = threading.Lock()
-
-
-def get_download_hub() -> _DownloadHub:
-    """Process-wide download signal hub (created lazily on the GUI thread)."""
-    global _HUB
-    if _HUB is None:
-        _HUB = _DownloadHub()
-    return _HUB
-
-
-def active_download() -> tuple[str, str, int, int | None] | None:
-    """(family_id, quant_label, done_bytes, total_bytes) of the running
-    download, or None. The snapshot is what a reopened dialog re-attaches to.
-    """
-    with _ACTIVE_LOCK:
-        task = _ACTIVE_TASK
-        if task is None:
-            return None
-        return (task.family_id, task.quant_label, task.done, task.total)
 
 
 def _alive(obj: QObject) -> bool:
@@ -866,90 +723,7 @@ class LocalBridge(QObject):
         runtime_asset: RuntimeAsset | None,
     ) -> bool:
         """Run download jobs on the pool under the process-wide single slot."""
-        total_bytes = sum(expected for _url, _dest, expected, _sha in jobs)
-        if runtime_asset is not None:
-            total_bytes += runtime_asset.size_bytes
-        cancel = threading.Event()
-        global _ACTIVE_TASK
-        with _ACTIVE_LOCK:
-            # A download started from a previous (now closed) dialog may still
-            # be running — refuse to race it (the UI re-attaches instead).
-            if _ACTIVE_TASK is not None:
-                return False
-            _ACTIVE_TASK = _ActiveDownload(
-                family_id=family_id,
-                quant_label=quant_label,
-                cancel=cancel,
-                done=0,
-                total=total_bytes,
-            )
-        hub = get_download_hub()
-
-        def work() -> str:
-            finished_prefix = 0
-            last_emitted = -PROGRESS_EMIT_STEP_BYTES
-
-            def report(done: int, _total: int | None, *, base: int) -> None:
-                nonlocal last_emitted
-                global _ACTIVE_TASK
-                overall = base + done
-                # Keep the re-attach snapshot fresh even between emits.
-                with _ACTIVE_LOCK:
-                    if _ACTIVE_TASK is not None:
-                        _ACTIVE_TASK = _dc_replace(_ACTIVE_TASK, done=overall)
-                if (
-                    overall - last_emitted < PROGRESS_EMIT_STEP_BYTES
-                    and overall != total_bytes
-                ):
-                    return
-                last_emitted = overall
-                # Worker-thread emit on the always-alive hub; Qt queues the
-                # delivery to every connected bridge on the GUI thread.
-                hub.progress.emit(family_id, quant_label, overall, total_bytes)
-
-            try:
-                if runtime_asset is not None:
-                    ensure_runtime(
-                        runtime_base_dir(),
-                        progress=lambda done, _t: report(done, None, base=0),
-                        cancel=cancel,
-                    )
-                    finished_prefix = runtime_asset.size_bytes
-                for url, dest, expected, sha256 in jobs:
-                    download_file(
-                        url,
-                        dest,
-                        expected_bytes=expected,
-                        expected_sha256=sha256 or None,
-                        progress=lambda done, _t, *, b=finished_prefix: report(
-                            done, None, base=b
-                        ),
-                        cancel=cancel,
-                    )
-                    finished_prefix += expected
-            except DownloadCancelledError:
-                return DOWNLOAD_CANCELLED
-            return DOWNLOAD_OK
-
-        def finish(status: str, message: str) -> None:
-            global _ACTIVE_TASK
-            with _ACTIVE_LOCK:
-                _ACTIVE_TASK = None
-            if status == DOWNLOAD_ERROR:
-                _LOGGER.warning(
-                    "download failed for %s/%s: %s", family_id, quant_label, message
-                )
-            elif status == DOWNLOAD_CANCELLED:
-                _LOGGER.info("download cancelled for %s/%s", family_id, quant_label)
-            hub.finished.emit(family_id, quant_label, status, message)
-
-        run_async(
-            self._pool,
-            work,
-            on_done=lambda status: finish(str(status), ""),
-            on_error=lambda message: finish(DOWNLOAD_ERROR, message),
-        )
-        return True
+        return launch_download_jobs(family_id, quant_label, jobs, runtime_asset)
 
     def cancel_download(self) -> None:
         """Signal the running download to stop (partial files are kept).
@@ -957,10 +731,7 @@ class LocalBridge(QObject):
         Works from ANY bridge — a dialog reopened mid-download can cancel
         the task its predecessor started.
         """
-        with _ACTIVE_LOCK:
-            task = _ACTIVE_TASK
-        if task is not None:
-            task.cancel.set()
+        cancel_active_download()
 
     # -- server ------------------------------------------------------------------------
     def server_running(self) -> bool:

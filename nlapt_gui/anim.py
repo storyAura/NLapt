@@ -97,45 +97,39 @@ def fade_out(widget: QWidget, ms: int = FADE_MS) -> QPropertyAnimation | None:
     return _fade(widget, 1.0, 0.0, ms)
 
 
-def pop_in(widget: QWidget, ms: int = POP_MS) -> QAbstractAnimation | None:
-    """Scale-and-fade a widget in (the design's ``popIn``).
+def pop_in(
+    widget: QWidget, ms: int = POP_MS, *, start: bool = True
+) -> QAbstractAnimation | None:
+    """Scale a widget in (the design's ``popIn``).
 
-    Fades opacity 0 -> 1 in parallel with a subtle geometry pop from a slightly
-    shrunk rectangle to the widget's laid-out geometry. Falls back to a plain
-    fade when the widget has no usable geometry yet. Returns ``None`` when
-    animations are disabled (widget left fully visible at its final geometry).
+    Geometry-only: a ``QGraphicsOpacityEffect`` on a live chip leaks across
+    rebuilds and collides with the drag-source effect. The start rect shrinks
+    height only so wrapping text does not reflow. Falls back to a no-op
+    when the widget has no usable geometry. Returns ``None`` when animations
+    are disabled (widget left at its laid-out geometry). Pass ``start=False``
+    to add the animation to a parent group.
     """
-    if widget is not None and not widget.isVisible():
-        widget.show()
-    effect = _opacity_effect(widget)
-    final = widget.geometry() if widget is not None else QRect()
-    if not ANIMATIONS_ENABLED:
-        effect.setOpacity(1.0)
+    if widget is None:
         return None
-    fade = QPropertyAnimation(effect, b"opacity", widget)
-    fade.setDuration(max(0, ms))
-    fade.setStartValue(0.0)
-    fade.setEndValue(1.0)
-    fade.setEasingCurve(QEasingCurve.Type.InOutQuad)
-    effect.setOpacity(0.0)
-    if final.isEmpty():
-        # No geometry to scale against — a pure fade is the graceful fallback.
-        fade.start(QAbstractAnimation.DeletionPolicy.DeleteWhenStopped)
-        return fade
-    # Shrink toward the widget's center for the scale-up illusion.
-    dx = round(final.width() * 0.06)
+    if not widget.isVisible():
+        widget.show()
+    final = widget.geometry()
+    if not ANIMATIONS_ENABLED or final.isEmpty():
+        return None
     dy = round(final.height() * 0.06)
-    start_rect = final.adjusted(dx, dy, -dx, -dy)
-    scale = QPropertyAnimation(widget, b"geometry", widget)
+    # Keep width fixed: shrinking a wrapping chip reflows its text every
+    # frame (a full-width caption collapses to "and a" then expands).
+    start_rect = final.adjusted(0, dy, 0, -dy)
+    # Do not parent the animation to ``widget``: a live geometry animation
+    # fights FlowLayout after the group is gone and leaves overlapping chips.
+    scale = QPropertyAnimation(widget, b"geometry")
     scale.setDuration(max(0, ms))
     scale.setStartValue(start_rect)
     scale.setEndValue(final)
     scale.setEasingCurve(_spring())
-    group = QParallelAnimationGroup(widget)
-    group.addAnimation(fade)
-    group.addAnimation(scale)
-    group.start(QAbstractAnimation.DeletionPolicy.DeleteWhenStopped)
-    return group
+    if start:
+        scale.start(QAbstractAnimation.DeletionPolicy.DeleteWhenStopped)
+    return scale
 
 
 def slide_geometry(
@@ -197,7 +191,7 @@ def animate_reflow(
         if widget is None or start == end:
             continue
         widget.setGeometry(start)
-        slide = QPropertyAnimation(widget, b"geometry", widget)
+        slide = QPropertyAnimation(widget, b"geometry")
         slide.setDuration(max(0, ms))
         slide.setStartValue(QRect(start))
         slide.setEndValue(QRect(end))
@@ -205,6 +199,14 @@ def animate_reflow(
         group.addAnimation(slide)
     if group.animationCount() == 0:
         return None
+    ends = [(widget, end) for widget, _start, end in moves if widget is not None]
+
+    def _snap() -> None:
+        for widget, end in ends:
+            if isValid(widget):
+                widget.setGeometry(end)
+
+    group.finished.connect(_snap)
     group.start(QAbstractAnimation.DeletionPolicy.DeleteWhenStopped)
     return group
 
@@ -219,6 +221,7 @@ def flip_reflow(
     """FLIP unmatched-by-identity widgets from ``previous`` rects to now.
 
     ``pop`` is excluded from the slide and given :func:`pop_in` instead.
+    Slide and pop share one group so callers can finish both together.
     """
     moves: list[tuple[QWidget, QRect, QRect]] = []
     for key, widget in items:
@@ -228,9 +231,36 @@ def flip_reflow(
         end = widget.geometry()
         if start != end and not start.isEmpty() and not end.isEmpty():
             moves.append((widget, start, end))
-    group = animate_reflow(moves, ms)
+    pop_end = QRect(pop.geometry()) if pop is not None else QRect()
+    if not ANIMATIONS_ENABLED:
+        for widget, _start, end in moves:
+            widget.setGeometry(end)
+        return None
+    group = QParallelAnimationGroup()
+    for widget, start, end in moves:
+        widget.setGeometry(start)
+        slide = QPropertyAnimation(widget, b"geometry")
+        slide.setDuration(max(0, ms))
+        slide.setStartValue(QRect(start))
+        slide.setEndValue(QRect(end))
+        slide.setEasingCurve(QEasingCurve.Type.OutCubic)
+        group.addAnimation(slide)
     if pop is not None:
-        pop_in(pop)
+        pop_anim = pop_in(pop, start=False)
+        if pop_anim is not None:
+            group.addAnimation(pop_anim)
+    if group.animationCount() == 0:
+        return None
+
+    def _snap() -> None:
+        for widget, _start, end in moves:
+            if widget is not None and isValid(widget):
+                widget.setGeometry(end)
+        if pop is not None and isValid(pop) and not pop_end.isEmpty():
+            pop.setGeometry(pop_end)
+
+    group.finished.connect(_snap)
+    group.start(QAbstractAnimation.DeletionPolicy.DeleteWhenStopped)
     return group
 
 

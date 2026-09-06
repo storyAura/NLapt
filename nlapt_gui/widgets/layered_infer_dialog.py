@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Sequence
 
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QGuiApplication, QPixmap
 from PySide6.QtWidgets import (
     QButtonGroup,
     QFormLayout,
@@ -20,9 +21,16 @@ from PySide6.QtWidgets import (
 )
 from shiboken6 import isValid
 
+from nlapt.core.config import LLMProfile
 from nlapt.core.errors import NLaptError
 from nlapt.diagnostics import get_logger
 
+from nlapt_gui.cha_config import (
+    CHASettings,
+    load_cha_settings,
+    resolve_batch_profile,
+    resolve_card_profile,
+)
 from nlapt_gui.controller import AppController
 from nlapt_gui.layered_prompts import (
     TIP_FLORENCE_NO_LAYERED,
@@ -38,6 +46,7 @@ from nlapt_gui.widgets.dialogs import CenteredDialog
 from nlapt_gui.widgets.layered_infer_cards import (
     PLACEHOLDER_ZH,
     CandidateCard,
+    CardsScrollArea,
     PreviewPane,
     RefPickerGrid,
 )
@@ -46,7 +55,7 @@ from nlapt_gui.widgets.thumbnails import ThumbnailLoader, bucket_height
 
 _LOGGER = get_logger(__name__)
 
-WINDOW_TITLE = "分层推标"
+WINDOW_TITLE = "CHA标注 · 组合分层推标 (Combined Hierarchical Annotation)"
 LABEL_NAME = "角色名"
 LABEL_SERIES = "作品名"
 LABEL_ENGINE = "推理引擎"
@@ -55,25 +64,29 @@ HINT_NAME = "必填，将锁定为全程主语"
 HINT_SERIES = "选填，写入人物卡首句 name from series"
 HINT_CARDS = "审阅并编辑英文；中文仅供对照。选定一套后用于整批。"
 HINT_CONFIRM = "确认后为每张图生成画面段，并拼接「人物卡 + 空行 + 画面段」。"
+LABEL_BATCH_MODEL_FMT = "整批画面模型: {model}"
 HINT_REF = "点击下方缩略图选择参考图"
 ENGINE_LLM_TEXT = "LLM"
 ENGINE_LOCAL_TEXT = "本地模型"
 BUTTON_BACK = "上一步"
 BUTTON_GENERATE = "生成人物卡"
 BUTTON_NEXT = "下一步"
-BUTTON_CONFIRM = "开始分层推标"
+BUTTON_CONFIRM = "开始CHA标注"
 STATUS_NEED_NAME = "请先填写角色名"
 STATUS_GENERATING = "正在生成人物卡…"
 STATUS_TRANSLATING = "正在翻译对照…"
 STATUS_PICK = "请选定一套人物卡"
 STATUS_READY = "将写入 {n} 张标注"
 STATUS_ENGINE = "当前引擎未配置"
+TRANSLATE_FAILED_FMT = "翻译失败: {message}"
+TRANSLATE_FAILED_UNKNOWN = "未知错误"
 PREVIEW_SCENE = "画面提示词预览"
 LABEL_CHOSEN_CARD = "选定人物卡"
 CARD_COUNT = 3
 PREVIEW_DECODE_H = 480
 DIALOG_MIN_W = 720
 DIALOG_MIN_H = 680
+SCREEN_MARGIN = 24
 PAGE_ROLE = 0
 PAGE_CARDS = 1
 PAGE_CONFIRM = 2
@@ -93,6 +106,7 @@ class LayeredInferDialog(CenteredDialog):
         translate_bridge: TranslateBridge | None = None,
         memory: LayeredMemory | None = None,
         florence: bool | None = None,
+        cha_settings: CHASettings | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -106,13 +120,17 @@ class LayeredInferDialog(CenteredDialog):
             else TranslateBridge(controller, parent=self)
         )
         self._memory = memory if memory is not None else load_layered_memory()
+        self._cha = cha_settings if cha_settings is not None else load_cha_settings()
         self._florence = local_engine_is_florence() if florence is None else florence
         self._pending: set[str] = set()
         self._translating: set[str] = set()
+        self._zh_queue: deque[tuple[str, str]] = deque()
+        self._zh_inflight: str | None = None
 
         self.setWindowTitle(WINDOW_TITLE)
         self.setModal(True)
         self.setMinimumSize(DIALOG_MIN_W, DIALOG_MIN_H)
+        self._cap_to_screen()
 
         self._stack = QStackedWidget(self)
         self._stack.addWidget(self._build_role_page())
@@ -234,19 +252,26 @@ class LayeredInferDialog(CenteredDialog):
         hint = QLabel(HINT_CARDS, page)
         hint.setProperty("muted", True)
         hint.setWordWrap(True)
+        inner = QWidget(page)
         self.cards: list[CandidateCard] = []
-        self._card_group = QButtonGroup(page)
+        self._card_group = QButtonGroup(inner)
+        cards_layout = QVBoxLayout(inner)
+        cards_layout.setContentsMargins(0, 0, 0, 0)
+        cards_layout.setSpacing(8)
+        for index in range(CARD_COUNT):
+            card = CandidateCard(index, inner)
+            card.regen_requested.connect(self._regen_one)
+            self._card_group.addButton(card.radio, index)
+            self.cards.append(card)
+            cards_layout.addWidget(card)
+        self.cards[0].radio.setChecked(True)
+        self.cards_scroll = CardsScrollArea(page)
+        self.cards_scroll.setWidget(inner)
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
         layout.addWidget(hint)
-        for index in range(CARD_COUNT):
-            card = CandidateCard(index, page)
-            card.regen_requested.connect(self._regen_one)
-            self._card_group.addButton(card.radio, index)
-            self.cards.append(card)
-            layout.addWidget(card, 1)
-        self.cards[0].radio.setChecked(True)
+        layout.addWidget(self.cards_scroll, 1)
         return page
 
     def _build_confirm_page(self) -> QWidget:
@@ -254,6 +279,8 @@ class LayeredInferDialog(CenteredDialog):
         hint = QLabel(HINT_CONFIRM, page)
         hint.setProperty("muted", True)
         hint.setWordWrap(True)
+        self.confirm_model = QLabel("", page)
+        self.confirm_model.setProperty("muted", True)
         self.confirm_card = QPlainTextEdit(page)
         self.confirm_card.setReadOnly(True)
         self.confirm_card_stats = QLabel(format_card_stats(""), page)
@@ -270,6 +297,7 @@ class LayeredInferDialog(CenteredDialog):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
         layout.addWidget(hint)
+        layout.addWidget(self.confirm_model)
         layout.addWidget(card_title)
         layout.addWidget(self.confirm_card, 1)
         layout.addWidget(self.confirm_card_stats)
@@ -342,13 +370,17 @@ class LayeredInferDialog(CenteredDialog):
         if not name or not self._keys:
             return
         engine = self.current_engine()
-        if not self._vision.configured(engine):
+        profile = self._card_profile(engine, index)
+        if not self._vision.configured(engine, profile=profile):
             self.status_label.setText(STATUS_ENGINE)
             return
         request_id = f"card-{index}"
+        self._drop_zh(request_id)
         self._pending.add(request_id)
+        self.cards[index].set_english("")
         self.cards[index].set_busy(True)
         self.cards[index].set_chinese(PLACEHOLDER_ZH)
+        self.cards[index].set_model_name(self._model_label(engine, profile))
         ok = self._vision.request_custom(
             request_id,
             self.reference_key(),
@@ -357,6 +389,7 @@ class LayeredInferDialog(CenteredDialog):
             user_prompt=build_card_prompt(
                 name, self.series_edit.text(), variant=index
             ),
+            profile=profile,
         )
         if not ok and request_id in self._pending:
             # Failure already emitted custom_ready (sync) or will not run.
@@ -376,12 +409,33 @@ class LayeredInferDialog(CenteredDialog):
         self.cards[index].set_busy(False)
         if ok and text.strip():
             self.cards[index].set_english(text.strip())
-            self._translating.add(request_id)
-            self._translate.request_to(request_id, text.strip(), TARGET_ZH)
+            self._enqueue_zh(request_id, text.strip())
         else:
             self.cards[index].set_english("")
             self.cards[index].set_chinese(text or PLACEHOLDER_ZH)
         self._sync_chrome()
+
+    def _enqueue_zh(self, request_id: str, english: str) -> None:
+        self._translating.add(request_id)
+        self._zh_queue.append((request_id, english))
+        self._pump_zh_queue()
+
+    def _drop_zh(self, request_id: str) -> None:
+        self._zh_queue = deque(
+            item for item in self._zh_queue if item[0] != request_id
+        )
+        self._translating.discard(request_id)
+
+    def _pump_zh_queue(self) -> None:
+        if self._zh_inflight is not None:
+            return
+        while self._zh_queue:
+            request_id, english = self._zh_queue.popleft()
+            if request_id not in self._translating:
+                continue
+            self._zh_inflight = request_id
+            self._translate.request_to(request_id, english, TARGET_ZH)
+            return
 
     def _on_target_ready(
         self, key: str, _source: str, lang: str, result: str, ok: bool
@@ -394,18 +448,39 @@ class LayeredInferDialog(CenteredDialog):
             return
         if index < 0 or index >= len(self.cards):
             return
+        if key == self._zh_inflight:
+            self._zh_inflight = None
+        if key in self._pending:
+            self._translating.discard(key)
+            self._pump_zh_queue()
+            self._sync_chrome()
+            return
         self._translating.discard(key)
-        self.cards[index].set_chinese(result if ok and result.strip() else PLACEHOLDER_ZH)
+        if ok and result.strip():
+            self.cards[index].set_chinese(result)
+        else:
+            message = result.strip() or TRANSLATE_FAILED_UNKNOWN
+            self.cards[index].set_chinese(
+                TRANSLATE_FAILED_FMT.format(message=message)
+            )
+        self._pump_zh_queue()
         self._sync_chrome()
 
     def _fill_confirm(self) -> None:
         name = self.name_edit.text().strip()
         card = self.selected_card_text()
         scene = build_scene_prompt(name)
+        engine = self.current_engine()
+        profile = self._batch_profile(engine)
+        model = self._model_label(engine, profile)
         self.confirm_card.setPlainText(card)
         self.confirm_card_stats.setText(format_card_stats(card))
         self.confirm_scene.setPlainText(scene)
         self.confirm_scene_stats.setText(format_card_stats(scene))
+        self.confirm_model.setText(
+            LABEL_BATCH_MODEL_FMT.format(model=model) if model else ""
+        )
+        self.confirm_model.setVisible(bool(model))
 
     def _start_batch(self) -> None:
         card = self.selected_card_text()
@@ -420,6 +495,7 @@ class LayeredInferDialog(CenteredDialog):
             card_text=card,
             scene_system=prompts.system_text_for(engine),
             scene_user=build_scene_prompt(name),
+            profile=self._batch_profile(engine),
         )
         if not started:
             return
@@ -435,14 +511,39 @@ class LayeredInferDialog(CenteredDialog):
             _LOGGER.warning("could not persist layered infer memory: %s", exc)
         self.accept()
 
+    def _card_profile(self, engine: str, index: int) -> LLMProfile | None:
+        if engine != ENGINE_LLM:
+            return None
+        return resolve_card_profile(self._cha, self._controller.active_profile(), index)
+
+    def _batch_profile(self, engine: str) -> LLMProfile | None:
+        if engine != ENGINE_LLM:
+            return None
+        return resolve_batch_profile(self._cha, self._controller.active_profile())
+
+    def _model_label(self, engine: str, profile: LLMProfile | None) -> str:
+        if engine == ENGINE_LOCAL:
+            return ENGINE_LOCAL_TEXT
+        if profile is not None and profile.vision_model:
+            return profile.vision_model
+        active = self._controller.active_profile()
+        return active.vision_model if active is not None else ""
+
     # -- helpers ---------------------------------------------------------------
+    def _cap_to_screen(self) -> None:
+        """Keep the wizard inside the available desktop so it stays draggable."""
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        geo = screen.availableGeometry()
+        self.setMaximumWidth(max(DIALOG_MIN_W, geo.width() - SCREEN_MARGIN))
+        self.setMaximumHeight(max(DIALOG_MIN_H, geo.height() - SCREEN_MARGIN))
+
     def _apply_memory(self) -> None:
         if self._memory.name:
             self.name_edit.setText(self._memory.name)
         if self._memory.series:
             self.series_edit.setText(self._memory.series)
-        if self._memory.card_text:
-            self.cards[0].set_english(self._memory.card_text)
 
     def _refresh_ref_preview(self) -> None:
         if self._loader is None:

@@ -16,6 +16,10 @@ Providers:
   and secret key obtained by registering at https://fanyi-api.baidu.com .
 * :class:`DeepLProvider` -- the DeepL API Free tier. Requires an API key from
   https://www.deepl.com/pro-api .
+* :class:`DeepLXProvider` -- DeepLX free ``POST /translate`` (self-hosted
+  or a community instance from https://deeplx.owo.network/endpoints/free.html ).
+* :class:`CustomOpenAIProvider` -- user-supplied OpenAI-compatible
+  ``/chat/completions`` endpoint (Base URL + model + optional key).
 
 ``httpx`` is imported lazily (via :func:`nlapt.llm.base.require_httpx`) so the
 core package keeps no hard HTTP dependency, and every provider accepts a
@@ -27,11 +31,14 @@ from __future__ import annotations
 
 import hashlib
 import secrets
+import time
 from typing import Any, Callable, Mapping, Protocol, runtime_checkable
+from urllib.parse import urlsplit, urlunsplit
 
 from nlapt.core.errors import LLMConfigError, LLMRequestError
 from nlapt.diagnostics import get_logger
-from nlapt.llm.base import require_httpx
+from nlapt.llm.base import http_post_json, join_url, require_httpx
+from nlapt.llm.retry import MinIntervalLimiter
 from nlapt.llm.translate import Direction, TARGET_LANGS
 
 _LOGGER = get_logger(__name__)
@@ -39,6 +46,18 @@ _LOGGER = get_logger(__name__)
 # Web translation endpoints answer in a couple of seconds when healthy; a
 # short per-attempt timeout + the caller's retry beats one 60 s hang.
 WEB_TRANSLATE_TIMEOUT_SECONDS = 15.0
+# Unofficial Google endpoint rate-limits aggressively; retry 429s locally
+# before bubbling up (sleep is injectable so tests never wait).
+GOOGLE_429_RETRIES = 2
+GOOGLE_429_BACKOFF_SECONDS = 0.5
+# Community DeepLX instances rate-limit concurrent caption segments; a
+# process-wide gap plus local 429/418 backoff keeps the free endpoints usable.
+DEEPLX_MIN_INTERVAL_SECONDS = 1.0
+DEEPLX_429_RETRIES = 3
+DEEPLX_429_BACKOFF_SECONDS = 1.0
+# api.deeplx.org uses HTTP 418 "I'm a teapot" as a soft ban / rate-limit.
+DEEPLX_RETRY_STATUS_CODES = frozenset({418, 429, 503})
+MSG_DEEPLX_BUSY = "DeepLX 请求过于频繁，请稍后再试或换用自建实例"
 
 # -- provider identifiers ----------------------------------------------------
 PROVIDER_GOOGLE = "google"
@@ -48,6 +67,26 @@ PROVIDER_DEEPL = "deepl"
 # Translator through the GUI controller) but shares the same selection UI, so
 # its id + registration note live here for a single source of truth.
 PROVIDER_LLM = "llm"
+PROVIDER_CUSTOM = "custom"
+PROVIDER_DEEPLX = "deeplx"
+PROVIDER_LOCAL_MT = "local_mt"
+DEEPLX_TRANSLATE_PATH = "/translate"
+DEEPLX_AUTO_SOURCE = "auto"
+CUSTOM_CHAT_ENDPOINT = "/chat/completions"
+CUSTOM_SYSTEM = (
+    "You translate image-caption tags. Output only the translation. "
+    "Keep comma-separated tag structure. No quotes or commentary."
+)
+CUSTOM_USER_FMT = "Translate into {language}:\n\n{text}"
+_CUSTOM_DIRECTION_LANG: Mapping[Direction, str] = {
+    Direction.EN_TO_ZH: "Simplified Chinese",
+    Direction.ZH_TO_EN: "English",
+}
+_CUSTOM_TARGET_LANG: Mapping[str, str] = {
+    "zh": "Simplified Chinese",
+    "en": "English",
+    "ja": "Japanese",
+}
 
 # -- endpoints ---------------------------------------------------------------
 GOOGLE_ENDPOINT = "https://translate.googleapis.com/translate_a/single"
@@ -74,6 +113,11 @@ _GOOGLE_TARGET_LANG: Mapping[str, str] = {"zh": "zh-CN", "en": "en", "ja": "ja"}
 _BAIDU_TARGET_LANG: Mapping[str, str] = {"zh": "zh", "en": "en", "ja": "jp"}
 _BAIDU_AUTO_SOURCE = "auto"
 _DEEPL_TARGET_LANG: Mapping[str, str] = {"zh": "ZH", "en": "EN-US", "ja": "JA"}
+_DEEPLX_TARGET: Mapping[Direction, str] = {
+    Direction.EN_TO_ZH: "ZH",
+    Direction.ZH_TO_EN: "EN",
+}
+_DEEPLX_TARGET_LANG: Mapping[str, str] = {"zh": "ZH", "en": "EN", "ja": "JA"}
 
 
 def _require_target_lang(target_lang: str) -> str:
@@ -114,9 +158,11 @@ class GoogleFreeProvider:
         *,
         transport: Any = None,
         timeout: float = WEB_TRANSLATE_TIMEOUT_SECONDS,
+        sleep: Callable[[float], None] | None = None,
     ) -> None:
         self._transport = transport
         self._timeout = timeout
+        self._sleep = time.sleep if sleep is None else sleep
 
     def translate(self, text: str, direction: Direction) -> str:
         return self._request(text, _GOOGLE_TARGET[direction])
@@ -135,13 +181,24 @@ class GoogleFreeProvider:
             "dt": "t",
             "q": stripped,
         }
-        try:
-            with httpx.Client(timeout=self._timeout, transport=self._transport) as http:
-                response = http.get(GOOGLE_ENDPOINT, params=params)
-        except httpx.TimeoutException as exc:
-            raise LLMRequestError(f"Google 翻译请求超时: {exc}") from exc
-        except httpx.HTTPError as exc:
-            raise LLMRequestError(f"Google 翻译请求失败: {exc}") from exc
+        attempts = 1 + GOOGLE_429_RETRIES
+        response = None
+        for attempt in range(attempts):
+            try:
+                with httpx.Client(
+                    timeout=self._timeout, transport=self._transport
+                ) as http:
+                    response = http.get(GOOGLE_ENDPOINT, params=params)
+            except httpx.TimeoutException as exc:
+                raise LLMRequestError(f"Google 翻译请求超时: {exc}") from exc
+            except httpx.HTTPError as exc:
+                raise LLMRequestError(f"Google 翻译请求失败: {exc}") from exc
+            if response.status_code == 429 and attempt + 1 < attempts:
+                self._sleep(GOOGLE_429_BACKOFF_SECONDS * (attempt + 1))
+                continue
+            break
+        if response is None:  # pragma: no cover - loop always assigns or raises
+            raise LLMRequestError("Google 翻译请求失败")
         if response.status_code >= 400:
             raise LLMRequestError(
                 f"Google 翻译返回 HTTP {response.status_code}"
@@ -323,6 +380,234 @@ def _parse_deepl(data: Any) -> str:
     return result
 
 
+class DeepLXProvider:
+    """DeepLX free ``POST /translate`` (self-hosted or community instance)."""
+
+    def __init__(
+        self,
+        base_url: str,
+        token: str = "",
+        *,
+        transport: Any = None,
+        timeout: float = WEB_TRANSLATE_TIMEOUT_SECONDS,
+        limiter: MinIntervalLimiter | None = None,
+        sleep: Callable[[float], None] | None = None,
+    ) -> None:
+        base_url = (base_url or "").strip()
+        if not base_url:
+            raise LLMConfigError(
+                "DeepLX 未配置:请填写实例地址"
+                "(自建或 https://deeplx.owo.network/endpoints/free.html )"
+            )
+        self._base_url = base_url
+        self._token = (token or "").strip()
+        self._transport = transport
+        self._timeout = timeout
+        self._limiter = limiter if limiter is not None else _DEEPLX_LIMITER
+        self._sleep = time.sleep if sleep is None else sleep
+
+    def translate(self, text: str, direction: Direction) -> str:
+        return self._request(text, _DEEPLX_TARGET[direction])
+
+    def translate_to(self, text: str, target_lang: str) -> str:
+        """Translate into a target language (``zh``/``en``/``ja``), auto source."""
+        return self._request(text, _DEEPLX_TARGET_LANG[_require_target_lang(target_lang)])
+
+    def _request(self, text: str, target_code: str) -> str:
+        stripped = _require_text(text)
+        headers: dict[str, str] = {}
+        if self._token:
+            headers["Authorization"] = f"Bearer {self._token}"
+        payload = {
+            "text": stripped,
+            "source_lang": DEEPLX_AUTO_SOURCE,
+            "target_lang": target_code,
+        }
+        url = _deeplx_translate_url(self._base_url)
+        display = display_deeplx_url(url)
+        attempts = 1 + DEEPLX_429_RETRIES
+        last_error: LLMRequestError | None = None
+        for attempt in range(attempts):
+            self._limiter.wait()
+            try:
+                data = http_post_json(
+                    url=url,
+                    payload=payload,
+                    headers=headers,
+                    timeout=self._timeout,
+                    provider="deeplx",
+                    transport=self._transport,
+                    display_url=display,
+                )
+                return _parse_deeplx(data)
+            except LLMRequestError as exc:
+                last_error = exc
+                if _deeplx_retryable(exc) and attempt + 1 < attempts:
+                    self._sleep(DEEPLX_429_BACKOFF_SECONDS * (2**attempt))
+                    continue
+                if _deeplx_retryable(exc):
+                    raise _deeplx_busy_error(exc) from exc
+                raise
+        if last_error is not None and _deeplx_retryable(last_error):
+            raise _deeplx_busy_error(last_error) from last_error
+        raise last_error or LLMRequestError("DeepLX 请求失败")
+
+
+def _deeplx_translate_url(base_url: str) -> str:
+    stripped = base_url.rstrip("/")
+    path = stripped.split("?", 1)[0]
+    if path.endswith(DEEPLX_TRANSLATE_PATH):
+        return stripped
+    return join_url(stripped, DEEPLX_TRANSLATE_PATH)
+
+
+def display_deeplx_url(url: str) -> str:
+    """Public host + ``/translate``, with secret path/query segments removed."""
+    parts = urlsplit(url)
+    path = parts.path.rstrip("/") or "/"
+    if path.endswith(DEEPLX_TRANSLATE_PATH):
+        prefix = path[: -len(DEEPLX_TRANSLATE_PATH)].rstrip("/")
+        path = "/…/translate" if prefix else DEEPLX_TRANSLATE_PATH
+    elif path not in ("", "/"):
+        path = "/…"
+    return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+
+
+_DEEPLX_LIMITER = MinIntervalLimiter(DEEPLX_MIN_INTERVAL_SECONDS)
+
+
+def reset_deeplx_limiter(
+    *,
+    min_interval: float = DEEPLX_MIN_INTERVAL_SECONDS,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> MinIntervalLimiter:
+    """Replace the process-wide DeepLX limiter (tests; never a real wait)."""
+    global _DEEPLX_LIMITER
+    _DEEPLX_LIMITER = MinIntervalLimiter(min_interval, clock=clock, sleep=sleep)
+    return _DEEPLX_LIMITER
+
+
+def _deeplx_retryable(exc: LLMRequestError) -> bool:
+    """True for community rate-limit / soft-ban status codes."""
+    return getattr(exc, "status_code", None) in DEEPLX_RETRY_STATUS_CODES
+
+
+def _deeplx_busy_error(exc: LLMRequestError) -> LLMRequestError:
+    """User-facing busy message; keeps the HTTP status for callers/tests."""
+    wrapped = LLMRequestError(MSG_DEEPLX_BUSY)
+    code = getattr(exc, "status_code", None)
+    if code is not None:
+        wrapped.status_code = code  # type: ignore[attr-defined]
+    return wrapped
+
+
+def _parse_deeplx(data: Any) -> str:
+    if not isinstance(data, Mapping):
+        raise LLMRequestError("DeepLX 响应结构异常")
+    code = data.get("code")
+    if code is not None and code != 200:
+        message = str(data.get("message") or data.get("msg") or "").strip()
+        suffix = f": {message}" if message else ""
+        error = LLMRequestError(f"DeepLX 错误 {code}{suffix}")
+        try:
+            error.status_code = int(code)
+        except (TypeError, ValueError):
+            pass
+        raise error
+    result = data.get("data")
+    if isinstance(result, str) and result.strip():
+        return result.strip()
+    raise LLMRequestError("DeepLX 未返回译文")
+
+
+class CustomOpenAIProvider:
+    """User-supplied OpenAI-compatible chat endpoint for translation."""
+
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        model: str,
+        *,
+        transport: Any = None,
+        timeout: float = WEB_TRANSLATE_TIMEOUT_SECONDS,
+    ) -> None:
+        base_url = (base_url or "").strip()
+        model = (model or "").strip()
+        if not base_url or not model:
+            raise LLMConfigError(
+                "自定义翻译未配置:请填写 Base URL 与模型"
+            )
+        self._base_url = base_url
+        self._api_key = (api_key or "").strip()
+        self._model = model
+        self._transport = transport
+        self._timeout = timeout
+
+    def translate(self, text: str, direction: Direction) -> str:
+        return self._complete(text, _CUSTOM_DIRECTION_LANG[direction])
+
+    def translate_to(self, text: str, target_lang: str) -> str:
+        """Translate into a target language (``zh``/``en``/``ja``), auto source."""
+        language = _CUSTOM_TARGET_LANG[_require_target_lang(target_lang)]
+        return self._complete(text, language)
+
+    def _complete(self, text: str, language: str) -> str:
+        stripped = _require_text(text)
+        url = _custom_completions_url(self._base_url)
+        headers: dict[str, str] = {}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        payload = {
+            "model": self._model,
+            "temperature": 0,
+            "messages": [
+                {"role": "system", "content": CUSTOM_SYSTEM},
+                {
+                    "role": "user",
+                    "content": CUSTOM_USER_FMT.format(
+                        language=language, text=stripped
+                    ),
+                },
+            ],
+        }
+        data = http_post_json(
+            url=url,
+            payload=payload,
+            headers=headers,
+            timeout=self._timeout,
+            provider="custom-translate",
+            transport=self._transport,
+        )
+        return _parse_openai_translation(data)
+
+
+def _custom_completions_url(base_url: str) -> str:
+    stripped = base_url.rstrip("/")
+    if stripped.endswith(CUSTOM_CHAT_ENDPOINT):
+        return stripped
+    return join_url(stripped, CUSTOM_CHAT_ENDPOINT)
+
+
+def _parse_openai_translation(data: Any) -> str:
+    if not isinstance(data, Mapping):
+        raise LLMRequestError("自定义翻译响应结构异常")
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise LLMRequestError("自定义翻译未返回译文")
+    first = choices[0]
+    if not isinstance(first, Mapping):
+        raise LLMRequestError("自定义翻译响应结构异常")
+    message = first.get("message")
+    if not isinstance(message, Mapping):
+        raise LLMRequestError("自定义翻译响应结构异常")
+    content = message.get("content")
+    if not isinstance(content, str) or not content.strip():
+        raise LLMRequestError("自定义翻译未返回译文")
+    return content.strip()
+
+
 # -- registry ----------------------------------------------------------------
 # A factory takes the credential mapping (keys documented in
 # nlapt_gui.translate_config) plus an optional httpx transport (tests) and
@@ -346,10 +631,29 @@ def _deepl_factory(creds: Mapping[str, str], *, transport: Any = None) -> DeepLP
     return DeepLProvider(creds.get("deepl_key", ""), transport=transport)
 
 
+def _deeplx_factory(creds: Mapping[str, str], *, transport: Any = None) -> DeepLXProvider:
+    return DeepLXProvider(
+        creds.get("deeplx_url", ""),
+        creds.get("deeplx_token", ""),
+        transport=transport,
+    )
+
+
+def _custom_factory(creds: Mapping[str, str], *, transport: Any = None) -> CustomOpenAIProvider:
+    return CustomOpenAIProvider(
+        creds.get("custom_base_url", ""),
+        creds.get("custom_api_key", ""),
+        creds.get("custom_model", ""),
+        transport=transport,
+    )
+
+
 PROVIDER_REGISTRY: dict[str, ProviderFactory] = {
     PROVIDER_GOOGLE: _google_factory,
     PROVIDER_BAIDU: _baidu_factory,
     PROVIDER_DEEPL: _deepl_factory,
+    PROVIDER_DEEPLX: _deeplx_factory,
+    PROVIDER_CUSTOM: _custom_factory,
 }
 
 
@@ -396,6 +700,35 @@ REGISTRATION_INFO: dict[str, dict[str, Any]] = {
         "note_zh": (
             "需注册:在 https://www.deepl.com/pro-api 注册获取免费 API Key"
             "(每月有免费额度)。"
+        ),
+    },
+    PROVIDER_DEEPLX: {
+        "needs_key": True,
+        "url": "https://deeplx.owo.network/endpoints/free.html",
+        "note_zh": (
+            "DeepLX 免费接口,无需官方 DeepL Key。"
+            "填写自建地址或社区实例(列表: "
+            "https://deeplx.owo.network/endpoints/free.html )。"
+            "自建启用了 -token 时再填访问令牌。"
+            "地址与令牌保存在「文档/NLapt/api.json」。"
+            "社区实例常限流(HTTP 429/418)，自建更稳。"
+        ),
+    },
+    PROVIDER_LOCAL_MT: {
+        "needs_key": True,
+        "url": "https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF",
+        "note_zh": (
+            "本地 Hy-MT2 翻译模型,走本机 llama-server,无需联网。"
+            "选择档位后点「管理模型」下载。快速=1.8B 2bit,"
+            "均衡=1.8B Q4,高质量=7B Q4。"
+        ),
+    },
+    PROVIDER_CUSTOM: {
+        "needs_key": True,
+        "url": "",
+        "note_zh": (
+            "OpenAI 兼容接口。填写 Base URL、模型与可选 API Key。"
+            "密钥保存在「文档/NLapt/api.json」，不写入应用配置目录。"
         ),
     },
 }

@@ -19,14 +19,14 @@ into the vision bridge).
 
 from __future__ import annotations
 
-import math
-
 from PySide6.QtCore import (
+    QAbstractAnimation,
     Property,
     QEasingCurve,
     QPoint,
     QPropertyAnimation,
     QRectF,
+    QSize,
     Qt,
     Signal,
 )
@@ -56,6 +56,7 @@ from nlapt_gui.widgets.file_panel_infer import (
     build_infer_actions,
     popup_infer_menu,
 )
+from nlapt_gui.widgets.folder_grid import _ThumbGrid
 from nlapt_gui.widgets.thumb_cells import (
     ListRow,
     ThumbCell,
@@ -76,7 +77,6 @@ TOOL_ICON_PX = 13
 SEARCH_HEIGHT = 30
 SEG_BUTTON_W = 52
 SEG_BUTTON_H = 24
-GRID_GAP = 10
 LIST_GAP = 6
 GROUP_HEADER_H = 27
 HEADER_INSET = (6, 0, 6, 0)
@@ -92,6 +92,7 @@ _MAX_WIDGET_H = 16_777_215  # Qt QWIDGETSIZE_MAX
 # Exact strings from the design.
 SEARCH_PLACEHOLDER = "搜索文件名 / 标签…"
 TEXT_SELECT_ALL = "全选"
+TIP_SELECT_FILTERED = "选中搜索结果 / 清除选择（当前匹配 {n} 张）"
 TEXT_SELECTED_FMT = "已选 {n}"
 TEXT_CLEAR = "清除"
 TEXT_NO_MATCH = "没有匹配的文件"
@@ -104,8 +105,8 @@ VIEW_TIPS = {"list": "详细列表", "mid": "中图网格", "big": "大图网格
 VIEW_LABELS = {"list": "列表", "mid": "中图", "big": "大图"}
 # ALL row + folder checkbox strings.
 TEXT_ALL_ROW = "ALL"
-TIP_FOLDER_CHECK = "选中 / 取消选中整个文件夹"
-TIP_ALL_CHECK = "选中 / 取消选中全部文件"
+TIP_FOLDER_CHECK = "选中 / 取消选中此文件夹内的搜索结果"
+TIP_ALL_CHECK = "选中 / 取消选中全部文件（包含搜索隐藏项）"
 
 # Selection coverage -> Qt check state (folder checkbox + ALL row).
 _COVERAGE_STATES = {
@@ -138,16 +139,18 @@ class _Arrow(QWidget):
     def animate_to(self, open_: bool) -> None:
         end = ARROW_OPEN_DEG if open_ else ARROW_CLOSED_DEG
         ui_anim.stop_animation(self._anim)
-        self._anim = None
         if not ui_anim.animations_enabled():
             self._set_angle(end)
             return
-        motion = QPropertyAnimation(self, b"angle", self)
+        motion = self._anim
+        if motion is None:
+            motion = QPropertyAnimation(self, b"angle", self)
+            self._anim = motion
+        motion.setStartValue(self._angle)
+        motion.setEndValue(end)
         motion.setDuration(COLLAPSE_MS)
         motion.setEasingCurve(QEasingCurve.Type.OutCubic)
-        motion.setEndValue(end)
         motion.start()
-        self._anim = motion
 
     def paintEvent(self, event: QPaintEvent) -> None:  # noqa: N802 - Qt override
         painter = QPainter(self)
@@ -160,36 +163,12 @@ class _Arrow(QWidget):
         painter.end()
 
 
-class _ThumbGrid(QWidget):
-    """Reflowing grid: auto-fill minmax(min_w, 1fr) columns like the design."""
+class _FolderViewport(QWidget):
+    """Allow the natural-height body to be clipped all the way to zero."""
 
-    def __init__(self, cells: list[ThumbCell], min_w: int, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self._cells = cells
-        self._min_w = max(1, min_w)
-        for cell in cells:
-            cell.setParent(self)
-
-    def resizeEvent(self, event: QResizeEvent) -> None:  # noqa: N802 - Qt override
-        super().resizeEvent(event)
-        self._relayout()
-
-    def _relayout(self) -> None:
-        width = self.width()
-        if not self._cells or width < self._min_w // 2:
-            return
-        cols = max(1, (width + GRID_GAP) // (self._min_w + GRID_GAP))
-        cell_w = (width - GRID_GAP * (cols - 1)) / cols
-        cell_h = round(cell_w * 4 / 3)  # design aspect-ratio 3/4
-        for index, cell in enumerate(self._cells):
-            row, col = divmod(index, cols)
-            x = round(col * (cell_w + GRID_GAP))
-            right = round((col + 1) * (cell_w + GRID_GAP)) - GRID_GAP
-            cell.setGeometry(x, row * (cell_h + GRID_GAP), right - x, cell_h)
-        rows = math.ceil(len(self._cells) / cols)
-        height = rows * cell_h + (rows - 1) * GRID_GAP if rows else 0
-        if self.height() != height:
-            self.setFixedHeight(height)
+    def minimumSizeHint(self) -> QSize:  # noqa: N802 - Qt override
+        hint = super().minimumSizeHint()
+        return QSize(hint.width(), 0)
 
 
 class _FolderGroup(QWidget):
@@ -208,10 +187,13 @@ class _FolderGroup(QWidget):
         self.folder = folder
         self._open = open_
         self._anim: QPropertyAnimation | None = None
+        self._body = content
 
         box = QVBoxLayout(self)
         box.setContentsMargins(0, 0, 0, 0)
         box.setSpacing(0)
+        # Parent height can lag one frame behind the animated content height.
+        box.setAlignment(Qt.AlignmentFlag.AlignTop)
 
         self.header = QPushButton(self)
         self.header.setFixedHeight(GROUP_HEADER_H)
@@ -249,12 +231,13 @@ class _FolderGroup(QWidget):
         header_lay.addWidget(self.count_label)
         box.addWidget(self.header)
 
-        self._content = QWidget(self)
+        self._content = _FolderViewport(self)
         content_lay = QVBoxLayout(self._content)
         content_lay.setContentsMargins(2, 6, 2, 6)
         content_lay.setSpacing(0)
-        content_lay.addWidget(content)
+        content_lay.addWidget(content, 0, Qt.AlignmentFlag.AlignTop)
         box.addWidget(self._content)
+        self._sync_body_height()
         if not open_:
             self._content.setMaximumHeight(0)
 
@@ -264,6 +247,11 @@ class _FolderGroup(QWidget):
     @property
     def is_open(self) -> bool:
         return self._open
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802 - Qt override
+        """Reserve the visible clip height in the outer scroll layout."""
+        hint = super().minimumSizeHint()
+        return QSize(hint.width(), self.sizeHint().height())
 
     def set_check_state(self, coverage: str) -> None:
         """Reflect the folder's selection coverage ('all'|'some'|'none')."""
@@ -278,46 +266,59 @@ class _FolderGroup(QWidget):
     def _on_header_clicked(self) -> None:
         self._panel._toggle_folder(self)
 
+    def _sync_body_height(self) -> int:
+        """Keep the animated viewport's child at its natural, never-compressed height."""
+        natural = max(
+            self._body.sizeHint().height(),
+            self._content.sizeHint().height() - self._content.layout().contentsMargins().top()
+            - self._content.layout().contentsMargins().bottom(),
+            0,
+        )
+        self._body.setMinimumHeight(natural)
+        self._body.setMaximumHeight(natural)
+        self._body.setFixedHeight(natural)
+        return natural
+
     def set_open(self, open_: bool, animate: bool) -> None:
         if open_ == self._open:
             return
         self._open = open_
         ui_anim.stop_animation(self._anim)
-        self._anim = None
-        visible = self._content.height()
+        natural = self._sync_body_height() + 12
+        visible = max(0, self._content.height())
         if not animate or not ui_anim.animations_enabled():
             self._content.setMaximumHeight(_MAX_WIDGET_H if open_ else 0)
             self.arrow._set_angle(ARROW_OPEN_DEG if open_ else ARROW_CLOSED_DEG)
             return
         self.arrow.animate_to(open_)
-        # Pin max-height to the *visible* height first. After expand we lift
-        # it to QWIDGETSIZE_MAX; a 0→0 tween then leaves that sentinel in
-        # place and the folder looks stuck open.
-        if visible <= 0:
-            visible = max(self._content.sizeHint().height(), 0)
         if open_:
-            self._content.setMaximumHeight(_MAX_WIDGET_H)
-            target = max(self._content.sizeHint().height(), 1)
+            target = natural
             self._content.setMaximumHeight(visible)
-        elif visible <= 0:
-            self._content.setMaximumHeight(0)
-            return
         else:
             target = 0
             self._content.setMaximumHeight(visible)
-        motion = QPropertyAnimation(self._content, b"maximumHeight", self)
-        motion.setDuration(COLLAPSE_MS)
-        motion.setEasingCurve(QEasingCurve.Type.OutCubic)
+        motion = self._anim
+        if motion is None:
+            motion = QPropertyAnimation(self._content, b"maximumHeight", self)
+            motion.finished.connect(self._unlock_content_height)
+            self._anim = motion
         motion.setStartValue(visible)
         motion.setEndValue(target)
-        if open_:
-            motion.finished.connect(self._unlock_content_height)
+        motion.setDuration(COLLAPSE_MS)
+        motion.setEasingCurve(QEasingCurve.Type.OutCubic)
         motion.start()
-        self._anim = motion
 
     def _unlock_content_height(self) -> None:
         if self._open:
             self._content.setMaximumHeight(_MAX_WIDGET_H)
+
+    def resizeEvent(self, event: QResizeEvent) -> None:  # noqa: N802 - Qt override
+        super().resizeEvent(event)
+        natural = self._sync_body_height() + 12
+        if self._open and self._anim is None:
+            self._content.setMaximumHeight(_MAX_WIDGET_H)
+        elif self._anim is not None and self._anim.state() == QAbstractAnimation.State.Running:
+            self._anim.setEndValue(natural if self._open else 0)
 
 
 class _AllRow(QWidget):
@@ -331,6 +332,7 @@ class _AllRow(QWidget):
         super().__init__(parent)
         self._panel = panel
         self.setFixedHeight(GROUP_HEADER_H)
+        self.setToolTip(TIP_ALL_CHECK)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(
             lambda pos: panel.show_infer_menu(None, self, pos)
@@ -495,6 +497,7 @@ class FilePanel(QFrame):
         self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self._groups_host = QWidget(self._scroll)
         self._groups_lay = QVBoxLayout(self._groups_host)
         self._groups_lay.setContentsMargins(12, 0, 12, 10)
@@ -616,7 +619,7 @@ class FilePanel(QFrame):
     # -- interactions -----------------------------------------------------------------
     def _on_select_all_clicked(self, checked: bool) -> None:
         if checked:
-            self._controller.select_all()
+            self._controller.select_filtered()
         else:
             self._controller.clear_selection()
 
@@ -629,7 +632,7 @@ class FilePanel(QFrame):
             controller.select_all()
 
     def _on_folder_check_clicked(self, folder: str) -> None:
-        """Folder checkbox: partial/none -> select the folder; full -> clear it."""
+        """Toggle selection of the matching files within this folder."""
         state = self._controller.folder_selection_state(folder)
         self._controller.set_folder_selected(folder, state != "all")
 
@@ -683,9 +686,17 @@ class FilePanel(QFrame):
         controller = self._controller
         selected = len(controller.selected_keys())
         total = len(controller.keys())
+        filtered = controller.filtered_keys()
+        matched_selected = sum(controller.is_selected(key) for key in filtered)
+        matched_state = (
+            Qt.CheckState.Checked if filtered and matched_selected == len(filtered)
+            else Qt.CheckState.PartiallyChecked if matched_selected else Qt.CheckState.Unchecked
+        )
         self.selected_label.setText(TEXT_SELECTED_FMT.format(n=selected))
         self.select_all_box.blockSignals(True)
-        self.select_all_box.setChecked(total > 0 and selected == total)
+        self.select_all_box.setCheckState(matched_state)
+        self.select_all_box.setEnabled(bool(filtered))
+        self.select_all_box.setToolTip(TIP_SELECT_FILTERED.format(n=len(filtered)))
         self.select_all_box.blockSignals(False)
         coverage = "all" if total and selected == total else "some" if selected else "none"
         self.all_row.refresh(coverage, total)

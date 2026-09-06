@@ -139,7 +139,7 @@ class TestAnimHelpers:
         widget.show()
         result = anim.pop_in(widget)
         assert result is None
-        assert widget.graphicsEffect().opacity() == pytest.approx(1.0)
+        assert widget.graphicsEffect() is None
         widget.deleteLater()
 
     def test_fade_in_enabled_returns_animation_and_ends_opaque(self, qapp) -> None:
@@ -156,12 +156,14 @@ class TestAnimHelpers:
     def test_pop_in_enabled_returns_animation(self, qapp) -> None:
         anim.set_animations_enabled(True)
         widget = QWidget()
-        widget.resize(140, 60)
+        widget.setGeometry(10, 10, 140, 60)
         widget.show()
+        final = widget.geometry()
         animation = anim.pop_in(widget, ms=140)
         assert isinstance(animation, QAbstractAnimation)
         animation.setCurrentTime(animation.duration())
-        assert widget.graphicsEffect().opacity() == pytest.approx(1.0)
+        assert widget.geometry() == final
+        assert widget.graphicsEffect() is None
         widget.deleteLater()
 
     def test_slide_geometry_disabled_jumps_to_end(self, qapp) -> None:

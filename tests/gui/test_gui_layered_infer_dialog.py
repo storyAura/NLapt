@@ -5,13 +5,22 @@ from __future__ import annotations
 from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtWidgets import QDialog
 
+from nlapt.core.config import LLMProfile
+
+from nlapt_gui.cha_config import API_MODE_OWN, CHASettings
 from nlapt_gui.layered_prompts import build_scene_prompt, format_card_stats
 from nlapt_gui.layered_store import LayeredMemory
 from nlapt_gui.prompt_store import ENGINE_LLM
+from nlapt_gui.widgets.layered_infer_cards import CARD_MODEL_FMT, PLACEHOLDER_ZH
+from nlapt_gui.widgets.layered_infer_cards import CARDS_SCROLL_HINT
 from nlapt_gui.widgets.layered_infer_dialog import (
+    ENGINE_LOCAL_TEXT,
+    LABEL_BATCH_MODEL_FMT,
     PAGE_CARDS,
     PAGE_CONFIRM,
     PAGE_ROLE,
+    STATUS_TRANSLATING,
+    TRANSLATE_FAILED_FMT,
     LayeredInferDialog,
 )
 
@@ -23,9 +32,12 @@ class FakeVision(QObject):
         super().__init__()
         self.batch_calls: list[dict[str, object]] = []
         self.custom_calls: list[tuple[str, str, str]] = []
+        self.custom_profiles: list[LLMProfile | None] = []
         self._ready = True
 
-    def configured(self, engine: str = ENGINE_LLM) -> bool:  # noqa: ARG002
+    def configured(
+        self, engine: str = ENGINE_LLM, *, profile: LLMProfile | None = None
+    ) -> bool:  # noqa: ARG002
         return self._ready
 
     def request_custom(
@@ -36,8 +48,10 @@ class FakeVision(QObject):
         *,
         system: str,  # noqa: ARG002
         user_prompt: str,
+        profile: LLMProfile | None = None,
     ) -> bool:
         self.custom_calls.append((request_id, key, engine))
+        self.custom_profiles.append(profile)
         self.custom_ready.emit(request_id, f"CARD {request_id} {user_prompt[-24:]}", True)
         return True
 
@@ -49,6 +63,7 @@ class FakeVision(QObject):
         card_text: str,
         scene_system: str,
         scene_user: str,
+        profile: LLMProfile | None = None,
     ) -> bool:
         self.batch_calls.append(
             {
@@ -57,6 +72,7 @@ class FakeVision(QObject):
                 "card_text": card_text,
                 "scene_system": scene_system,
                 "scene_user": scene_user,
+                "profile": profile,
             }
         )
         return True
@@ -69,6 +85,24 @@ class FakeTranslate(QObject):
         self.target_ready.emit(key, text, target_lang, f"ZH:{text[:16]}", True)
 
 
+class RecordingTranslate(QObject):
+    target_ready = Signal(str, str, str, str, bool)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.requests: list[tuple[str, str, str]] = []
+
+    def request_to(self, key: str, text: str, target_lang: str) -> None:
+        self.requests.append((key, text, target_lang))
+
+
+class FailingTranslate(QObject):
+    target_ready = Signal(str, str, str, str, bool)
+
+    def request_to(self, key: str, text: str, target_lang: str) -> None:
+        self.target_ready.emit(key, text, target_lang, "Google 翻译返回 HTTP 429", False)
+
+
 def _open(
     qtbot,
     controller,
@@ -77,15 +111,18 @@ def _open(
     florence: bool = False,
     memory: LayeredMemory | None = None,
     keys: tuple[str, ...] = ("0001.png", "0002.png"),
+    translate: QObject | None = None,
+    cha_settings: CHASettings | None = None,
 ) -> tuple[LayeredInferDialog, FakeVision]:
     bridge = vision if vision is not None else FakeVision()
     dialog = LayeredInferDialog(
         controller,
         bridge,  # type: ignore[arg-type]
         keys,
-        translate_bridge=FakeTranslate(),  # type: ignore[arg-type]
+        translate_bridge=translate or FakeTranslate(),  # type: ignore[arg-type]
         memory=memory if memory is not None else LayeredMemory(name="ema", series="monosaba"),
         florence=florence,
+        cha_settings=cha_settings,
     )
     qtbot.addWidget(dialog)
     return dialog, bridge
@@ -107,6 +144,23 @@ class TestWizard:
         for index, card in enumerate(dialog.cards):
             assert card.english_text().startswith(f"CARD card-{index}")
             assert card.chinese.text().startswith("ZH:")
+
+    def test_last_card_memory_does_not_fill_candidates(
+        self, qtbot, controller
+    ) -> None:
+        dialog, _vision = _open(
+            qtbot,
+            controller,
+            memory=LayeredMemory(
+                name="ema", series="monosaba", card_text="OLD CACHED CARD"
+            ),
+        )
+        assert dialog.name_edit.text() == "ema"
+        assert dialog.series_edit.text() == "monosaba"
+        assert dialog.cards[0].english_text() == ""
+        assert dialog.cards[0].chinese.text() == PLACEHOLDER_ZH
+        dialog.next_button.click()
+        assert "OLD CACHED CARD" not in dialog.cards[0].english_text()
 
     def test_confirm_calls_layered_batch(self, qtbot, controller) -> None:
         dialog, vision = _open(qtbot, controller)
@@ -166,3 +220,86 @@ class TestWizard:
         dialog.next_button.click()
         assert dialog.confirm_card_stats.text() == format_card_stats("alpha beta gamma")
         assert "tokens" in dialog.confirm_scene_stats.text()
+
+    def test_translate_failure_shows_message(self, qtbot, controller) -> None:
+        dialog, _vision = _open(qtbot, controller, translate=FailingTranslate())
+        dialog.next_button.click()
+        expected = TRANSLATE_FAILED_FMT.format(message="Google 翻译返回 HTTP 429")
+        for card in dialog.cards:
+            assert card.chinese.text() == expected
+            assert PLACEHOLDER_ZH not in card.chinese.text()
+
+    def test_zh_queue_is_serial(self, qtbot, controller) -> None:
+        translate = RecordingTranslate()
+        dialog, _vision = _open(qtbot, controller, translate=translate)
+        dialog.next_button.click()
+        assert len(translate.requests) == 1
+        assert translate.requests[0][0] == "card-0"
+        assert dialog.status_label.text() == STATUS_TRANSLATING
+        assert dialog.cards[0].chinese.text() == PLACEHOLDER_ZH
+        assert dialog.cards[1].chinese.text() == PLACEHOLDER_ZH
+        first_en = dialog.cards[0].english_text()
+        translate.target_ready.emit("card-0", first_en, "zh", "第一张中文", True)
+        assert dialog.cards[0].chinese.text() == "第一张中文"
+        assert len(translate.requests) == 2
+        assert translate.requests[1][0] == "card-1"
+        assert dialog.status_label.text() == STATUS_TRANSLATING
+        second_en = dialog.cards[1].english_text()
+        translate.target_ready.emit("card-1", second_en, "zh", "第二张中文", True)
+        assert len(translate.requests) == 3
+        assert translate.requests[2][0] == "card-2"
+        third_en = dialog.cards[2].english_text()
+        translate.target_ready.emit("card-2", third_en, "zh", "第三张中文", True)
+        assert dialog.cards[2].chinese.text() == "第三张中文"
+        assert dialog.status_label.text() != STATUS_TRANSLATING
+
+    def test_long_chinese_does_not_grow_dialog(self, qtbot, controller) -> None:
+        dialog, _vision = _open(qtbot, controller)
+        dialog.next_button.click()
+        hint_before = dialog.cards_scroll.sizeHint()
+        assert hint_before.height() == CARDS_SCROLL_HINT.height()
+        blob = "对照文字很长。" * 200
+        for card in dialog.cards:
+            card.set_chinese(blob)
+        dialog.adjustSize()
+        assert dialog.cards_scroll.sizeHint() == hint_before
+        assert dialog.height() < 900
+        assert blob[:12] in dialog.cards[0].chinese.text()
+
+    def test_per_card_models_label_and_batch_profile(self, qtbot, controller) -> None:
+        settings = CHASettings(
+            api_mode=API_MODE_OWN,
+            api_type="openai",
+            base_url="http://cha.local",
+            card_models=("alpha-vis", "beta-vis", "gamma-vis"),
+            batch_model="batch-vis",
+        )
+        dialog, vision = _open(qtbot, controller, cha_settings=settings)
+        dialog.next_button.click()
+        models = [
+            profile.vision_model if profile is not None else None
+            for profile in vision.custom_profiles
+        ]
+        assert models == ["alpha-vis", "beta-vis", "gamma-vis"]
+        assert dialog.cards[0].model_label.text() == CARD_MODEL_FMT.format(
+            model="alpha-vis"
+        )
+        assert dialog.cards[1].model_label.text() == CARD_MODEL_FMT.format(
+            model="beta-vis"
+        )
+        dialog.next_button.click()
+        assert dialog.confirm_model.text() == LABEL_BATCH_MODEL_FMT.format(
+            model="batch-vis"
+        )
+        dialog.next_button.click()
+        profile = vision.batch_calls[0]["profile"]
+        assert isinstance(profile, LLMProfile)
+        assert profile.vision_model == "batch-vis"
+
+    def test_local_engine_shows_local_model_label(self, qtbot, controller) -> None:
+        dialog, _vision = _open(qtbot, controller)
+        dialog.engine_local.setChecked(True)
+        dialog.next_button.click()
+        assert dialog.cards[0].model_label.text() == CARD_MODEL_FMT.format(
+            model=ENGINE_LOCAL_TEXT
+        )

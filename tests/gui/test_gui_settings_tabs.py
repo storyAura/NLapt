@@ -19,12 +19,14 @@ from nlapt.core.errors import LLMRequestError
 from nlapt.llm.base import register_client
 from nlapt.llm.mock import MockLLMClient
 
+from nlapt_gui.api_config import load_app_config, save_app_config
 from nlapt_gui.controller import AppController
 from nlapt_gui.prompt_store import load_vision_prompts
 from nlapt_gui.settings import UISettings
 from nlapt_gui.widgets.dialogs import CenteredDialog
 from nlapt_gui.widgets.model_picker import VISION_TAG, ModelPickerDialog
 from nlapt_gui.widgets.settings_dialog import (
+    TAB_CHA,
     TAB_LLM,
     TAB_LOCAL,
     TAB_PROMPTS,
@@ -51,10 +53,10 @@ def _make_dialog(qtbot, controller: AppController) -> SettingsDialog:
 
 
 class TestTabs:
-    def test_four_tabs_in_order(self, qtbot, dlg_controller) -> None:
+    def test_five_tabs_in_order(self, qtbot, dlg_controller) -> None:
         dialog = _make_dialog(qtbot, dlg_controller)
         labels = [dialog.tabs.tabText(i) for i in range(dialog.tabs.count())]
-        assert labels == [TAB_TRANSLATE, TAB_LLM, TAB_PROMPTS, TAB_LOCAL]
+        assert labels == [TAB_TRANSLATE, TAB_LLM, TAB_PROMPTS, TAB_LOCAL, TAB_CHA]
 
     def test_is_a_centered_fading_dialog(self, qtbot, dlg_controller) -> None:
         dialog = _make_dialog(qtbot, dlg_controller)
@@ -108,9 +110,10 @@ class TestUnifiedModel:
         dialog.unified_check.setChecked(True)
         with qtbot.waitSignal(dialog.saved, timeout=1000):
             dialog.save_button.click()
-        stored = load_config(config_path())
+        stored = load_app_config()
         profile = stored.profiles[0]
         assert profile.text_model == profile.vision_model == "text-model-1"
+        assert "text-model-1" not in config_path().read_text(encoding="utf-8")
 
     def test_prefill_detects_unified(self, qtbot, dlg_controller) -> None:
         profile = LLMProfile(
@@ -120,7 +123,7 @@ class TestUnifiedModel:
             text_model="shared",
             vision_model="shared",
         )
-        save_config(config_path(), AppConfig(profiles=(profile,), active_profile="default"))
+        save_app_config(AppConfig(profiles=(profile,), active_profile="default"))
         dialog = SettingsDialog(dlg_controller, api_types=(API_TYPE,))
         qtbot.addWidget(dialog)
         assert dialog.unified_check.isChecked()
@@ -133,7 +136,7 @@ class TestUnifiedModel:
             text_model="t1",
             vision_model="v1",
         )
-        save_config(config_path(), AppConfig(profiles=(profile,), active_profile="default"))
+        save_app_config(AppConfig(profiles=(profile,), active_profile="default"))
         dialog = SettingsDialog(dlg_controller, api_types=(API_TYPE,))
         qtbot.addWidget(dialog)
         assert not dialog.unified_check.isChecked()

@@ -16,3 +16,12 @@ def _isolate_nlapt_data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     in the developer's real ``%APPDATA%/NLapt``.
     """
     monkeypatch.setenv("NLAPT_DATA_DIR", str(tmp_path / "nlapt-data"))
+    monkeypatch.setenv("NLAPT_DOCUMENTS_DIR", str(tmp_path / "documents"))
+
+
+@pytest.fixture(autouse=True)
+def _quiet_deeplx_limiter() -> None:
+    """DeepLX's process-wide limiter must not sleep between tests."""
+    from nlapt.llm.web_translate import reset_deeplx_limiter
+
+    reset_deeplx_limiter(min_interval=0.0)

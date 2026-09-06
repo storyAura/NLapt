@@ -11,19 +11,41 @@ Pure functions — no Qt. Chinese UI strings live at the module top.
 from __future__ import annotations
 
 # -- UI / history labels -------------------------------------------------------
-LAYERED_BATCH_DESCRIPTION_FMT = "分层推标 · {n} 张"
-LAYERED_BATCH_HISTORY = "分层推标"
+LAYERED_BATCH_DESCRIPTION_FMT = "CHA标注 · {n} 张"
+LAYERED_BATCH_HISTORY = "CHA标注"
 TIP_FLORENCE_NO_LAYERED = "当前本地模型是 Florence-2,不支持自定义提示词,请改用 LLM"
 # Heuristic: English averages ~4 characters per token (no tokenizer in-app).
 CHARS_PER_TOKEN = 4
 CARD_STATS_FMT = "约 {tokens} tokens · {words} 词"
 
-# -- Character-card skill (appearance + clothing only) -------------------------
+# -- Character-card skills (appearance first, then clothing) -------------------
+# Two named skills are filled into one card so the model cannot start with
+# shoes / jacket. Appearance is always written out before any garment.
+CARD_APPEARANCE_SKILL = """\
+Appearance skill (write this block first, before any clothing):
+- Hair: color, length, cut, bangs, highlights, and how it is worn \
+(loose, tied, twintails, ribbons, clips). No mood words.
+- Eyes: iris color; pupil color and pupil shape when visible \
+(round, slit, cross, ring, symbol). Do not mention gaze direction.
+- Other fixed face/body facts only if clearly visible: glasses, a mark, \
+horns, or species traits that are part of the design (e.g. animal ears \
+worn as appearance). No expression, emotion, or gaze.
+"""
+
+CARD_CLOTHING_SKILL = """\
+Clothing skill (write this block second, after appearance is complete):
+- Full outfit from head to shoes: headwear, outerwear, inner layers, \
+bottoms, hosiery, footwear, bags, jewelry, harnesses, straps, and other \
+worn accessories.
+- Name colors and construction when visible (pleated, ruffled, \
+cold-shoulder, crossed straps, cropped, oversized).
+"""
+
 CHARACTER_CARD_PROMPT = """\
 You are an image analysis system. Output English only.
 
-Write one short objective paragraph that identifies the named subject and \
-lists only their visible fixed appearance and full outfit.
+Write one short objective paragraph that identifies the named subject \
+and lists only their visible fixed appearance and full outfit.
 
 Lead sentence must start with this exact opening: "{opening}"
 Then continue in the same paragraph.
@@ -31,17 +53,11 @@ Then continue in the same paragraph.
 Subject naming: refer to the primary subject only as {name} (or a pronoun \
 after the first mention). Do not invent other proper names.
 
-Include only what is visible:
-- Hair: color, length, style (cut, bangs, ties). No mood words.
-- Face-structure facts only if clearly visible (e.g. glasses, a mark) — \
-not expression, gaze, or emotion.
-- Full clothing from head to shoes, including headwear, outerwear, inner \
-layers, bottoms, hosiery, footwear, bags, jewelry, harnesses, and other \
-worn accessories. Name colors and construction (pleated, ruffled, \
-cold-shoulder, crossed straps) when they are visible.
-- Species or body-covering traits that are costume-like (e.g. animal ears \
-that are part of the design) only if worn/attached as appearance, not pose.
+Required order (do not invert, do not interleave):
+1. Appearance skill — hair, eyes / pupils, then other fixed face facts.
+2. Clothing skill — the full outfit, only after appearance is finished.
 
+""" + CARD_APPEARANCE_SKILL + "\n" + CARD_CLOTHING_SKILL + """
 Hard bans (never include):
 - Pose, stance, weight shift, gestures, hand position, or motion.
 - Facial expression, gaze direction, emotion, or demeanor.
@@ -54,6 +70,8 @@ Hard bans (never include):
 - Speculation, narrative, praise, or criticism.
 
 Output format: one complete English paragraph. No title, bullets, or notes.
+The paragraph MUST finish all appearance facts before the first garment \
+word (jacket, dress, skirt, shirt, socks, shoes, …).
 """
 
 # -- Pose/scene skill (SKILL.md, no clothing / appearance) ---------------------
@@ -118,11 +136,12 @@ summaries, introductions, or trailing notes before or after the paragraph.
 
 # Extra user-line so three concurrent card calls do not collapse to one wording.
 CARD_VARIANT_HINTS: tuple[str, ...] = (
-    "This is alternative 1 of 3: lead with headwear and outer layers.",
-    "This is alternative 2 of 3: lead with inner garments and accessories; "
-    "rephrase; do not copy another alternative.",
-    "This is alternative 3 of 3: lead with footwear and lower garments; "
-    "use a different sentence order.",
+    "This is alternative 1 of 3: after the opening, give more hair detail "
+    "(part, ties, highlights), then clothing. Never start with garments.",
+    "This is alternative 2 of 3: after the opening, give more eye/pupil "
+    "detail, then clothing. Rephrase; do not copy another alternative.",
+    "This is alternative 3 of 3: keep appearance-first order, then be more "
+    "specific about clothing construction. Do not lead with footwear.",
 )
 
 # Words the pose/scene skill must forbid (self-check / tests).

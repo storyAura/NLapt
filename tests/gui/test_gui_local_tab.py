@@ -14,6 +14,7 @@ from nlapt.local.catalog import all_series, families_for
 from nlapt.local.hardware import GIB, GpuInfo, HardwareInfo
 from nlapt.local.settings import LocalSettings, load_local_settings, save_local_settings
 
+from nlapt_gui.api_config import load_app_config
 from nlapt_gui.controller import AppController
 from nlapt_gui.local_bridge import LocalBridge
 from nlapt_gui.resources import app_data_dir
@@ -324,10 +325,10 @@ class TestDownloadFlow:
                 progress(int(expected_bytes or 0), int(expected_bytes or 0))
             return dest
 
-        monkeypatch.setattr("nlapt_gui.local_bridge.download_file", fake_download)
+        monkeypatch.setattr("nlapt_gui.download_hub.download_file", fake_download)
         # The runtime auto-provision job must stay hermetic in tests.
         monkeypatch.setattr(
-            "nlapt_gui.local_bridge.ensure_runtime",
+            "nlapt_gui.download_hub.ensure_runtime",
             lambda base_dir, **kw: tmp_path / "llama-server.exe",
         )
         tab = make_tab(qtbot, tab_controller)
@@ -357,7 +358,7 @@ class TestDownloadFlow:
             assert cancel.wait(timeout=5)
             raise DownloadCancelledError("下载已取消")
 
-        monkeypatch.setattr("nlapt_gui.local_bridge.download_file", blocking_download)
+        monkeypatch.setattr("nlapt_gui.download_hub.download_file", blocking_download)
         starter = LocalBridge(manager=FakeManager())
         starter.update_settings(
             server_path="srv.exe",  # keep the runtime provision job out
@@ -432,7 +433,7 @@ class TestApplyProfile:
         tab.port_spin.setValue(2222)
         assert tab.apply_button.isEnabled()
         tab.apply_button.click()
-        stored = load_config(config_path())
+        stored = load_app_config()
         assert stored.active_profile == "local"
         profile = stored.profiles[0]
         assert profile.name == "local"
@@ -441,6 +442,7 @@ class TestApplyProfile:
         assert profile.text_model == "joycaption-beta-one"
         assert profile.vision_model == "joycaption-beta-one"
         assert stored.request.concurrency == 4
+        assert "127.0.0.1:2222" not in config_path().read_text(encoding="utf-8")
         assert any("已切换到本地模型" in text for text, _ in tab_toasts)
 
     def test_apply_text_only_family_leaves_vision_empty(
@@ -452,8 +454,9 @@ class TestApplyProfile:
             quant_item(tab, "gemma4-26b-a4b-heretic", "i1-Q4_K_M")
         )
         tab.apply_button.click()
-        stored = load_config(config_path())
+        stored = load_app_config()
         assert stored.profiles[0].vision_model == ""
+        assert load_config(config_path()).profiles == ()
 
     def test_apply_with_unreadable_config_refuses(
         self, qtbot, tab_controller, tab_toasts, monkeypatch

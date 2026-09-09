@@ -12,6 +12,7 @@ from nlapt.local.mt_catalog import (
     ALL_MT_MODELS,
     KNOWN_TIERS,
     MT_CATALOG_SNAPSHOT_DATE,
+    MT_PARAGRAPH_SEPARATOR,
     TIER_BALANCED,
     TIER_FAST,
     TIER_QUALITY,
@@ -21,6 +22,7 @@ from nlapt.local.mt_catalog import (
     mt_download_url,
     mt_model_path,
     mt_tier_dir,
+    split_mt_paragraphs,
 )
 
 
@@ -104,3 +106,29 @@ class TestHyMTPrompt:
     def test_unknown_lang_raises(self) -> None:
         with pytest.raises(ValidationError):
             hymt_prompt("hi", "fr")
+
+
+class TestSplitParagraphs:
+    def test_single_paragraph_is_one_item(self) -> None:
+        assert split_mt_paragraphs("a red dress, long hair") == ("a red dress, long hair",)
+
+    def test_blank_line_splits(self) -> None:
+        assert split_mt_paragraphs("Hsin has white hair.\n\nHsin sits on a chair.") == (
+            "Hsin has white hair.",
+            "Hsin sits on a chair.",
+        )
+
+    def test_extra_blank_lines_and_whitespace_are_dropped(self) -> None:
+        text = "\n\n  first  \n\n\n\n second \n \n third\n\n"
+        assert split_mt_paragraphs(text) == ("first", "second", "third")
+
+    def test_single_newline_stays_inside_paragraph(self) -> None:
+        assert split_mt_paragraphs("line one\nline two") == ("line one\nline two",)
+
+    def test_separator_roundtrip(self) -> None:
+        paragraphs = ("one", "two")
+        assert split_mt_paragraphs(MT_PARAGRAPH_SEPARATOR.join(paragraphs)) == paragraphs
+
+    def test_non_string_raises(self) -> None:
+        with pytest.raises(ValidationError):
+            split_mt_paragraphs(None)  # type: ignore[arg-type]

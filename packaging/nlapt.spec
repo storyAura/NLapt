@@ -13,12 +13,39 @@ PyInstaller injects ``Analysis`` / ``PYZ`` / ``EXE`` / ``COLLECT`` into the
 spec's namespace at build time; this file only needs to be valid Python.
 """
 
+import importlib
 import os
 import sys
 
 from PyInstaller.utils.hooks import collect_submodules
 
 APP_NAME = "NLapt"
+
+# Runtime dependencies the code imports lazily (inside functions / via
+# importlib), so PyInstaller cannot see them statically. They are listed in
+# HIDDEN_IMPORTS below, but a hidden import that is NOT installed only produces
+# a "missing module" warning and the build still succeeds — shipping an exe
+# whose inference dies with "The 'httpx' package is required for LLM HTTP
+# clients". Fail the build loudly instead.
+REQUIRED_RUNTIME_MODULES = ("PySide6", "PIL", "httpx", "numpy", "onnxruntime")
+MISSING_RUNTIME_HINT = (
+    "Missing runtime dependencies at build time: {missing}. "
+    "Install them first: pip install -e .[gui,images,llm,local]"
+)
+
+
+def _preflight_runtime_modules() -> None:
+    missing = []
+    for module_name in REQUIRED_RUNTIME_MODULES:
+        try:
+            importlib.import_module(module_name)
+        except ImportError:
+            missing.append(module_name)
+    if missing:
+        raise SystemExit(MISSING_RUNTIME_HINT.format(missing=", ".join(missing)))
+
+
+_preflight_runtime_modules()
 # Relative paths in a spec resolve against the spec's own directory
 # (packaging/), NOT the invocation cwd — so anchor everything on SPECPATH
 # (injected by PyInstaller: the directory containing this file).

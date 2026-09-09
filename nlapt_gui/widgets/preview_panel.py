@@ -25,7 +25,6 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QColor,
-    QFont,
     QImage,
     QImageReader,
     QMouseEvent,
@@ -76,7 +75,6 @@ from nlapt_gui.widgets.thumb_cells import (
     make_icon,
     mono_font,
     tokens_for_settings,
-    ui_font,
 )
 from nlapt_gui.widgets.thumbnails import get_decode_pool
 from nlapt_gui.widgets.window_chrome import (
@@ -92,7 +90,6 @@ _LOGGER = get_logger(__name__)
 
 HEADER_H = 46
 NAV_BUTTON_PX = 28
-POS_MIN_W = 44
 DIVIDER_H = 18
 MULTI_GAP = 14
 ZOOM_BTN_PX = 26
@@ -187,54 +184,29 @@ class PreviewPanel(QFrame):
         header = self.header
         header.setProperty("panel", True)
         header.setFixedHeight(HEADER_H)
-        bar = QHBoxLayout(header)
-        bar.setContentsMargins(14, 0, 0, 0)
-        bar.setSpacing(10)
-        self.name_label = QLabel(header)
-        self.name_label.setFont(mono_font(12.5, QFont.Weight.DemiBold))
-        bar.addWidget(self.name_label)
-        self.meta_pill = QLabel(header)
-        self.meta_pill.setProperty("pill", True)
-        self.meta_pill.setProperty("mono", True)
-        bar.addWidget(self.meta_pill)
-        self.dim_label = QLabel(header)
-        self.dim_label.setProperty("muted", True)
-        self.dim_label.setFont(ui_font(11))
-        bar.addWidget(self.dim_label)
-        self.size_label = QLabel(header)
-        self.size_label.setProperty("muted", True)
-        self.size_label.setFont(ui_font(11))
-        bar.addWidget(self.size_label)
-        self.mtime_label = QLabel(header)
-        self.mtime_label.setProperty("muted", True)
-        self.mtime_label.setFont(ui_font(11))
-        bar.addWidget(self.mtime_label)
-        self.dirty_pill = QLabel(TEXT_DIRTY, header)
-        self.dirty_pill.setProperty("pill", "warn")
-        self.dirty_pill.hide()
-        bar.addWidget(self.dirty_pill)
-        self.multi_pill = QLabel(header)
-        self.multi_pill.setProperty("pill", "accentSoft")
-        self.multi_pill.hide()
-        bar.addWidget(self.multi_pill)
-        bar.addStretch(1)
         self.prev_button = self._nav_button(header, TIP_PREV, lambda: self.controller.nav(-1))
-        bar.addWidget(self.prev_button)
-        self.pos_label = QLabel(header)
-        self.pos_label.setFont(mono_font(11.5))
-        self.pos_label.setProperty("secondary", True)
-        self.pos_label.setMinimumWidth(POS_MIN_W)
-        self.pos_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        bar.addWidget(self.pos_label)
         self.next_button = self._nav_button(header, TIP_NEXT, lambda: self.controller.nav(1))
-        bar.addWidget(self.next_button)
         tokens = self._tokens
         self.min_button = WindowButton(KIND_MIN, tokens, header)
         self.max_button = WindowButton(KIND_MAX, tokens, header)
         self.close_button = WindowButton(KIND_CLOSE, tokens, header)
         wire_window_buttons(self.min_button, self.max_button, self.close_button, self)
-        for button in (self.min_button, self.max_button, self.close_button):
-            bar.addWidget(button)
+        header.build_controls(
+            dirty_text=TEXT_DIRTY,
+            prev_button=self.prev_button,
+            next_button=self.next_button,
+            min_button=self.min_button,
+            max_button=self.max_button,
+            close_button=self.close_button,
+        )
+        self.name_label = header.name_label
+        self.meta_pill = header.meta_pill
+        self.dim_label = header.dim_label
+        self.size_label = header.size_label
+        self.mtime_label = header.mtime_label
+        self.dirty_pill = header.dirty_pill
+        self.multi_pill = header.multi_pill
+        self.pos_label = header.pos_label
         root.addWidget(header)
 
         divider = QFrame(self)
@@ -600,7 +572,7 @@ class PreviewPanel(QFrame):
         controller = self.controller
         key = controller.current_key
         if key is None:
-            self.name_label.setText("")
+            self.header.set_file_name("")
             self.meta_pill.setText("")
             self.meta_pill.hide()
             self.dim_label.setText("")
@@ -608,7 +580,7 @@ class PreviewPanel(QFrame):
             self.mtime_label.setText("")
             self.dirty_pill.hide()
             return
-        self.name_label.setText(key.rsplit("/", 1)[-1])
+        self.header.set_file_name(key.rsplit("/", 1)[-1])
         try:
             self.meta_pill.setText(controller.image_format(key))
             self.meta_pill.show()

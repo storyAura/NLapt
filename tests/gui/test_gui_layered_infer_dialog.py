@@ -8,7 +8,13 @@ from PySide6.QtWidgets import QDialog
 from nlapt.core.config import LLMProfile
 
 from nlapt_gui.cha_config import API_MODE_OWN, CHASettings
-from nlapt_gui.layered_prompts import build_scene_prompt, format_card_stats
+from nlapt_gui.layered_prompts import (
+    WARN_SPLIT_FAILED,
+    CardParts,
+    build_scene_prompt,
+    format_card_stats,
+    split_card,
+)
 from nlapt_gui.layered_store import LayeredMemory
 from nlapt_gui.prompt_store import ENGINE_LLM
 from nlapt_gui.widgets.layered_infer_cards import CARD_MODEL_FMT, PLACEHOLDER_ZH
@@ -64,6 +70,7 @@ class FakeVision(QObject):
         scene_system: str,
         scene_user: str,
         profile: LLMProfile | None = None,
+        card_parts: CardParts | None = None,
     ) -> bool:
         self.batch_calls.append(
             {
@@ -73,6 +80,7 @@ class FakeVision(QObject):
                 "scene_system": scene_system,
                 "scene_user": scene_user,
                 "profile": profile,
+                "card_parts": card_parts,
             }
         )
         return True
@@ -178,7 +186,32 @@ class TestWizard:
         assert call["keys"] == ("0001.png", "0002.png")
         assert call["engine"] == ENGINE_LLM
         assert call["card_text"] == chosen
-        assert call["scene_user"] == build_scene_prompt("ema")
+        parts = split_card(chosen, "ema")
+        assert call["card_parts"] == parts
+        assert call["scene_user"] == build_scene_prompt("ema", official_outfit=parts.outfit)
+
+    def test_confirm_page_shows_card_split(self, qtbot, controller) -> None:
+        dialog, _vision = _open(qtbot, controller)
+        dialog.next_button.click()
+        dialog.cards[0].radio.setChecked(True)
+        dialog.cards[0].set_english(
+            "ema, black hair and red eyes. She wears a red dress and black boots."
+        )
+        dialog.next_button.click()
+        assert dialog.confirm_appearance.toPlainText() == "ema, black hair and red eyes."
+        assert dialog.confirm_outfit.toPlainText() == "She wears a red dress and black boots."
+        assert dialog.confirm_split_warning.isHidden()
+        assert "She wears a red dress and black boots." in dialog.confirm_scene.toPlainText()
+
+    def test_confirm_page_warns_when_no_outfit_block(self, qtbot, controller) -> None:
+        dialog, _vision = _open(qtbot, controller)
+        dialog.next_button.click()
+        dialog.cards[0].radio.setChecked(True)
+        dialog.cards[0].set_english("ema, black hair and red eyes.")
+        dialog.next_button.click()
+        assert dialog.confirm_outfit.toPlainText() == ""
+        assert not dialog.confirm_split_warning.isHidden()
+        assert dialog.confirm_split_warning.text() == WARN_SPLIT_FAILED
 
     def test_florence_disables_local(self, qtbot, controller) -> None:
         dialog, _vision = _open(qtbot, controller, florence=True)
@@ -295,6 +328,55 @@ class TestWizard:
         profile = vision.batch_calls[0]["profile"]
         assert isinstance(profile, LLMProfile)
         assert profile.vision_model == "batch-vis"
+
+    def test_pool_ref_card_runs_on_its_own_api(self, qtbot, controller) -> None:
+        from nlapt.core.config import AppConfig, ModelRef
+
+        main = LLMProfile(
+            name="main",
+            api_type="openai",
+            base_url="http://main",
+            models=("main-vis",),
+            enabled_models=("main-vis",),
+        )
+        other = LLMProfile(
+            name="other",
+            api_type="openai",
+            base_url="http://other",
+            api_key="sk-other",
+            models=("llava",),
+            enabled_models=("llava",),
+        )
+        controller.reload_config(
+            AppConfig(
+                profiles=(main, other),
+                text_target=ModelRef("main", "main-vis"),
+                vision_target=ModelRef("main", "main-vis"),
+            )
+        )
+        settings = CHASettings(
+            card_models=(ModelRef("other", "llava"), "typed-vis", ModelRef()),
+            batch_model=ModelRef("other", "llava"),
+        )
+        dialog, vision = _open(qtbot, controller, cha_settings=settings)
+        dialog.next_button.click()
+        profiles = vision.custom_profiles
+        assert [p.base_url for p in profiles] == ["http://other", "http://main", "http://main"]
+        assert [p.vision_model for p in profiles] == ["llava", "typed-vis", "main-vis"]
+        assert profiles[0].api_key == "sk-other"
+        # Pool picks on another API are labelled with their provider.
+        assert dialog.cards[0].model_label.text() == CARD_MODEL_FMT.format(
+            model="other · llava"
+        )
+        assert dialog.cards[1].model_label.text() == CARD_MODEL_FMT.format(model="typed-vis")
+        dialog.next_button.click()
+        assert dialog.confirm_model.text() == LABEL_BATCH_MODEL_FMT.format(
+            model="other · llava"
+        )
+        dialog.next_button.click()
+        batch_profile = vision.batch_calls[0]["profile"]
+        assert isinstance(batch_profile, LLMProfile)
+        assert batch_profile.base_url == "http://other"
 
     def test_local_engine_shows_local_model_label(self, qtbot, controller) -> None:
         dialog, _vision = _open(qtbot, controller)

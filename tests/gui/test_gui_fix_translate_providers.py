@@ -39,7 +39,6 @@ from nlapt_gui.widgets.settings_dialog import (
     TOAST_TR_NEED_KEY,
     TOAST_TR_NEED_LOCAL_MT,
     SettingsDialog,
-    config_path,
 )
 
 # Unique api_type for this module (registry is process-global).
@@ -486,8 +485,13 @@ class TestSettingsDialogProviders:
             dialog.save_button.click()
         assert (TOAST_SAVED, "ok") in toasts
         assert load_translation_config().provider == "google"
-        # Google needs no LLM profile, so config.json is left untouched.
-        assert not config_path().exists()
+        # Google needs no LLM profile: the save goes through with an empty
+        # pool (no profiles, no targets) instead of demanding LLM fields.
+        from nlapt_gui.api_config import load_app_config
+
+        saved = load_app_config()
+        assert saved.profiles == ()
+        assert not saved.text_target.is_set()
 
     def test_save_baidu_without_keys_warns(
         self, qtbot, unconfigured_controller

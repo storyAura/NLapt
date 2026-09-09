@@ -144,6 +144,82 @@ class TestLocalMTProvider:
         with pytest.raises(LLMRequestError):
             provider.translate("   ", Direction.EN_TO_ZH)
 
+    def test_multi_paragraph_caption_is_translated_per_paragraph(self, tmp_path: Path) -> None:
+        # Hy-MT2 treats everything before the last blank line as untranslated
+        # context, so a two-paragraph caption must become two requests.
+        replies = {
+            "Hsin has white hair.": "希恩有白发。",
+            "Hsin sits on a red chair.": "希恩坐在红椅上。",
+        }
+        prompts: list[str] = []
+        ensure_calls: list[int] = []
+        events: list[str] = []
+
+        class Stopper:
+            def note_request(self) -> None:
+                events.append("request")
+
+            def note_finished(self) -> None:
+                events.append("finished")
+
+        def ensure() -> str:
+            ensure_calls.append(1)
+            return "http://127.0.0.1:18435/v1"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            prompt = json.loads(request.content)["messages"][0]["content"]
+            prompts.append(prompt)
+            source = prompt.rsplit("\n\n", 1)[-1]
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": replies[source]}, "finish_reason": "stop"}]},
+            )
+
+        provider = LocalMTProvider(
+            TIER_BALANCED,
+            models_dir=tmp_path,
+            retry_sleep=lambda _delay: None,
+            transport=httpx.MockTransport(handler),
+            ensure=ensure,
+            idle_stopper=Stopper(),
+        )
+        result = provider.translate_to(
+            "Hsin has white hair.\n\n\nHsin sits on a red chair.\n", "zh"
+        )
+        assert result == "希恩有白发。\n\n希恩坐在红椅上。"
+        assert prompts == [
+            hymt_prompt("Hsin has white hair.", "zh"),
+            hymt_prompt("Hsin sits on a red chair.", "zh"),
+        ]
+        assert ensure_calls == [1]
+        assert events == ["request", "finished"]
+
+    def test_incomplete_paragraph_fails_whole_translation(self, tmp_path: Path) -> None:
+        calls: list[int] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            if len(calls) == 1:
+                return httpx.Response(
+                    200,
+                    json={"choices": [{"message": {"content": "第一段"}, "finish_reason": "stop"}]},
+                )
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": "第二"}, "finish_reason": "length"}]},
+            )
+
+        provider = LocalMTProvider(
+            TIER_BALANCED,
+            models_dir=tmp_path,
+            retry_sleep=lambda _delay: None,
+            transport=httpx.MockTransport(handler),
+            ensure=lambda: "http://127.0.0.1:18435/v1",
+            idle_stopper=_QuietStopper(),
+        )
+        with pytest.raises(LLMRequestError, match="finish_reason='length'"):
+            provider.translate_to("first paragraph\n\nsecond paragraph", "zh")
+
     @pytest.mark.parametrize("reply", [
         {},
         {"choices": []},

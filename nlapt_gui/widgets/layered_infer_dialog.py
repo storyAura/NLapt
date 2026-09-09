@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
 )
 from shiboken6 import isValid
 
-from nlapt.core.config import LLMProfile
+from nlapt.core.config import LLMProfile, ModelRef
 from nlapt.core.errors import NLaptError
 from nlapt.diagnostics import get_logger
 
@@ -32,11 +32,16 @@ from nlapt_gui.cha_config import (
     resolve_card_profile,
 )
 from nlapt_gui.controller import AppController
+from nlapt_gui.model_targets import choice_label
 from nlapt_gui.layered_prompts import (
+    LABEL_CARD_APPEARANCE,
+    LABEL_CARD_OUTFIT,
     TIP_FLORENCE_NO_LAYERED,
+    WARN_SPLIT_FAILED,
     build_card_prompt,
     build_scene_prompt,
     format_card_stats,
+    split_card,
 )
 from nlapt_gui.layered_store import LayeredMemory, load_layered_memory, save_layered_memory
 from nlapt_gui.prompt_store import ENGINE_LLM, ENGINE_LOCAL, load_vision_prompts
@@ -63,7 +68,10 @@ LABEL_REF = "参考图"
 HINT_NAME = "必填，将锁定为全程主语"
 HINT_SERIES = "选填，写入人物卡首句 name from series"
 HINT_CARDS = "审阅并编辑英文；中文仅供对照。选定一套后用于整批。"
-HINT_CONFIRM = "确认后为每张图生成画面段，并拼接「人物卡 + 空行 + 画面段」。"
+HINT_CONFIRM = (
+    "确认后为每张图生成画面段，并拼接「人物卡 + 空行 + 画面段」。"
+    "每张图会同时核对服装：与官方服装不同时保留固定外貌、改写服装段。"
+)
 LABEL_BATCH_MODEL_FMT = "整批画面模型: {model}"
 HINT_REF = "点击下方缩略图选择参考图"
 ENGINE_LLM_TEXT = "LLM"
@@ -285,12 +293,23 @@ class LayeredInferDialog(CenteredDialog):
         self.confirm_card.setReadOnly(True)
         self.confirm_card_stats = QLabel(format_card_stats(""), page)
         self.confirm_card_stats.setProperty("muted", True)
+        self.confirm_appearance = QPlainTextEdit(page)
+        self.confirm_appearance.setReadOnly(True)
+        self.confirm_outfit = QPlainTextEdit(page)
+        self.confirm_outfit.setReadOnly(True)
+        self.confirm_split_warning = QLabel(WARN_SPLIT_FAILED, page)
+        self.confirm_split_warning.setProperty("muted", True)
+        self.confirm_split_warning.hide()
         self.confirm_scene = QPlainTextEdit(page)
         self.confirm_scene.setReadOnly(True)
         self.confirm_scene_stats = QLabel(format_card_stats(""), page)
         self.confirm_scene_stats.setProperty("muted", True)
         card_title = QLabel(LABEL_CHOSEN_CARD, page)
         card_title.setProperty("sectionTitle", True)
+        appearance_title = QLabel(LABEL_CARD_APPEARANCE, page)
+        appearance_title.setProperty("sectionTitle", True)
+        outfit_title = QLabel(LABEL_CARD_OUTFIT, page)
+        outfit_title.setProperty("sectionTitle", True)
         scene_title = QLabel(PREVIEW_SCENE, page)
         scene_title.setProperty("sectionTitle", True)
         layout = QVBoxLayout(page)
@@ -301,6 +320,11 @@ class LayeredInferDialog(CenteredDialog):
         layout.addWidget(card_title)
         layout.addWidget(self.confirm_card, 1)
         layout.addWidget(self.confirm_card_stats)
+        layout.addWidget(appearance_title)
+        layout.addWidget(self.confirm_appearance, 1)
+        layout.addWidget(outfit_title)
+        layout.addWidget(self.confirm_outfit, 1)
+        layout.addWidget(self.confirm_split_warning)
         layout.addWidget(scene_title)
         layout.addWidget(self.confirm_scene, 1)
         layout.addWidget(self.confirm_scene_stats)
@@ -380,7 +404,9 @@ class LayeredInferDialog(CenteredDialog):
         self.cards[index].set_english("")
         self.cards[index].set_busy(True)
         self.cards[index].set_chinese(PLACEHOLDER_ZH)
-        self.cards[index].set_model_name(self._model_label(engine, profile))
+        self.cards[index].set_model_name(
+            self._model_label(engine, profile, self._card_ref(index))
+        )
         ok = self._vision.request_custom(
             request_id,
             self.reference_key(),
@@ -469,12 +495,16 @@ class LayeredInferDialog(CenteredDialog):
     def _fill_confirm(self) -> None:
         name = self.name_edit.text().strip()
         card = self.selected_card_text()
-        scene = build_scene_prompt(name)
+        parts = split_card(card, name)
+        scene = build_scene_prompt(name, official_outfit=parts.outfit)
         engine = self.current_engine()
         profile = self._batch_profile(engine)
-        model = self._model_label(engine, profile)
+        model = self._model_label(engine, profile, self._cha.batch_model)
         self.confirm_card.setPlainText(card)
         self.confirm_card_stats.setText(format_card_stats(card))
+        self.confirm_appearance.setPlainText(parts.appearance)
+        self.confirm_outfit.setPlainText(parts.outfit)
+        self.confirm_split_warning.setVisible(bool(card) and not parts.outfit)
         self.confirm_scene.setPlainText(scene)
         self.confirm_scene_stats.setText(format_card_stats(scene))
         self.confirm_model.setText(
@@ -489,13 +519,15 @@ class LayeredInferDialog(CenteredDialog):
             return
         engine = self.current_engine()
         prompts = load_vision_prompts()
+        parts = split_card(card, name)
         started = self._vision.request_layered_batch(
             self._keys,
             engine,
             card_text=card,
             scene_system=prompts.system_text_for(engine),
-            scene_user=build_scene_prompt(name),
+            scene_user=build_scene_prompt(name, official_outfit=parts.outfit),
             profile=self._batch_profile(engine),
+            card_parts=parts,
         )
         if not started:
             return
@@ -514,20 +546,38 @@ class LayeredInferDialog(CenteredDialog):
     def _card_profile(self, engine: str, index: int) -> LLMProfile | None:
         if engine != ENGINE_LLM:
             return None
-        return resolve_card_profile(self._cha, self._controller.active_profile(), index)
+        return resolve_card_profile(
+            self._cha,
+            self._controller.vision_profile(),
+            index,
+            lookup=self._controller.profile_for_ref,
+        )
 
     def _batch_profile(self, engine: str) -> LLMProfile | None:
         if engine != ENGINE_LLM:
             return None
-        return resolve_batch_profile(self._cha, self._controller.active_profile())
+        return resolve_batch_profile(
+            self._cha,
+            self._controller.vision_profile(),
+            lookup=self._controller.profile_for_ref,
+        )
 
-    def _model_label(self, engine: str, profile: LLMProfile | None) -> str:
+    def _model_label(
+        self, engine: str, profile: LLMProfile | None, ref: ModelRef = ModelRef()
+    ) -> str:
         if engine == ENGINE_LOCAL:
             return ENGINE_LOCAL_TEXT
         if profile is not None and profile.vision_model:
+            # A pool pick on another API shows its provider too.
+            if ref.profile:
+                return choice_label(ModelRef(profile.name, profile.vision_model))
             return profile.vision_model
-        active = self._controller.active_profile()
+        active = self._controller.vision_profile()
         return active.vision_model if active is not None else ""
+
+    def _card_ref(self, index: int) -> ModelRef:
+        models = self._cha.card_models
+        return models[index] if 0 <= index < len(models) else ModelRef()
 
     # -- helpers ---------------------------------------------------------------
     def _cap_to_screen(self) -> None:

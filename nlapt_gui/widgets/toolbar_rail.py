@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from nlapt.core.config import ROLE_TEXT, ROLE_VISION
 from nlapt.diagnostics import get_logger
 
 from nlapt_gui.controller import AppController
@@ -27,7 +28,8 @@ from nlapt_gui.theme.manager import ThemeManager
 from nlapt_gui.theme.tokens import ThemeTokens
 from nlapt_gui.widgets.dialogs import show_message
 from nlapt_gui.widgets.thumb_cells import make_icon
-from nlapt_gui.widgets.title_bar import ABOUT_TEXT, ABOUT_TITLE, GUIDE_TEXT, GUIDE_TITLE
+from nlapt_gui.widgets.title_bar import ABOUT_TEXT, ABOUT_TITLE
+from nlapt_gui.widgets.tools_menu import ToolsMenuPopup
 from nlapt_gui.widgets.window_chrome import ThemePopup, WindowDragHelper
 
 _LOGGER = get_logger(__name__)
@@ -44,10 +46,10 @@ TIP_EXPORT = "导出"
 TIP_UNDO = "撤销"
 TIP_REDO = "重做"
 TIP_TOOLS = "修改工具"
+TIP_TOOLS_MENU = "工具"
 TIP_THEME = "切换主题"
 TIP_SETTINGS = "设置"
 TIP_LOGO = "NLapt"
-ACTION_GUIDE = "使用说明"
 ACTION_ABOUT = "关于"
 ACTION_QUIT = "退出"
 
@@ -60,6 +62,8 @@ class ToolbarRail(QFrame):
     colors_requested = Signal()
     export_requested = Signal()
     tools_toggled = Signal(bool)
+    tool_action_requested = Signal(str)
+    model_switch_requested = Signal(str, object)  # (role, ModelRef)
 
     def __init__(
         self,
@@ -71,6 +75,7 @@ class ToolbarRail(QFrame):
         self._controller = controller
         self._manager = theme_manager
         self._popup: ThemePopup | None = None
+        self._tools_menu: ToolsMenuPopup | None = None
         self._drag = WindowDragHelper(self)
         self._tools_open = False
         self.setFixedWidth(RAIL_W)
@@ -113,6 +118,7 @@ class ToolbarRail(QFrame):
         mid_lay.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
 
         self.open_button = self._icon_button(TIP_OPEN, self.open_folder_requested.emit)
+        self.tools_menu_button = self._icon_button(TIP_TOOLS_MENU, self.open_tools_menu)
         self.save_button = self._icon_button(TIP_SAVE, self._controller.save_current)
         self.save_all_button = self._icon_button(TIP_SAVE_ALL, self._controller.save_all)
         self.export_button = self._icon_button(TIP_EXPORT, self.export_requested.emit)
@@ -120,6 +126,7 @@ class ToolbarRail(QFrame):
         self.redo_button = self._icon_button(TIP_REDO, self._controller.redo_current)
         self.tools_button = self._icon_button(TIP_TOOLS, self._toggle_tools)
         mid_lay.addWidget(self.open_button)
+        mid_lay.addWidget(self.tools_menu_button)
         mid_lay.addWidget(self.save_button)
         mid_lay.addWidget(self.save_all_button)
         mid_lay.addWidget(self.export_button)
@@ -137,6 +144,7 @@ class ToolbarRail(QFrame):
 
         self._icon_buttons: dict[str, QPushButton] = {
             "open": self.open_button,
+            "apps": self.tools_menu_button,
             "save": self.save_button,
             "save_all": self.save_all_button,
             "export": self.export_button,
@@ -185,6 +193,7 @@ class ToolbarRail(QFrame):
         color = tokens.text2
         mapping = {
             "open": "folder_open",
+            "apps": "apps",
             "save": "save",
             "save_all": "save_all",
             "export": "export",
@@ -221,6 +230,26 @@ class ToolbarRail(QFrame):
     def tools_open(self) -> bool:
         return self._tools_open
 
+    def open_tools_menu(self) -> ToolsMenuPopup:
+        """Build and show the grouped 工具 popup next to the tools-menu button."""
+        popup = ToolsMenuPopup(
+            self._manager.tokens,
+            busy=self._controller.batch_running(),
+            choices=self._controller.model_pool(),
+            text_target=self._controller.model_target(ROLE_TEXT),
+            vision_target=self._controller.model_target(ROLE_VISION),
+            parent=self,
+        )
+        popup.action_triggered.connect(self.tool_action_requested.emit)
+        popup.model_switch_requested.connect(self.model_switch_requested.emit)
+        anchor = self.tools_menu_button.mapToGlobal(
+            QPoint(self.tools_menu_button.width() + 6, 0)
+        )
+        popup.move(anchor)
+        popup.show()
+        self._tools_menu = popup
+        return popup
+
     def open_theme_popup(self) -> ThemePopup:
         """Build and show the theme picker next to the theme button."""
         popup = ThemePopup(self._manager.theme_name, self._manager.tokens, self)
@@ -241,14 +270,10 @@ class ToolbarRail(QFrame):
 
     def _open_logo_menu(self) -> None:
         menu = QMenu(self)
-        menu.addAction(ACTION_GUIDE, self.show_guide)
         menu.addAction(ACTION_ABOUT, self.show_about)
         menu.addSeparator()
         menu.addAction(ACTION_QUIT, lambda: self.window().close())
         menu.popup(self.logo_button.mapToGlobal(QPoint(self.logo_button.width() + 4, 0)))
-
-    def show_guide(self) -> None:
-        show_message(self.window(), GUIDE_TITLE, GUIDE_TEXT)
 
     def show_about(self) -> None:
         show_message(self.window(), ABOUT_TITLE, ABOUT_TEXT)

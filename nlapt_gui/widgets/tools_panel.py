@@ -43,9 +43,8 @@ _LOGGER = get_logger(__name__)
 
 # Design metrics.
 PANEL_WIDTH = 340
-_HEADER_MARGINS = (16, 13, 16, 11)
 _STACK_MARGINS = (10, 10, 10, 10)
-_STACK_GAP = 10
+_STACK_GAP = 8
 _SEG_BAR_PADDING = 3
 _SEG_BAR_GAP = 3
 _SEG_HEIGHT = 24
@@ -60,16 +59,22 @@ SECTION_HISTORY = "hist"
 # Exact UI strings from the design.
 PANEL_TITLE = "修改工具"
 PANEL_SUBTITLE = "对当前文件或批量范围应用修改"
+STATS_PILL = "{n} 张 · 已选 {m}"
+TIP_CLOSE = "收起"
+HEADER_H = 44
+CLOSE_PX = 26
 TITLE_FIND_REPLACE = "查找替换"
 TITLE_PREFIX_SUFFIX = "前缀 / 后缀"
 TITLE_TRANSLATE = "翻译对照"
 TITLE_HISTORY = "历史记录"
 SCOPE_CURRENT_LABEL = "当前"
+SCOPE_FOLDER_LABEL = "文件夹 {n}"
 SCOPE_SELECTED_LABEL = "选中 {n}"
 SCOPE_ALL_LABEL = "全部 {n}"
 HISTORY_COUNT_SUFFIX = "{n} 条"
 
 SCOPE_CURRENT = "current"
+SCOPE_FOLDER = "folder"
 SCOPE_SELECTED = "selected"
 SCOPE_ALL = "all"
 
@@ -187,12 +192,13 @@ class SegmentedBar(QFrame):
 
 
 class ScopeSelector(SegmentedBar):
-    """当前 / 选中 n / 全部 N scope control with live controller counts."""
+    """当前 / 文件夹 n / 选中 n / 全部 N scope control with live counts."""
 
     def __init__(self, controller: AppController, parent: QWidget | None = None) -> None:
         super().__init__(
             (
                 (SCOPE_CURRENT, SCOPE_CURRENT_LABEL),
+                (SCOPE_FOLDER, SCOPE_FOLDER_LABEL.format(n=0)),
                 (SCOPE_SELECTED, SCOPE_SELECTED_LABEL.format(n=0)),
                 (SCOPE_ALL, SCOPE_ALL_LABEL.format(n=0)),
             ),
@@ -201,7 +207,14 @@ class ScopeSelector(SegmentedBar):
         )
         self._controller = controller
         controller.selection_changed.connect(self.refresh_counts)
-        controller.dataset_opened.connect(lambda _result: self.refresh_counts())
+        controller.current_changed.connect(self._on_current_changed)
+        controller.dataset_opened.connect(self._on_dataset_opened)
+        self.refresh_counts()
+
+    def _on_current_changed(self, _key: str) -> None:
+        self.refresh_counts()
+
+    def _on_dataset_opened(self, _result: object) -> None:
         self.refresh_counts()
 
     @property
@@ -211,6 +224,8 @@ class ScopeSelector(SegmentedBar):
     def refresh_counts(self) -> None:
         selected = len(self._controller.selected_keys())
         total = len(self._controller.keys())
+        folder_n = len(self._controller.scope_keys(SCOPE_FOLDER))
+        self.set_label(SCOPE_FOLDER, SCOPE_FOLDER_LABEL.format(n=folder_n))
         self.set_label(SCOPE_SELECTED, SCOPE_SELECTED_LABEL.format(n=selected))
         self.set_label(SCOPE_ALL, SCOPE_ALL_LABEL.format(n=total))
 
@@ -256,6 +271,8 @@ class SectionIcon(QWidget):
 
 class ToolsPanel(QWidget):
     """Right column: panel header + the four collapsible tool sections."""
+
+    close_requested = Signal()
 
     def __init__(
         self,
@@ -342,9 +359,11 @@ class ToolsPanel(QWidget):
         outer.addWidget(scroll, 1)
 
         controller.history.changed.connect(self._on_history_changed)
-        controller.current_changed.connect(lambda _key: self._update_history_count())
-        controller.dataset_opened.connect(lambda _result: self._update_history_count())
+        controller.current_changed.connect(self._on_current_changed)
+        controller.dataset_opened.connect(self._on_dataset_opened)
+        controller.selection_changed.connect(self._update_stats_pill)
         self._update_history_count()
+        self._update_stats_pill()
 
     # -- public API -------------------------------------------------------------
     def section(self, section_id: str) -> CollapsibleSection:
@@ -370,17 +389,38 @@ class ToolsPanel(QWidget):
     # -- internals -----------------------------------------------------------------
     def _build_header(self) -> QWidget:
         header = QWidget(self)
-        layout = QVBoxLayout(header)
-        layout.setContentsMargins(*_HEADER_MARGINS)
-        layout.setSpacing(2)
+        header.setFixedHeight(HEADER_H)
+        header.setToolTip(PANEL_SUBTITLE)
+        layout = QHBoxLayout(header)
+        layout.setContentsMargins(14, 0, 10, 0)
+        layout.setSpacing(8)
         title = QLabel(PANEL_TITLE, header)
         title.setStyleSheet("font-size: 13px; font-weight: 700;")
-        subtitle = QLabel(PANEL_SUBTITLE, header)
-        subtitle.setProperty("muted", True)
-        subtitle.setStyleSheet("font-size: 11px;")
+        title.setToolTip(PANEL_SUBTITLE)
         layout.addWidget(title)
-        layout.addWidget(subtitle)
+        layout.addStretch(1)
+        self.stats_pill = QLabel(header)
+        self.stats_pill.setProperty("pill", True)
+        self.stats_pill.setProperty("muted", True)
+        layout.addWidget(self.stats_pill)
+        self.close_button = QPushButton("×", header)
+        self.close_button.setFixedSize(CLOSE_PX, CLOSE_PX)
+        self.close_button.setToolTip(TIP_CLOSE)
+        self.close_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.close_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.close_button.clicked.connect(self.close_requested.emit)
+        layout.addWidget(self.close_button)
         return header
+
+    def _update_stats_pill(self) -> None:
+        if not hasattr(self, "stats_pill"):
+            return
+        self.stats_pill.setText(
+            STATS_PILL.format(
+                n=len(self._controller.keys()),
+                m=len(self._controller.selected_keys()),
+            )
+        )
 
     def _persist_section_state(self, section_id: str, is_open: bool) -> None:
         sections = dict(self._controller.settings.sections)
@@ -392,6 +432,13 @@ class ToolsPanel(QWidget):
         heights[section_id] = height
         self._section_heights = heights
         save_section_heights(heights, self._section_heights_path)
+
+    def _on_current_changed(self, _key: str) -> None:
+        self._update_history_count()
+
+    def _on_dataset_opened(self, _result: object) -> None:
+        self._update_history_count()
+        self._update_stats_pill()
 
     def _on_history_changed(self, key: str) -> None:
         if key == (self._controller.current_key or ""):

@@ -23,6 +23,7 @@ from nlapt.core.errors import ValidationError
 from nlapt.diagnostics import get_logger
 
 from nlapt_gui.controller import AppController, TOAST_INFO
+from nlapt_gui.widgets.sections.common import CONTENT_MARGINS, ROW_GAP
 from nlapt_gui.widgets.tools_panel import resolve_tokens
 
 _LOGGER = get_logger(__name__)
@@ -40,8 +41,6 @@ _ROW_GAP = 6
 _ROW_MARGINS = (9, 6, 9, 6)
 _REVERT_HEIGHT = 22
 _CLEAR_HEIGHT = 27
-_CONTENT_MARGINS = (13, 2, 13, 13)
-_CONTENT_GAP = 8
 
 
 class HistorySection(QWidget):
@@ -77,8 +76,8 @@ class HistorySection(QWidget):
         self.clear_button.clicked.connect(self.clear_history)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(*_CONTENT_MARGINS)
-        layout.setSpacing(_CONTENT_GAP)
+        layout.setContentsMargins(*CONTENT_MARGINS)
+        layout.setSpacing(ROW_GAP)
         layout.addWidget(scroll)
         layout.addWidget(self.clear_button)
 

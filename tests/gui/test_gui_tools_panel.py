@@ -18,6 +18,7 @@ from nlapt_gui.widgets.tools_panel import (
     PANEL_TITLE,
     PANEL_WIDTH,
     SCOPE_ALL_LABEL,
+    SCOPE_FOLDER_LABEL,
     SCOPE_SELECTED_LABEL,
     SECTION_FIND_REPLACE,
     SECTION_HISTORY,
@@ -42,6 +43,12 @@ _OWNED_SOURCES = (
     _GUI_ROOT / "widgets" / "sections" / "prefix_suffix.py",
     _GUI_ROOT / "widgets" / "sections" / "translate.py",
     _GUI_ROOT / "widgets" / "sections" / "history.py",
+    _GUI_ROOT / "widgets" / "sections" / "common.py",
+    _GUI_ROOT / "widgets" / "tools_menu.py",
+    _GUI_ROOT / "widgets" / "batch_scope_dialog.py",
+    _GUI_ROOT / "widgets" / "flatten_alpha_dialog.py",
+    _GUI_ROOT / "widgets" / "duplicate_review_dialog.py",
+    _GUI_ROOT / "image_tools_bridge.py",
 )
 _HEX_COLOR = re.compile(r"#[0-9A-Fa-f]{6}\b")
 
@@ -99,10 +106,13 @@ class TestScopeSelector:
         scope = ScopeSelector(controller)
         qtbot.addWidget(scope)
         assert scope._buttons["all"].text() == SCOPE_ALL_LABEL.format(n=4)
+        assert scope._buttons["folder"].text() == SCOPE_FOLDER_LABEL.format(n=4)
         assert scope._buttons["selected"].text() == SCOPE_SELECTED_LABEL.format(n=0)
         controller.toggle_selected("0001.png")
         controller.toggle_selected("0002.png")
         assert scope._buttons["selected"].text() == SCOPE_SELECTED_LABEL.format(n=2)
+        controller.set_current("10_concept/0003.png")
+        assert scope._buttons["folder"].text() == SCOPE_FOLDER_LABEL.format(n=2)
 
 
 class TestToolsPanel:
@@ -112,7 +122,7 @@ class TestToolsPanel:
         assert panel.width() == PANEL_WIDTH
         titles = [label.text() for label in panel.findChildren(QLabel)]
         assert PANEL_TITLE in titles
-        assert PANEL_SUBTITLE in titles
+        assert any(label.toolTip() == PANEL_SUBTITLE for label in panel.findChildren(QLabel))
 
     def test_sections_initial_open_states(self, qtbot, controller) -> None:
         panel = ToolsPanel(controller)
@@ -166,3 +176,9 @@ class TestToolsPanel:
         assert panel.prefix_suffix._controller is controller
         assert panel.translate._controller is controller
         assert panel.history._controller is controller
+
+    def test_close_button_emits(self, qtbot, controller) -> None:
+        panel = ToolsPanel(controller)
+        qtbot.addWidget(panel)
+        with qtbot.waitSignal(panel.close_requested, timeout=1000):
+            panel.close_button.click()

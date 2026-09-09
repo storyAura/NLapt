@@ -28,6 +28,12 @@ MENU_LAYERED_ALL = "CHA标注全部({n} 张)"
 MENU_LAYERED_IMAGE = "CHA标注这张图片"
 MENU_LAYERED_FOLDER_UNLABELED = "CHA标注此文件夹未标注({n} 张)"
 MENU_LAYERED_ALL_UNLABELED = "CHA标注全部未标注({n} 张)"
+MENU_COMPARE_FOLDER = "多对比推标此文件夹({n} 张)"
+MENU_COMPARE_SELECTED = "多对比推标已选({n} 张)"
+MENU_COMPARE_ALL = "多对比推标全部({n} 张)"
+MENU_COMPARE_IMAGE = "多对比推标这张图片"
+MENU_COMPARE_FOLDER_UNLABELED = "多对比推标此文件夹未标注({n} 张)"
+MENU_COMPARE_ALL_UNLABELED = "多对比推标全部未标注({n} 张)"
 MENU_CANCEL_INFER = "取消当前推标"
 MENU_COPY_CAPTION = "复制标注"
 CONFIRM_INFER_TITLE = "批量推标"
@@ -45,6 +51,7 @@ class InferMenuHost(Protocol):
 
     def _request_infer(self, keys: tuple[str, ...], engine: str) -> None: ...
     def _request_layered(self, keys: tuple[str, ...]) -> None: ...
+    def _request_compare(self, keys: tuple[str, ...]) -> None: ...
     def infer_menu_actions(
         self, folder: str | None, image: str | None = None
     ) -> list[tuple[str, object]]: ...
@@ -64,10 +71,11 @@ def build_infer_actions(
     if controller.batch_running():
         return [(MENU_CANCEL_INFER, controller.cancel_batch)]
 
-    def trio(
+    def quartet(
         llm_label: str,
         local_label: str,
         layered_label: str,
+        compare_label: str,
         keys: tuple[str, ...],
     ) -> list[tuple[str, object]]:
         n = len(keys)
@@ -75,62 +83,73 @@ def build_infer_actions(
             (llm_label.format(n=n), lambda: panel._request_infer(keys, ENGINE_LLM)),
             (local_label.format(n=n), lambda: panel._request_infer(keys, ENGINE_LOCAL)),
             (layered_label.format(n=n), lambda: panel._request_layered(keys)),
+            (compare_label.format(n=n), lambda: panel._request_compare(keys)),
         ]
+
+    def all_scope() -> list[tuple[str, object]]:
+        return quartet(
+            MENU_INFER_ALL_LLM,
+            MENU_INFER_ALL_LOCAL,
+            MENU_LAYERED_ALL,
+            MENU_COMPARE_ALL,
+            controller.keys(),
+        )
 
     actions: list[tuple[str, object]] = []
     if image is not None:
         selected = controller.selected_keys()
         if image in selected and len(selected) > 1:
-            actions += trio(
+            actions += quartet(
                 MENU_INFER_SELECTED_LLM,
                 MENU_INFER_SELECTED_LOCAL,
                 MENU_LAYERED_SELECTED,
+                MENU_COMPARE_SELECTED,
                 selected,
             )
-            actions += trio(
-                MENU_INFER_ALL_LLM, MENU_INFER_ALL_LOCAL, MENU_LAYERED_ALL, controller.keys()
-            )
+            actions += all_scope()
         else:
-            actions += trio(
-                MENU_INFER_IMAGE_LLM, MENU_INFER_IMAGE_LOCAL, MENU_LAYERED_IMAGE, (image,)
+            actions += quartet(
+                MENU_INFER_IMAGE_LLM,
+                MENU_INFER_IMAGE_LOCAL,
+                MENU_LAYERED_IMAGE,
+                MENU_COMPARE_IMAGE,
+                (image,),
             )
         return actions
 
     if folder is not None and folder != FOLDER_ROOT_LABEL:
         keys = controller.folder_keys(folder)
         if keys:
-            actions += trio(
+            actions += quartet(
                 MENU_INFER_FOLDER_LLM,
                 MENU_INFER_FOLDER_LOCAL,
                 MENU_LAYERED_FOLDER,
+                MENU_COMPARE_FOLDER,
                 keys,
             )
             unlabeled = controller.unlabeled_keys(keys)
             if unlabeled:
-                actions += trio(
+                actions += quartet(
                     MENU_INFER_FOLDER_UNLABELED_LLM,
                     MENU_INFER_FOLDER_UNLABELED_LOCAL,
                     MENU_LAYERED_FOLDER_UNLABELED,
+                    MENU_COMPARE_FOLDER_UNLABELED,
                     unlabeled,
                 )
-        every = controller.keys()
-        if every:
-            actions += trio(
-                MENU_INFER_ALL_LLM, MENU_INFER_ALL_LOCAL, MENU_LAYERED_ALL, every
-            )
+        if controller.keys():
+            actions += all_scope()
         return actions
 
     every = controller.keys()
     if every:
-        actions += trio(
-            MENU_INFER_ALL_LLM, MENU_INFER_ALL_LOCAL, MENU_LAYERED_ALL, every
-        )
+        actions += all_scope()
         unlabeled = controller.unlabeled_keys(every)
         if unlabeled:
-            actions += trio(
+            actions += quartet(
                 MENU_INFER_ALL_UNLABELED_LLM,
                 MENU_INFER_ALL_UNLABELED_LOCAL,
                 MENU_LAYERED_ALL_UNLABELED,
+                MENU_COMPARE_ALL_UNLABELED,
                 unlabeled,
             )
     return actions

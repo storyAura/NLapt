@@ -1287,3 +1287,117 @@ portable installs), then Windows `SHGetKnownFolderPath(FOLDERID_Documents)`
 so OneDrive / redirected folders resolve, then `Path.home()/Documents`.
 `windows_known_documents_dir()` returns `None` off Windows or when the
 shell call fails.
+
+## v1.24 addendum — image tools (`nlapt.images`)
+
+Pixel-level helpers for flattening transparent backgrounds and grouping
+near-duplicate images. Pillow is optional: `load_pil()` raises
+`ImageProcessingError` with an install hint when it is missing.
+
+```python
+def load_pil() -> ModuleType
+def has_transparency(path: Path) -> bool
+def flatten_alpha(path: Path, color: tuple[int, int, int]) -> bool
+def pick_color(spec: FlattenSpec, key: str, rng: object | None = None) -> tuple[int, int, int]
+def dhash(path: Path, size: int = 8) -> int
+def hamming(left: int, right: int) -> int
+def sha256_file(path: Path) -> str
+def fingerprint(key: str, path: Path, *, size: int = 8) -> ImageFingerprint
+def group_similar(fingerprints, max_distance: int) -> tuple[DuplicateGroup, ...]
+def suggest_keep(group: DuplicateGroup) -> ImageFingerprint
+
+class FlattenSpec:  # mode: "fixed"|"random"; color; palette; seed
+class ImageBackupManager:
+    def create(self, operation: str, paths: tuple[Path, ...]) -> ImageBackupInfo
+    def quarantine(self, paths: tuple[Path, ...], *, operation: str = "duplicates") -> ImageBackupInfo
+    def list_backups(self) -> tuple[ImageBackupInfo, ...]
+    def restore(self, info: ImageBackupInfo) -> tuple[str, ...]
+```
+
+Flatten writes the original container back (PNG unchanged, WEBP `lossless=True`)
+via `atomic_write_bytes`. Image copies live under
+`<dataset>/.backups/images/<stamp>_<op>/`; quarantined near-duplicates (image +
+sibling txt) live under `<dataset>/.backups/duplicates/<stamp>/`. Both kinds
+keep the 5 newest folders. Dataset scan already skips `.` directories.
+
+## v1.25 addendum — model pool: several APIs, per-model switches, two targets
+
+An `LLMProfile` is one API (endpoint + key) that knows a catalog of models;
+the switched-on models of every profile form one pool. Two roles pick from
+the pool — the 文本 target (翻译 / 改写) and the 视觉 target (推标 / CHA) —
+and may sit on different APIs.
+
+```python
+# nlapt/core/config.py
+@dataclass(frozen=True)
+class LLMProfile:
+    ...                                   # name / api_type / base_url / api_key / temperature / max_tokens / system_prompt
+    text_model: str = ""                  # id a RESOLVED profile is bound to (legacy default on stored ones)
+    vision_model: str = ""
+    models: tuple[str, ...] = ()          # catalog (fetched via list_models or typed)
+    enabled_models: tuple[str, ...] = ()  # subset switched on for the pool
+
+@dataclass(frozen=True)
+class ModelRef:
+    profile: str = ""
+    model: str = ""
+    def is_set(self) -> bool
+
+ROLE_TEXT = "text"; ROLE_VISION = "vision"
+
+@dataclass(frozen=True)
+class AppConfig:
+    profiles: tuple[LLMProfile, ...] = ()
+    active_profile: str = ""              # legacy single selection; the pool UI writes ""
+    text_target: ModelRef = ModelRef()
+    vision_target: ModelRef = ModelRef()
+    ...
+
+def model_ref_from_dict(data: Any, context: str) -> ModelRef      # None -> unset; non-dict -> ValidationError
+def find_profile(config, name) -> LLMProfile | None
+def enabled_model_refs(config) -> tuple[ModelRef, ...]           # profile order, then enabled_models order
+def resolve_model_ref(config, ref) -> LLMProfile | None          # None when unset / profile gone / model switched off
+def resolve_text_profile(config) -> LLMProfile | None            # target's profile with text_model = ref.model
+def resolve_vision_profile(config) -> LLMProfile | None          # ... with vision_model = ref.model
+def upgrade_legacy_targets(config) -> AppConfig                  # pure, idempotent
+```
+
+Rules:
+
+1. A stale target (profile deleted or model switched off) resolves to
+   `None` — callers treat it as unconfigured; nothing falls back to another
+   model silently.
+2. When a target is **unset**, the resolvers fall back to the legacy
+   `active_profile` + its `text_model` / `vision_model`, so a pre-pool
+   `AppConfig` (tests, `reload_config`) keeps working unchanged.
+3. `upgrade_legacy_targets`: a profile with neither `models` nor
+   `enabled_models` enables its `text_model` / `vision_model` (and lists them
+   in `models`); unset targets are pointed at the `active_profile`'s models.
+   A profile that has a catalog but nothing enabled stays off (deliberate).
+   The GUI applies this on every `api.json` load; core `load_config` does
+   not (round-trip fidelity for tests / migration).
+4. `NLaptApp.make_translator` uses `resolve_text_profile`;
+   `make_rewrite_service` builds `text_client` from the text profile and
+   `vision_client` from the vision profile (possibly another API), passing
+   `replace(text_profile, vision_model=vision_profile.vision_model)` as the
+   service's profile so `_select_client_and_model` is unchanged.
+   `LLMConfigError` when no text model resolves.
+5. `masked_config_dict` still masks every `api_key`; `text_target` /
+   `vision_target` serialise as `{"profile", "model"}` objects.
+
+## v1.26 addendum — binding an arbitrary pool ref
+
+```python
+# nlapt/core/config.py
+def bind_model_ref(config: AppConfig, ref: ModelRef, role: str) -> LLMProfile | None
+```
+
+The pool profile `ref` points at, with `text_model` (ROLE_TEXT) or
+`vision_model` (ROLE_VISION) replaced by `ref.model`; `None` for an unset or
+stale ref (same rule as `resolve_model_ref`), `ValidationError` for an
+unknown role. `resolve_text_profile` / `resolve_vision_profile` are now thin
+wrappers over it (plus the legacy `active_profile` fallback). GUI callers
+that need a model other than the two targets — CHA标注 per-scheme picks and
+多对比推标 — go through `AppController.profile_for_ref(ref)` which binds
+ROLE_VISION.
+

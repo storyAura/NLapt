@@ -15,7 +15,7 @@ from nlapt_gui.theme.manager import ThemeManager
 from nlapt_gui.theme.tokens import DEFAULT_THEME
 from nlapt_gui.widgets.title_bar import (
     ACTION_ABOUT,
-    ACTION_GUIDE,
+    AUTHOR,
     MENU_HELP,
     TITLE_BAR_HEIGHT,
     VERSION_LABEL,
@@ -96,24 +96,17 @@ class TestIssue4HelpMenu:
     def test_help_menu_actions(self, title_bar: TitleBar) -> None:
         help_menu = title_bar.menus[MENU_HELP]
         texts = [a.text() for a in help_menu.actions() if a.text()]
-        assert ACTION_GUIDE in texts
-        assert ACTION_ABOUT in texts
+        assert texts == [ACTION_ABOUT]
+        assert "使用说明" not in texts
         # 快捷键 was removed by design (spec module 3.5): the status bar at the
         # bottom of the window already lists the live shortcut hints.
         assert "快捷键" not in texts
         assert not hasattr(title_bar, "action_shortcuts")
+        assert not hasattr(title_bar, "action_guide")
 
-    def test_guide_handler_builds_dialog(self, qtbot, title_bar, monkeypatch) -> None:
-        captured: list[tuple[str, str]] = []
-        _stub_information(monkeypatch, captured)
-        title_bar.action_guide.trigger()
-        assert captured
-        title, body = captured[0]
-        assert title == ACTION_GUIDE
-        for token in ("图标轨", "文件栏", "预览", "胶囊", "分句", "文本", "快照"):
-            assert token in body
-
-    def test_about_handler_is_richer(self, qtbot, title_bar, monkeypatch) -> None:
+    def test_about_handler_is_summary_with_author(
+        self, qtbot, title_bar, monkeypatch
+    ) -> None:
         captured: list[tuple[str, str]] = []
         _stub_information(monkeypatch, captured)
         title_bar.action_about.trigger()
@@ -121,14 +114,16 @@ class TestIssue4HelpMenu:
         _title, body = captured[0]
         assert VERSION_LABEL in body
         assert __version__ in body
-        assert "kohya" in body
+        assert AUTHOR in body
+        assert "作者：" in body
+        assert "图片 + 同名 .txt" in body
+        assert "使用说明" not in body
 
     def test_all_help_handlers_do_not_raise(self, qtbot, title_bar, monkeypatch) -> None:
         # Swap the modal call for a no-op so triggering never blocks offscreen.
         monkeypatch.setattr(
             "nlapt_gui.widgets.title_bar.show_message", lambda *a, **k: None
         )
-        title_bar.action_guide.trigger()
         title_bar.action_about.trigger()
 
 

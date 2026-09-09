@@ -1509,3 +1509,405 @@ a no-op. Settings / 本地推理 persist LLM profiles through
 keep their public dataclasses; credentials go through `load_api_config` /
 `update_api_config`. This module must not import those two (legacy file
 names are duplicated strings to avoid a cycle).
+
+## v1.39 — CHA 人物卡 skill：发色发型优先 + 纹身/服装细节必写
+
+Prompt text only (`nlapt_gui/layered_prompts.py`); no signature change, no
+version bump. The card stays one English paragraph.
+
+1. **`CARD_APPEARANCE_SKILL`**: hair is a fixed sub-order — color (incl.
+   two-tone / gradient / streaks) → length → cut and how it is worn → bangs
+   and parting → hair-worn ornaments. Then eyes / pupils. Skin marks are
+   mandatory when visible: every tattoo / scar / birthmark / body paint must
+   carry position, color, and motif; omitting a visible tattoo is an error.
+2. **`CARD_CLOTHING_SKILL`**: head-to-shoe checklist (headwear, neckwear,
+   outerwear, inner layers, bottoms, arm wear, waist wear / harnesses /
+   straps, hosiery, footwear, bags, jewelry); every garment names color plus
+   pattern / print / logo / trim; construction vocabulary (pleated, lace,
+   sheer, cutout, cropped, zipper, buckle, …); exposed underlayers (bikini,
+   bra strap, undershirt) are their own item.
+3. **`CHARACTER_CARD_PROMPT`**: "one complete objective paragraph" (was
+   "short"); the first fact after the opening is the hair color; required
+   order is hair color → hair length / style → eyes → tattoos / body facts
+   → clothing; a paragraph that omits a visible tattoo, underlayer, strap, or
+   pattern is not acceptable.
+4. **`CARD_VARIANT_HINTS`**: all three alternatives state hair color first;
+   alternative 2 asks for every tattoo with its position, alternative 3 for
+   straps, jewelry, and patterns.
+5. **`POSE_SCENE_PROMPT`**: hard bans now list tattoos / scars / birthmarks /
+   body paint so the per-image paragraph never repeats the locked card.
+
+## v1.40 — 工具弹层、四档范围、图像工具、信息栏穿透、抽屉重构
+
+1. **Left rail 工具 popup** (`ToolsMenuPopup`): groups 处理工具 / 标注工具 /
+   预处理工具. Actions: 替换透明底, 撤销上次图像操作, LLM / 本地 / CHA 推标,
+   修改工具 (toggles the existing drawer), 查找雷同图片. Image actions disable
+   while `controller.batch_running()`.
+2. **Scope** `SCOPES = ("current", "folder", "selected", "all")`. `folder` is
+   the current file's folder plus nested subfolders (`folder_tree_keys`);
+   根目录 equals the whole dataset. `ScopeSelector` and every batch section
+   share the four-segment control. `BatchScopeDialog` picks a scope for 推标.
+3. **`ImageToolsBridge`**: `flatten(keys, spec)`, `scan_duplicates(keys,
+   max_distance)`, `quarantine(paths)`, `restore_last_backup()`. Uses
+   `begin_work` / `end_work` then `controller.refresh()`.
+4. **`FlattenAlphaDialog`**: fixed or random color, preset / custom swatches,
+   transparency count, backup hint. **`DuplicateReviewDialog`**: Hamming
+   slider 0–16 (default 6), group cards with keep checkboxes, quarantine
+   unused members.
+5. **Preview `_InfoBar`**: filename / meta / pos labels set
+   `WA_TransparentForMouseEvents` so the frameless strip drags on text;
+   filename elides in the middle (tooltip keeps the full name).
+6. **修改工具 header**: 44px single row (title + `{n} 张 · 已选 {m}` pill +
+   close). Section cards share `sections/common.py` metrics and `ScopeRow`.
+   `ResizeGrip` paints only while hovered.
+
+## v1.41 — CHA标注 per-image outfit check (single call)
+
+The per-image scene call now also verifies the outfit against the locked
+card. Still one LLM call per image; nothing changes for captions whose
+reply carries no `OUTFIT:` header.
+
+```python
+# nlapt_gui/layered_prompts.py
+OUTFIT_PREFIX = "OUTFIT:"
+OUTFIT_SAME = "SAME"
+
+@dataclass(frozen=True)
+class CardParts:
+    appearance: str   # fixed block: opening, hair, eyes, skin marks
+    outfit: str       # clothing block; "" when no anchor was found
+
+def split_card(card: str, name: str = "") -> CardParts
+def build_scene_prompt(name: str, official_outfit: str = "") -> str
+def parse_scene_reply(text: str) -> tuple[str | None, str]   # (outfit | None=SAME, scene)
+def assemble_layered(card: str, parts: CardParts, outfit: str | None, scene: str) -> str
+
+# nlapt_gui/vision_bridge.py
+VisionBridge.request_layered_batch(keys, engine, *, card_text, scene_system,
+                                   scene_user, profile=None,
+                                   card_parts: CardParts | None = None) -> bool
+```
+
+1. **Card contract**: `CARD_CLOTHING_SKILL` requires the clothing block to
+   start a new sentence with `{name} wears` / `She wears` / `He wears`.
+   `split_card` anchors on that sentence (`<name>|She|He|They` +
+   `wears|is wearing|is dressed in`), falls back to the first sentence
+   after the opening that names a garment (`GARMENT_WORDS`), else returns
+   `CardParts(card, "")`.
+2. **Scene prompt**: `POSE_SCENE_PROMPT` gained rule 0 "Outfit check" with
+   `{OUTFIT}` (the card's clothing block; `OUTFIT_REFERENCE_MISSING` when
+   empty). Output format is now `OUTFIT: SAME` or `OUTFIT: <clothing>`,
+   one blank line, then the 200–300 word scene paragraph. Rule 5's
+   clothing ban applies to the scene paragraph only.
+3. **Assembly**: `parse_scene_reply` splits on blank lines; a first block
+   starting with `OUTFIT:` (case-insensitive) is the header, `SAME`
+   (punctuation / trailing word tolerated) → `None`. `assemble_layered`
+   writes `card + blank + scene` for `None`, an empty outfit, or a card
+   without a clothing block; otherwise
+   `parts.appearance + " " + outfit + blank + scene`. The bridge logs a
+   warning when a reply rewrites the outfit but `card_parts.outfit` is
+   empty.
+4. **Dialog** (`LayeredInferDialog` confirm page): read-only
+   `confirm_appearance` / `confirm_outfit` boxes (`LABEL_CARD_APPEARANCE`,
+   `LABEL_CARD_OUTFIT`) show the split; `confirm_split_warning`
+   (`WARN_SPLIT_FAILED`) appears when no clothing block was found. The
+   scene preview and the batch use
+   `build_scene_prompt(name, official_outfit=parts.outfit)` and pass
+   `card_parts=parts`.
+5. Exported skill text: `CHA-skills.md` (repo root) mirrors the live
+   constants plus the assembly rules.
+
+## v1.42 — Local Hy-MT2 translates paragraph by paragraph
+
+Hy-MT2's official prompt is `instruction + blank line + source`, and the
+model was also trained on a context template of the same shape
+(`{context}\n\n…{source_text}`) where only the block after the LAST blank
+line is translated. A caption containing its own blank lines (e.g. CHA
+人物卡 + 画面段) therefore came back with every paragraph but the last
+dropped — "sometimes", because of the official `temperature=0.7`.
+
+```python
+# nlapt/local/mt_catalog.py
+MT_PARAGRAPH_SEPARATOR = "\n\n"
+def split_mt_paragraphs(text: str) -> tuple[str, ...]   # split on \n\s*\n, strip, drop empties
+
+# nlapt_gui/mt_bridge.py
+LocalMTProvider.translate_to(text, target_lang) -> str  # one request PER paragraph
+```
+
+1. `translate_to` splits the stripped caption with `split_mt_paragraphs`,
+   sends one `hymt_prompt(paragraph, …)` chat request per paragraph
+   (sequential, same server; `ensure_mt_server` runs once and the idle
+   stopper's `note_request`/`note_finished` bracket the whole call), and
+   rejoins the cleaned results with `MT_PARAGRAPH_SEPARATOR`.
+2. The per-request contract is unchanged: `with_retry(HYMT_RETRY_POLICY)`,
+   `finish_reason == "stop"` required, `clean_llm_output`. Any paragraph
+   failing raises `LLMRequestError` for the whole translation — no partial
+   text is ever returned.
+3. Single-paragraph captions (tag lists, one-block prose) still cost
+   exactly one request. Single newlines inside a paragraph are preserved
+   as-is; only blank lines split.
+4. LLM / Google / DeepL / DeepLX / custom providers are untouched — the
+   ambiguity is specific to the Hy-MT2 template.
+
+## v1.43 — Multi-API profiles, per-model switches, 当前文本 / 视觉模型
+
+设置 ▸ LLM 设置 no longer edits a single `default` profile. It manages any
+number of API profiles, each with a model checklist (checked = switched on
+for the shared pool), and picks the 当前文本模型 / 当前视觉模型 from that
+pool (core contract `ARCHITECTURE.md` v1.25). The 工具 popup gets a
+pi-style quick switch.
+
+```python
+# nlapt_gui/api_config.py — api.json v2
+API_FORMAT_VERSION = 2
+class ApiConfig:
+    profiles: tuple[LLMProfile, ...]; active_profile: str = ""   # legacy; pool UI writes ""
+    text_target: ModelRef = ModelRef(); vision_target: ModelRef = ModelRef()
+    translate: TranslateCredentials; cha: CHAApi
+    def upgraded(self) -> ApiConfig            # upgrade_legacy_targets over the llm section
+def update_api_config(*, profiles=None, active_profile=None, text_target=None, vision_target=None, translate=None, cha=None)
+# load_api_config / _legacy_api_config always return .upgraded(); a v1 file
+# (no targets) therefore loads with its old text/vision models switched on
+# and both targets pointing at the former active profile.
+
+# nlapt_gui/model_targets.py (pure helpers + the single persistence path)
+@dataclass(frozen=True)
+class ModelChoice: ref: ModelRef; label: str  # "profile · model"; vision_hint: bool
+def pool_choices(config) -> tuple[ModelChoice, ...]
+def choice_label(ref) -> str; def role_label(role) -> str; def find_choice(choices, ref)
+def current_target(config, role) -> ModelRef; def target_display(config, role) -> str  # 未设置 / 已失效 / id
+def switch_target(config, role, ref) -> AppConfig   # ValidationError for a ref outside the pool; clears active_profile
+def persist_targets(config) -> None                 # save_app_config
+
+# nlapt_gui/controller.py
+def text_profile(self) -> LLMProfile | None         # replaces active_profile()
+def vision_profile(self) -> LLMProfile | None
+def model_pool(self) -> tuple[ModelChoice, ...]
+def model_target(self, role) -> ModelRef
+def set_model_target(self, role, ref) -> None       # switch_target -> persist -> reload_config -> toast
+
+# nlapt_gui/widgets/llm_providers_tab.py
+class LLMProvidersTab(QWidget):
+    toast_requested = Signal(str, str); pool_changed = Signal()
+    def __init__(existing: AppConfig | None, *, api_types, pool, parent)
+    profile_list / add_button / remove_button; name_edit / api_type / base_url / api_key
+    fetch_models_button / test_button; model_list (checkable) / enable_all_button / disable_all_button
+    new_model_edit / add_model_button; text_combo / vision_combo; divider / concurrency_spin
+    def profiles() -> tuple[LLMProfile, ...]; def text_target() / vision_target() -> ModelRef
+    def current_profile() -> LLMProfile | None; def build_config(base: AppConfig) -> AppConfig
+    def vision_profile() -> LLMProfile | None    # CHA标注 main_profile_provider
+    def validate(*, require_text: bool) -> str | None
+    def add_profile() / remove_profile() / select_profile(name) / add_model() / set_target(role, ref)
+    def fetch_models() / test_connection()       # run_async; fetched ids merge UNCHECKED into the catalog
+
+# nlapt_gui/widgets/settings_dialog.py
+SettingsDialog.llm_tab: LLMProvidersTab; .divider / .concurrency_spin proxy to it
+def draft_config(self) -> AppConfig            # llm_tab.build_config(existing)
+# save(): llm_tab.validate(require_text = provider == "llm") -> web-provider check -> CHA check
+#         -> refuse when the existing config is unreadable -> save everything -> reload_config
+
+# nlapt_gui/widgets/tools_menu.py
+GROUP_MODELS = "当前模型"; ACTION_MODEL_TEXT / ACTION_MODEL_VISION (busy-disabled)
+ToolsMenuPopup(tokens, *, busy, choices, text_target, vision_target, parent)
+model_switch_requested = Signal(str, object)   # (role, ModelRef)
+def target_display(role) -> str; def build_model_menu(role) -> QMenu  # checkable pool + 不使用; non-blocking popup()
+# toolbar_rail.open_tools_menu passes controller.model_pool()/model_target(); ToolbarRail.model_switch_requested
+# -> MainWindow -> controller.set_model_target
+```
+
+Behaviour:
+
+1. Fetched model ids are merged into the profile's catalog **unchecked**;
+   the user switches on what they want (手动添加 enables immediately).
+   Unchecking a model that is a current target resets that target to 未设置.
+   Renaming a profile follows the targets; deleting one clears targets that
+   pointed at it.
+2. 保存 always writes the whole LLM section (`active_profile=""`) and the
+   concurrency into `config.json`, even for non-LLM translation providers.
+   A profile without a Base URL, a blank / duplicate name, or (when the
+   翻译服务 is 大模型) a missing 当前文本模型 blocks the save with a toast.
+3. 本地推理 ▸ 设为当前模型 writes the `local` profile with
+   `models = enabled_models = (family_id,)` and points the text target (and
+   the vision target when the family has vision) at it; a text-only family
+   leaves the existing vision target alone.
+4. `LayeredInferDialog` / CHA resolvers read `controller.vision_profile()`.
+   `make_vision_captioner_or_none` defaults to `resolve_vision_profile`.
+5. `widgets/model_picker.py` (the old 获取模型 assignment dialog) is removed;
+   the checklist replaces it.
+
+Field ownership update: `Documents/NLapt/api.json` now also owns
+`llm.text_target` / `llm.vision_target` and each profile's `models` /
+`enabled_models`.
+
+## v1.44 — Model search box + CHA quick-pick from the pool
+
+```python
+# nlapt_gui/widgets/llm_providers_tab.py
+LLMProvidersTab.model_filter: QLineEdit          # above model_list; clear button
+LABEL_MODELS_FILTERED = "模型开关 · 匹配 {n} / {total}"
+def _apply_model_filter()                        # case-insensitive substring on the model id; item.setHidden
+# 全选 / 全不选 act on the rows the filter shows (whole catalog when the filter is empty).
+
+# nlapt_gui/widgets/cha_tab.py
+MODEL_COMBO_MIN_W = 240                          # combos: Expanding + min width + AdjustToMinimumContentsLengthWithIcon
+def refresh_pool_models()                        # 同步 mode: items = main_profile_provider().enabled_models; own API: () 
+# 获取模型 results are kept separately and merged (deduped, pool first) into every combo;
+# the typed / prefilled text of each combo survives a refresh. _sync_api_rows calls refresh_pool_models.
+
+# nlapt_gui/widgets/settings_dialog.py
+# llm_tab.pool_changed -> cha_tab.refresh_pool_models; refresh once after cha_tab.prefill.
+```
+
+1. The filter is view-only: it never changes `models` / `enabled_models` by
+   itself and survives profile switches and fetches (`_load_model_list`
+   re-applies it).
+2. `main_profile_provider` is `LLMProvidersTab.vision_profile`, so the CHA
+   dropdown lists exactly the switched-on models of the API CHA will call
+   in 同步 mode, updated live as switches are toggled on the LLM tab. With an
+   own endpoint the pool is not authoritative, so only fetched ids appear.
+   (Superseded by v1.45: the pickers now list the whole pool.)
+
+## v1.45 — Provider-grouped CHA picks + 多对比推标
+
+### CHA标注 picks may point at any API
+
+```python
+# nlapt_gui/cha_config.py
+class CHASettings:
+    card_models: tuple[ModelRef, ModelRef, ModelRef]   # str inputs normalise to bare refs
+    batch_model: ModelRef
+# ModelRef("p", "m") = pool model on API p; ModelRef("", "m") = typed id on the base
+# endpoint; ModelRef() = 留空 (base 视觉模型). cha_annotation.json stores
+# {"profile","model"} objects; legacy bare strings still load.
+ProfileLookup = Callable[[ModelRef], LLMProfile | None]
+def resolve_card_profile(settings, active, index, *, lookup: ProfileLookup | None = None)
+def resolve_batch_profile(settings, active, *, lookup: ProfileLookup | None = None)
+# A ref with profile set resolves ONLY through lookup (stale / no lookup -> None);
+# bare and empty refs keep the base-endpoint path.
+
+# nlapt_gui/model_targets.py
+def model_ref_from_value(value: object) -> ModelRef
+def grouped_pool_choices(config) -> tuple[tuple[str, tuple[ModelChoice, ...]], ...]
+
+# nlapt_gui/widgets/cha_tab.py
+CHATab(*, main_profile_provider, pool_provider=(), profile_lookup=None, api_types, pool, parent)
+GROUP_HEADER_FMT = "── {name} ──"; GROUP_BASE_ENDPOINT = "当前接口"; GROUP_STALE = "已失效"
+def refresh_pool_models()   # rebuild every picker from pool_provider(): blank, then one
+                            # disabled header + "provider · model" rows per provider (any
+                            # sync/own mode), then 获取模型 ids under 当前接口 as bare refs.
+# current_settings(): a verbatim listed row -> its ModelRef; anything else typed -> bare ref.
+# prefill(): pool refs select their row (a vanished one is appended under 已失效), bare
+# ids are typed. 测试连接 probes the first filled pick via profile_lookup when it is a
+# pool ref, else the base endpoint.
+
+# nlapt_gui/widgets/llm_providers_tab.py
+def pool_groups() -> grouped choices of the DRAFT config   # feeds CHATab / CompareTab
+def profile_for_ref(ref) -> LLMProfile | None              # bind_model_ref(draft, ref, ROLE_VISION)
+
+# nlapt_gui/controller.py
+def profile_for_ref(self, ref: ModelRef) -> LLMProfile | None   # saved config, ROLE_VISION
+def request_concurrency(self) -> int
+# LayeredInferDialog passes lookup=controller.profile_for_ref; card labels show
+# "provider · model" for pool refs, the bare model otherwise.
+```
+
+### 多对比推标
+
+```python
+# nlapt_gui/compare_config.py — AppData compare_infer.json, refs only
+class CompareSettings: models: tuple[ModelRef, ...]   # deduped, bare/unset dropped
+MIN_COMPARE_MODELS = 2
+def load_compare_settings() / save_compare_settings(settings)
+
+# nlapt_gui/widgets/pool_model_list.py
+class PoolModelList(QListWidget): changed = Signal()
+    def set_groups(groups, checked); def checked_refs(); def set_checked(refs)
+# nlapt_gui/widgets/compare_tab.py — 设置 sixth tab TAB_COMPARE = "多对比推标"
+class CompareTab: current_settings() / prefill(settings) / refresh_pool()
+# refresh_pool remembers checked refs whose provider is switched off so they come back.
+
+# nlapt_gui/compare_bridge.py
+class CompareRunner(QObject):
+    item_ready = Signal(str, object, str, bool)   # key, ModelRef, text_or_error, ok
+    progress = Signal(int, int); finished = Signal()
+    def start(keys, refs, *, system, user_prompt, concurrency=1) -> str | None
+    def cancel(); def running()
+# One captioner per ref via controller.make_vision_captioner_or_none(profile_for_ref(ref));
+# jobs = keys × refs through run_async with at most `concurrency` in flight. A stale
+# ref or missing Base URL aborts start() with a Chinese message — never silently fewer
+# models. Cancel drops in-flight results. No txt writes, no batch_running flag.
+
+# nlapt_gui/widgets/compare_infer_dialog.py
+class CompareInferDialog(CenteredDialog):
+    def __init__(controller, keys, refs, *, loader, runner=None, prompts=None, pool=None, parent)
+    def start() -> str | None; current_key(); choice_for(key); chosen_caption(key)
+    def apply_all(); def write_chosen() -> bool
+def open_compare_infer(controller, keys, loader, parent=None) -> CompareInferDialog | None
+# tools_menu: ACTION_INFER_COMPARE = "infer_compare", LABEL_INFER_COMPARE = "多对比推标…"
+```
+
+1. The dialog opens immediately and cards fill as `item_ready` arrives;
+   results and per-card edits are kept per `(key, ref)` so browsing never
+   refetches. Radios share one `QButtonGroup`; a failed model's card shows
+   the error and cannot be picked.
+2. 「全部采用 X」 picks X for every image where X succeeded. 「写入已选 (n)」 is
+   enabled once the runner finished or was cancelled and n > 0; it calls
+   `controller.run_caption_batch(chosen_keys, caption_fn, description="多对比推标 · {n} 张",
+   history_label="多对比推标", engine=ENGINE_LLM)` with the (edited) chosen
+   text — same snapshot / oplog / per-file history / progress window as
+   LLM 推标. Unpicked images are untouched. Closing the dialog cancels the runner.
+3. Prompts are the LLM 推标 ones (`load_vision_prompts().system_text_for /
+   user_prompt_for(ENGINE_LLM)`); concurrency is `controller.request_concurrency()`.
+4. `MainWindow._dispatch_tool_action` routes the action through
+   `pick_scope_keys` → `open_compare_infer` (module-level launcher keeps
+   `main_window.py` under the 800-line cap).
+
+## v1.46 — Right-click 多对比推标 + popup without 修改工具
+
+```python
+# nlapt_gui/widgets/file_panel_infer.py
+MENU_COMPARE_IMAGE = "多对比推标这张图片"; MENU_COMPARE_SELECTED = "多对比推标已选({n} 张)"
+MENU_COMPARE_FOLDER = "多对比推标此文件夹({n} 张)"; MENU_COMPARE_FOLDER_UNLABELED = "多对比推标此文件夹未标注({n} 张)"
+MENU_COMPARE_ALL = "多对比推标全部({n} 张)"; MENU_COMPARE_ALL_UNLABELED = "多对比推标全部未标注({n} 张)"
+class InferMenuHost(Protocol):
+    def _request_compare(self, keys: tuple[str, ...]) -> None: ...
+# build_infer_actions: every scope block is now a quartet — LLM, 本地, CHA标注, 多对比推标.
+
+# nlapt_gui/widgets/file_panel.py
+FilePanel.compare_infer_requested = Signal(object)   # keys tuple; no confirm (the review window is the gate)
+
+# nlapt_gui/widgets/main_window.py
+def _open_compare_infer(self, keys: object) -> None  # shared by the panel signal and ACTION_INFER_COMPARE
+```
+
+1. The 工具 popup no longer lists 修改工具 (`ACTION_TEXT_TOOLS` / `LABEL_TEXT_TOOLS`
+   removed; supersedes that item of v1.40). The drawer keeps its own rail
+   button (`ToolbarRail.tools_button`, tooltip 修改工具) and `set_tools_open`.
+2. Right-click 多对比推标 entries follow the CHA标注 rules exactly: 这张图片 on
+   a single cell, 已选 + 全部 when the cell is part of a multi-selection,
+   此文件夹 / 此文件夹未标注 / 全部 on folder headers, 全部 / 全部未标注 on the
+   ALL row and 根目录. `popup_infer_menu`'s separator heuristic places them in
+   their own group.
+
+## v1.47 — Logo menu drops 使用说明; About names the author
+
+```python
+# nlapt_gui/widgets/title_bar.py  (strings shared with ToolbarRail)
+ACTION_ABOUT = "关于"; ABOUT_TITLE = "关于 NLapt"; AUTHOR = "storyAura"
+ABOUT_TEXT = (
+    f"{APP_NAME}\n{VERSION_LABEL}\n\n"
+    "面向图像生成与 LoRA 训练的桌面标注编辑器。\n"
+    "处理「图片 + 同名 .txt」，单张精修，批量可回滚。\n\n"
+    f"作者：{AUTHOR}"
+)
+# ACTION_GUIDE / GUIDE_TITLE / GUIDE_TEXT / TitleBar.show_guide removed.
+
+# nlapt_gui/widgets/toolbar_rail.py
+# Logo QMenu: 关于 / 退出. ACTION_GUIDE and show_guide removed.
+```
+
+1. The live Logo menu (and the retained `TitleBar` 帮助 menu) no longer
+   list 使用说明. Product documentation stays in `docs/功能清单.md`.
+2. `ABOUT_TEXT` is a short product blurb plus `作者：storyAura`.
+

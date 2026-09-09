@@ -431,6 +431,9 @@ class TestInferMenu:
         assert "CHA标注此文件夹(2 张)" in labels
         assert "CHA标注此文件夹未标注(1 张)" in labels
         assert "CHA标注全部(4 张)" in labels
+        assert "多对比推标此文件夹(2 张)" in labels
+        assert "多对比推标此文件夹未标注(1 张)" in labels
+        assert "多对比推标全部(4 张)" in labels
         assert "用 LLM 推理此文件夹未标注(1 张)" in labels
         assert "用本地模型推理此文件夹未标注(1 张)" in labels
         assert "用 LLM 推理全部(4 张)" in labels
@@ -447,6 +450,7 @@ class TestInferMenu:
         assert "用 LLM 推理全部(4 张)" in labels
         assert "用 LLM 推理全部未标注(1 张)" in labels
         assert "用本地模型推理全部未标注(1 张)" in labels
+        assert "多对比推标全部未标注(1 张)" in labels
 
     def test_root_group_menu_matches_all_row(
         self, panel: FilePanel, controller: AppController
@@ -466,6 +470,7 @@ class TestInferMenu:
             "用 LLM 推理这张图片",
             "用本地模型推理这张图片",
             "CHA标注这张图片",
+            "多对比推标这张图片",
         ]
 
     def test_image_menu_multiselect_adds_selected_and_all(
@@ -478,6 +483,7 @@ class TestInferMenu:
         assert "用本地模型推理已选(2 张)" in labels
         assert "用 LLM 推理全部(4 张)" in labels
         assert "用本地模型推理全部(4 张)" in labels
+        assert "多对比推标已选(2 张)" in labels
         assert not any("这张图片" in label for label in labels)
         assert not any("此文件夹" in label for label in labels)
 
@@ -491,6 +497,7 @@ class TestInferMenu:
             "用 LLM 推理这张图片",
             "用本地模型推理这张图片",
             "CHA标注这张图片",
+            "多对比推标这张图片",
         ]
 
     def test_image_action_infers_single_key(
@@ -521,6 +528,26 @@ class TestInferMenu:
         )
         dict(panel.infer_menu_actions(None, image=K2))["CHA标注这张图片"]()
         assert received == [(K2,)]
+        assert confirms == []
+
+    def test_compare_action_emits_without_confirm(
+        self, qtbot, panel: FilePanel, controller: AppController, monkeypatch
+    ) -> None:
+        import nlapt_gui.widgets.file_panel as fp_module
+
+        confirms: list[object] = []
+        monkeypatch.setattr(
+            fp_module, "ask_confirm", lambda *a, **k: confirms.append(True) or True
+        )
+        received: list[tuple[str, ...]] = []
+        panel.compare_infer_requested.connect(
+            lambda keys: received.append(tuple(keys))
+        )
+        dict(panel.infer_menu_actions(None, image=K2))["多对比推标这张图片"]()
+        controller.toggle_selected(K1)
+        controller.toggle_selected(K2)
+        dict(panel.infer_menu_actions(None, image=K1))["多对比推标已选(2 张)"]()
+        assert received == [(K2,), (K1, K2)]
         assert confirms == []
 
     def test_unlabeled_action_targets_only_unlabeled(

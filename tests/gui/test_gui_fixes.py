@@ -252,8 +252,11 @@ class TestSettingsSafety:
         corrupt = "{ this is not valid json"
         path.write_text(corrupt, encoding="utf-8")
         dialog = SettingsDialog(controller)
-        dialog.base_url.setText("http://localhost:1")
-        dialog.text_model.setText("model")
+        dialog.llm_tab.add_profile()
+        dialog.llm_tab.base_url.setText("http://localhost:1")
+        dialog.llm_tab.new_model_edit.setText("model")
+        dialog.llm_tab.add_model()
+        dialog.llm_tab.text_combo.setCurrentIndex(1)
         dialog.save()
         assert path.read_text(encoding="utf-8") == corrupt  # untouched
         assert any("无法读取现有配置" in text for text, _ in toasts)

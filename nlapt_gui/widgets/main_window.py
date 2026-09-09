@@ -52,22 +52,41 @@ from nlapt.diagnostics import get_logger
 from nlapt.storage.atomic import atomic_write_text
 
 from nlapt_gui import anim
-from nlapt_gui.controller import TOAST_NO_DATASET, TOAST_WARN, AppController
+from nlapt_gui.controller import TOAST_NO_DATASET, TOAST_NO_SELECTION, TOAST_WARN, AppController
+from nlapt_gui.image_tools_bridge import ImageToolsBridge
 from nlapt_gui.resources import app_data_dir
 from nlapt_gui.theme.logo import load_app_icon
 from nlapt_gui.theme.manager import ThemeManager
 from nlapt_gui.theme.tokens import EDITOR_H_RANGE, MIN_WINDOW, ThemeTokens
 from nlapt_gui.translate_bridge import TranslateBridge
 from nlapt_gui.vision_bridge import VisionBridge
+from nlapt_gui.prompt_store import ENGINE_LLM, ENGINE_LOCAL
 from nlapt_gui.widgets.batch_progress_dialog import BatchProgressDialog
+from nlapt_gui.widgets.batch_scope_dialog import pick_scope_keys
 from nlapt_gui.widgets.color_dialog import ColorSettingsDialog
 from nlapt_gui.widgets.dialogs import ask_confirm
+from nlapt_gui.widgets.duplicate_review_dialog import DuplicateReviewDialog
 from nlapt_gui.widgets.editor_panel import EditorPanel
 from nlapt_gui.widgets.file_panel import FilePanel
+from nlapt_gui.widgets.flatten_alpha_dialog import FlattenAlphaDialog
 from nlapt_gui.widgets.layered_infer_dialog import LayeredInferDialog
 from nlapt_gui.widgets.preview_panel import HEADER_H, PreviewPanel, SplitterHandle
 from nlapt_gui.widgets.toast import ToastOverlay
 from nlapt_gui.widgets.toolbar_rail import ToolbarRail
+from nlapt_gui.widgets.compare_infer_dialog import open_compare_infer
+from nlapt_gui.widgets.tools_menu import (
+    ACTION_FIND_DUPLICATES,
+    ACTION_FLATTEN_ALPHA,
+    ACTION_INFER_CHA,
+    ACTION_INFER_COMPARE,
+    ACTION_INFER_LLM,
+    ACTION_INFER_LOCAL,
+    ACTION_UNDO_IMAGE_OP,
+    LABEL_INFER_CHA,
+    LABEL_INFER_COMPARE,
+    LABEL_INFER_LLM,
+    LABEL_INFER_LOCAL,
+)
 from nlapt_gui.widgets.tools_panel import ToolsPanel
 
 _LOGGER = get_logger(__name__)
@@ -213,6 +232,7 @@ class MainWindow(QWidget):
         # Keep strong references: the bridges own async LLM work.
         self.translate_bridge = TranslateBridge(controller, parent=self)
         self.vision_bridge = VisionBridge(controller, parent=self)
+        self.image_tools = ImageToolsBridge(controller, parent=self)
 
         self.rail = ToolbarRail(controller, theme_manager, self)
         self.file_panel = FilePanel(controller, tokens=theme_manager.tokens, parent=self)
@@ -249,12 +269,16 @@ class MainWindow(QWidget):
             lambda keys, engine: self.vision_bridge.request_batch(tuple(keys), engine)
         )
         self.file_panel.layered_infer_requested.connect(self._open_layered_infer)
+        self.file_panel.compare_infer_requested.connect(self._open_compare_infer)
         self._layered_dialog: LayeredInferDialog | None = None
         self.rail.open_folder_requested.connect(self.pick_folder)
         self.rail.settings_requested.connect(self.tools_panel.open_settings_dialog)
         self.rail.colors_requested.connect(self.open_color_settings)
         self.rail.export_requested.connect(self.export_dataset)
         self.rail.tools_toggled.connect(self.set_tools_open)
+        self.rail.tool_action_requested.connect(self._dispatch_tool_action)
+        self.rail.model_switch_requested.connect(self._controller.set_model_target)
+        self.tools_panel.close_requested.connect(lambda: self.rail.set_tools_open(False))
 
         theme_manager.theme_changed.connect(self._on_theme_changed)
         self._install_shortcuts()
@@ -339,6 +363,50 @@ class MainWindow(QWidget):
         self.tools_panel.set_busy(busy)
 
     # -- folder picking ---------------------------------------------------------------
+    def _dispatch_tool_action(self, action_id: str) -> None:
+        """Launch a 工具-menu action (image tools or one of the 推标 flavours)."""
+        if action_id == ACTION_FLATTEN_ALPHA:
+            FlattenAlphaDialog(self._controller, self.image_tools, parent=self).exec()
+            return
+        if action_id == ACTION_FIND_DUPLICATES:
+            DuplicateReviewDialog(
+                self._controller,
+                self.image_tools,
+                self.file_panel.thumbnail_loader,
+                parent=self,
+            ).exec()
+            return
+        if action_id == ACTION_UNDO_IMAGE_OP:
+            self.image_tools.restore_last_backup()
+            return
+        title = {
+            ACTION_INFER_LLM: LABEL_INFER_LLM,
+            ACTION_INFER_LOCAL: LABEL_INFER_LOCAL,
+            ACTION_INFER_CHA: LABEL_INFER_CHA,
+            ACTION_INFER_COMPARE: LABEL_INFER_COMPARE,
+        }.get(action_id)
+        if title is None:
+            return
+        keys = pick_scope_keys(self._controller, title, parent=self)
+        if keys is None:
+            return
+        if not keys:
+            self._controller.toast_requested.emit(TOAST_NO_SELECTION, TOAST_WARN)
+            return
+        if action_id == ACTION_INFER_CHA:
+            self._open_layered_infer(keys)
+            return
+        if action_id == ACTION_INFER_COMPARE:
+            self._open_compare_infer(keys)
+            return
+        engine = ENGINE_LOCAL if action_id == ACTION_INFER_LOCAL else ENGINE_LLM
+        self.vision_bridge.request_batch(keys, engine)
+
+    def _open_compare_infer(self, keys: object) -> None:
+        """Show the 多对比推标 review window for a key list (right-click or 工具 popup)."""
+        batch = tuple(keys) if isinstance(keys, (list, tuple)) else ()
+        open_compare_infer(self._controller, batch, self.file_panel.thumbnail_loader, self)
+
     def _open_layered_infer(self, keys: object) -> None:
         """Show the 分层推标 wizard for the file-panel menu's key list."""
         batch = tuple(keys) if isinstance(keys, (list, tuple)) else ()

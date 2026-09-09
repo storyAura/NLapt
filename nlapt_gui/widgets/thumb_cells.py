@@ -314,6 +314,14 @@ def _paint_settings(p: QPainter, color: QColor) -> None:
     p.drawEllipse(QRectF(2.2, 2.2, 11.6, 11.6))
 
 
+def _paint_apps(p: QPainter, color: QColor) -> None:
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(color)
+    for row in (2.4, 6.6, 10.8):
+        for col in (2.4, 6.6, 10.8):
+            p.drawEllipse(QRectF(col, row, 2.8, 2.8))
+
+
 def _paint_theme(p: QPainter, color: QColor) -> None:
     p.setPen(_pen(color, 1.5))
     p.drawEllipse(QRectF(4.5, 4.5, 7.0, 7.0))
@@ -345,6 +353,7 @@ _ICON_PAINTERS: dict[str, Callable[[QPainter, QColor], None]] = {
     "save_all": _paint_save_all,
     "export": _paint_export,
     "tools": _paint_tools,
+    "apps": _paint_apps,
     "settings": _paint_settings,
     "theme": _paint_theme,
     "view_list": _paint_view_list,

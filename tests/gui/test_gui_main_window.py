@@ -394,6 +394,34 @@ class TestEdgeResize:
         assert not window.edge_at(QPoint(window.width() // 2, window.height() // 2))
 
 
+class TestCompareInferAction:
+    def test_dispatch_routes_scope_to_compare_launcher(
+        self, window, controller, monkeypatch
+    ) -> None:
+        from nlapt_gui.widgets import main_window as mw
+        from nlapt_gui.widgets.tools_menu import ACTION_INFER_COMPARE, LABEL_INFER_COMPARE
+
+        picked: list[str] = []
+        launched: list[tuple[tuple[str, ...], object]] = []
+        monkeypatch.setattr(
+            mw,
+            "pick_scope_keys",
+            lambda ctrl, title, parent=None: picked.append(title) or (K1, K2),
+        )
+        monkeypatch.setattr(
+            mw,
+            "open_compare_infer",
+            lambda ctrl, keys, loader, parent=None: launched.append((tuple(keys), loader)),
+        )
+        window._dispatch_tool_action(ACTION_INFER_COMPARE)
+        assert picked == [LABEL_INFER_COMPARE]
+        assert launched == [((K1, K2), window.file_panel.thumbnail_loader)]
+        # The file panel's right-click entry takes the same route (no scope dialog).
+        window.file_panel.compare_infer_requested.emit((K2,))
+        assert picked == [LABEL_INFER_COMPARE]
+        assert launched[-1] == ((K2,), window.file_panel.thumbnail_loader)
+
+
 class TestToasts:
     def test_controller_toasts_reach_overlay(self, qtbot, window, controller) -> None:
         controller.toast_requested.emit("集成冒烟提示", "ok")

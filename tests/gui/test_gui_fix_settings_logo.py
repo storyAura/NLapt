@@ -207,9 +207,11 @@ class TestProviderRows:
         _select(dialog, PROVIDER_LLM)
         for widget in _baidu_widgets(dialog) + _deepl_widgets(dialog):
             assert not widget.isVisible()
-        # The LLM profile form stays fully available on its own tab.
-        dialog.tabs.setCurrentIndex(dialog.tabs.indexOf(dialog.api_type.parentWidget()))
-        for widget in (dialog.api_type, dialog.base_url, dialog.text_model):
+        # The LLM tab stays fully available on its own tab.
+        dialog.tabs.setCurrentIndex(dialog.tabs.indexOf(dialog.llm_tab))
+        dialog.llm_tab.add_profile()
+        tab = dialog.llm_tab
+        for widget in (tab.profile_list, tab.api_type, tab.base_url, tab.text_combo):
             assert widget.isVisible()
 
     def test_registration_note_updates_per_provider(

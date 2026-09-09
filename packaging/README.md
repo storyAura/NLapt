@@ -4,9 +4,15 @@
 
 ## 最快方式:双击根目录的批处理
 
-- `Launch-NLapt.bat` — 双击直接运行图形界面(缺依赖会自动安装 PySide6/Pillow)。
-- `Build-NLapt.bat` — 双击一键打包(缺 PyInstaller 会自动安装),完成后自动打开
+- `Launch-NLapt.bat` — 双击直接运行图形界面(缺依赖会自动安装 PySide6 / Pillow / httpx,
+  并尽力安装 Florence-2 所需的 numpy / onnxruntime)。
+- `Build-NLapt.bat` — 双击一键打包(缺 PyInstaller 或任一运行依赖会自动安装),完成后自动打开
   `dist\NLapt` 输出目录。等价于下文的 `build.ps1` 流程。
+
+> `httpx` 承担全部 LLM / 翻译 / 本机 llama-server 请求。它是懒加载的隐式依赖,
+> 打包机上若未安装,PyInstaller 只会给出 warning 并照常产出 exe,用户一做推理就会看到
+> 「The 'httpx' package is required for LLM HTTP clients」。因此 `nlapt.spec` 在
+> `Analysis` 之前会先检查 PySide6 / PIL / httpx / numpy / onnxruntime,缺任一个直接报错终止。
 
 > 两个 `.bat` 为纯 ASCII 英文脚本(不含中文、不使用 `chcp`),以避免在 GBK 默认
 > 代码页的中文 Windows 上出现乱码/解析错误。
@@ -16,8 +22,8 @@
 ## 环境准备
 
 ```powershell
-# 在仓库根目录,安装运行与打包依赖
-pip install -e .[gui]
+# 在仓库根目录,安装全部运行依赖与打包依赖
+pip install -e .[gui,images,llm,local]
 pip install pyinstaller
 ```
 

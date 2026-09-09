@@ -18,7 +18,7 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 
@@ -27,7 +27,12 @@ from nlapt.batch.engine import BatchEngine, ProgressCallback
 from nlapt.batch.progress import BatchController, BatchItemResult, BatchReport
 from nlapt.captions.store import CaptionRecord, CaptionStore, PendingSuggestion
 from nlapt.captions.tokens import TokenEstimator, get_default_estimator
-from nlapt.core.config import AppConfig, LLMProfile, get_active_profile
+from nlapt.core.config import (
+    AppConfig,
+    LLMProfile,
+    resolve_text_profile,
+    resolve_vision_profile,
+)
 from nlapt.core.errors import (
     LLMConfigError,
     SessionError,
@@ -655,30 +660,37 @@ class NLaptApp:
     TRANSLATE_TEMPLATE_KEYS = ("translate_en_zh", "translate_zh_en")
 
     def make_rewrite_service(self, *, trigger: str = "") -> RewriteService:
-        """Build a :class:`RewriteService` from the active profile.
+        """Build a :class:`RewriteService` from the current text / vision models.
 
         Wires the spec-8 request controls (``config.request``: timeout,
-        retries with backoff, min interval) into every LLM call. A vision
-        client is attached only when the profile names a vision model.
-        Raises :class:`LLMConfigError` when no active profile is configured.
+        retries with backoff, min interval) into every LLM call. The text
+        and vision clients come from ``config.text_target`` /
+        ``config.vision_target`` and may live on different APIs; a vision
+        client is attached only when a vision model is chosen. Raises
+        :class:`LLMConfigError` when no text model is configured.
         """
-        profile = self._require_profile()
-        vision_client = create_client(profile) if profile.vision_model else None
+        text_profile = self._require_profile()
+        vision_profile = resolve_vision_profile(self._config)
+        vision_client = create_client(vision_profile) if vision_profile is not None else None
+        merged = replace(
+            text_profile,
+            vision_model=vision_profile.vision_model if vision_profile is not None else "",
+        )
         return RewriteService(
-            text_client=create_client(profile),
+            text_client=create_client(text_profile),
             vision_client=vision_client,
-            profile=profile,
+            profile=merged,
             trigger=trigger,
             request=self._config.request,
         )
 
     def make_translator(self, *, cache: TranslationCache | None = None) -> Translator:
-        """Build a :class:`Translator` from the active profile.
+        """Build a :class:`Translator` from the current text model.
 
         Wires the spec-8 request controls and any user-edited translation
         prompt templates saved in ``config.custom_templates`` under the
         :data:`TRANSLATE_TEMPLATE_KEYS` names. Raises
-        :class:`LLMConfigError` when no active profile is configured.
+        :class:`LLMConfigError` when no text model is configured.
         """
         profile = self._require_profile()
         overrides = {
@@ -695,11 +707,11 @@ class NLaptApp:
         )
 
     def _require_profile(self) -> LLMProfile:
-        profile = get_active_profile(self._config)
+        profile = resolve_text_profile(self._config)
         if profile is None:
             raise LLMConfigError(
-                "no active LLM profile configured — add a profile and set "
-                "AppConfig.active_profile before using LLM features"
+                "no text model configured — add an API profile, enable a model "
+                "and set AppConfig.text_target before using LLM features"
             )
         return profile
 

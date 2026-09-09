@@ -9,6 +9,7 @@ import pytest
 from nlapt.core.errors import (
     BatchCancelledError,
     EncodingDetectionError,
+    ImageProcessingError,
     LLMConfigError,
     LLMError,
     LLMOutputError,
@@ -40,6 +41,7 @@ from nlapt.core.errors import (
         (LLMTimeoutError, LLMRequestError),
         (LLMOutputError, LLMError),
         (BatchCancelledError, NLaptError),
+        (ImageProcessingError, NLaptError),
     ],
 )
 def test_hierarchy(child: type, parent: type) -> None:

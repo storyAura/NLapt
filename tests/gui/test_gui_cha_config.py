@@ -6,7 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from nlapt.core.config import LLMProfile
+import json
+
+from nlapt.core.config import LLMProfile, ModelRef
 from nlapt.core.errors import StorageError
 
 from nlapt_gui.api_config import api_config_path
@@ -16,6 +18,7 @@ from nlapt_gui.cha_config import (
     CHASettings,
     cha_settings_path,
     load_cha_settings,
+    model_ref_from_value,
     resolve_base_profile,
     resolve_batch_profile,
     resolve_card_profile,
@@ -48,12 +51,43 @@ class TestRoundTrip:
         save_cha_settings(settings)
         loaded = load_cha_settings()
         assert loaded == settings
+        # Strings are normalised to bare refs (typed ids on the base endpoint).
+        assert loaded.card_models == (ModelRef("", "m0"), ModelRef("", "m1"), ModelRef("", "m2"))
+        assert loaded.batch_model == ModelRef("", "mbatch")
         public = cha_settings_path().read_text(encoding="utf-8")
         assert "sk-secret-cha" not in public
         assert "http://cha.local" not in public
         unified = api_config_path().read_text(encoding="utf-8")
         assert "sk-secret-cha" in unified
         assert "http://cha.local" in unified
+
+    def test_pool_refs_round_trip_as_objects(self) -> None:
+        settings = CHASettings(
+            card_models=(ModelRef("alpha", "gpt-4o"), "typed", ModelRef()),
+            batch_model=ModelRef("beta", "llava"),
+        )
+        save_cha_settings(settings)
+        raw = json.loads(cha_settings_path().read_text(encoding="utf-8"))
+        assert raw["card_models"][0] == {"profile": "alpha", "model": "gpt-4o"}
+        assert raw["card_models"][1] == {"profile": "", "model": "typed"}
+        assert raw["batch_model"] == {"profile": "beta", "model": "llava"}
+        assert load_cha_settings() == settings
+
+    def test_legacy_string_file_still_loads(self, tmp_path: Path) -> None:
+        path = tmp_path / "cha_annotation.json"
+        path.write_text(
+            json.dumps({"api_mode": "sync", "card_models": ["a", "", "c"], "batch_model": "d"}),
+            encoding="utf-8",
+        )
+        loaded = load_cha_settings(path)
+        assert loaded.card_models == (ModelRef("", "a"), ModelRef(), ModelRef("", "c"))
+        assert loaded.batch_model == ModelRef("", "d")
+
+    def test_model_ref_from_value(self) -> None:
+        assert model_ref_from_value(" x ") == ModelRef("", "x")
+        assert model_ref_from_value({"profile": " p ", "model": "m"}) == ModelRef("p", "m")
+        assert model_ref_from_value({"profile": 3, "model": None}) == ModelRef()
+        assert model_ref_from_value(42) == ModelRef()
 
     def test_missing_file_is_sync_defaults(self) -> None:
         assert load_cha_settings() == CHASettings()
@@ -66,7 +100,7 @@ class TestRoundTrip:
     def test_unknown_mode_and_short_models_normalize(self) -> None:
         settings = CHASettings(api_mode="nope", card_models=("only",))
         assert settings.api_mode == API_MODE_SYNC
-        assert settings.card_models == ("only", "", "")
+        assert settings.card_models == (ModelRef("", "only"), ModelRef(), ModelRef())
 
     def test_save_rejects_wrong_type(self) -> None:
         with pytest.raises(StorageError):
@@ -136,3 +170,28 @@ class TestResolve:
         settings = CHASettings()
         assert resolve_card_profile(settings, bare, 0) is None
         assert resolve_batch_profile(settings, bare) is None
+
+    def test_pool_refs_resolve_through_lookup_only(self) -> None:
+        other = LLMProfile(
+            name="beta", api_type="ollama", base_url="http://beta", vision_model="llava"
+        )
+        seen: list[ModelRef] = []
+
+        def lookup(ref: ModelRef) -> LLMProfile | None:
+            seen.append(ref)
+            return other if ref == ModelRef("beta", "llava") else None
+
+        settings = CHASettings(
+            card_models=(ModelRef("beta", "llava"), ModelRef("beta", "gone"), "typed"),
+            batch_model=ModelRef("beta", "llava"),
+        )
+        card0 = resolve_card_profile(settings, ACTIVE, 0, lookup=lookup)
+        assert card0 is other  # another API entirely, not the sync base
+        assert resolve_card_profile(settings, ACTIVE, 1, lookup=lookup) is None  # stale
+        typed = resolve_card_profile(settings, ACTIVE, 2, lookup=lookup)
+        assert typed is not None and typed.base_url == "http://main.local"
+        assert typed.vision_model == "typed"
+        assert resolve_batch_profile(settings, ACTIVE, lookup=lookup) is other
+        # Without a lookup a pool ref cannot be honoured -> unconfigured.
+        assert resolve_card_profile(settings, ACTIVE, 0) is None
+        assert seen[0] == ModelRef("beta", "llava")

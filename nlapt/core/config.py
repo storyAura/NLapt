@@ -37,7 +37,14 @@ MIN_MASKABLE_LENGTH = MASK_PREFIX_CHARS + MASK_SUFFIX_CHARS + MIN_HIDDEN_CHARS
 
 @dataclass(frozen=True)
 class LLMProfile:
-    """One configured LLM service profile."""
+    """One configured LLM API (an endpoint plus the models known on it).
+
+    ``models`` is the catalog the user fetched or typed; ``enabled_models`` is
+    the subset switched on for the shared model pool. ``text_model`` /
+    ``vision_model`` are the ids a *resolved* profile is bound to (see
+    :func:`resolve_text_profile`); on a stored profile they are only the
+    legacy per-profile defaults used by :func:`upgrade_legacy_targets`.
+    """
 
     name: str
     api_type: str  # "openai" | "anthropic" | "ollama" (registry-extensible)
@@ -48,6 +55,27 @@ class LLMProfile:
     temperature: float = 0.7
     max_tokens: int = 1024
     system_prompt: str = ""
+    models: tuple[str, ...] = ()
+    enabled_models: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "models", tuple(self.models))
+        object.__setattr__(self, "enabled_models", tuple(self.enabled_models))
+
+
+@dataclass(frozen=True)
+class ModelRef:
+    """A model chosen from the pool: ``model`` on the profile named ``profile``."""
+
+    profile: str = ""
+    model: str = ""
+
+    def is_set(self) -> bool:
+        return bool(self.profile) and bool(self.model)
+
+
+ROLE_TEXT = "text"
+ROLE_VISION = "vision"
 
 
 @dataclass(frozen=True)
@@ -65,7 +93,9 @@ class AppConfig:
     """Top-level application configuration."""
 
     profiles: tuple[LLMProfile, ...] = ()
-    active_profile: str = ""
+    active_profile: str = ""  # legacy single-profile selection (see upgrade_legacy_targets)
+    text_target: ModelRef = ModelRef()
+    vision_target: ModelRef = ModelRef()
     request: RequestControl = RequestControl()
     image_max_edge: int = 1024
     revert_confirmed_on_edit: bool = True  # spec 4.1 supplementary rule
@@ -116,6 +146,25 @@ def _get_bool(data: Mapping[str, Any], key: str, default: bool, context: str) ->
     return bool(_expect_type(value, bool, f"{context}.{key}"))
 
 
+def _get_str_list(data: Mapping[str, Any], key: str, context: str) -> tuple[str, ...]:
+    raw = data.get(key, [])
+    _expect_type(raw, list, f"{context}.{key}")
+    return tuple(
+        str(_expect_type(item, str, f"{context}.{key}[{i}]")) for i, item in enumerate(raw)
+    )
+
+
+def model_ref_from_dict(data: Any, context: str) -> ModelRef:
+    """Parse a ``{"profile": ..., "model": ...}`` object (missing -> unset)."""
+    if data is None:
+        return ModelRef()
+    _expect_type(data, dict, context)
+    return ModelRef(
+        profile=_get_str(data, "profile", "", context),
+        model=_get_str(data, "model", "", context),
+    )
+
+
 def profile_from_dict(data: Any, index: int = 0) -> LLMProfile:
     """Parse one LLM profile object (unknown ``api_type`` is tolerated)."""
     context = f"profiles[{index}]"
@@ -130,6 +179,8 @@ def profile_from_dict(data: Any, index: int = 0) -> LLMProfile:
         temperature=_get_float(data, "temperature", 0.7, context),
         max_tokens=_get_int(data, "max_tokens", 1024, context),
         system_prompt=_get_str(data, "system_prompt", "", context),
+        models=_get_str_list(data, "models", context),
+        enabled_models=_get_str_list(data, "enabled_models", context),
     )
     if profile.api_type and profile.api_type not in KNOWN_API_TYPES:
         # Tolerated here: the client registry may have extra types registered.
@@ -185,6 +236,8 @@ def _config_from_dict(data: Mapping[str, Any]) -> AppConfig:
     return AppConfig(
         profiles=profiles,
         active_profile=_get_str(data, "active_profile", "", "config"),
+        text_target=model_ref_from_dict(data.get("text_target"), "text_target"),
+        vision_target=model_ref_from_dict(data.get("vision_target"), "vision_target"),
         request=request,
         image_max_edge=_get_int(data, "image_max_edge", defaults.image_max_edge, "config"),
         revert_confirmed_on_edit=_get_bool(
@@ -241,6 +294,136 @@ def get_active_profile(config: AppConfig) -> LLMProfile | None:
         if profile.name == config.active_profile:
             return profile
     return None
+
+
+# ---- model pool -----------------------------------------------------------------
+
+
+def find_profile(config: AppConfig, name: str) -> LLMProfile | None:
+    """The profile named ``name`` (exact match), or None."""
+    if not name:
+        return None
+    for profile in config.profiles:
+        if profile.name == name:
+            return profile
+    return None
+
+
+def enabled_model_refs(config: AppConfig) -> tuple[ModelRef, ...]:
+    """Every switched-on model across all profiles (profile order, then model order)."""
+    refs: list[ModelRef] = []
+    for profile in config.profiles:
+        for model in profile.enabled_models:
+            if model:
+                refs.append(ModelRef(profile=profile.name, model=model))
+    return tuple(refs)
+
+
+def resolve_model_ref(config: AppConfig, ref: ModelRef) -> LLMProfile | None:
+    """The profile ``ref`` points at, or None when it is unset / stale.
+
+    Stale means the profile no longer exists or the model has been switched
+    off — the caller must treat that as "unconfigured", never fall back to a
+    different model silently.
+    """
+    if not ref.is_set():
+        return None
+    profile = find_profile(config, ref.profile)
+    if profile is None or ref.model not in profile.enabled_models:
+        return None
+    return profile
+
+
+def _role_field(role: str) -> str:
+    if role not in (ROLE_TEXT, ROLE_VISION):
+        raise ValidationError(f"unknown model role {role!r}")
+    return "text_model" if role == ROLE_TEXT else "vision_model"
+
+
+def bind_model_ref(config: AppConfig, ref: ModelRef, role: str) -> LLMProfile | None:
+    """The pool profile ``ref`` points at, bound to ``ref.model`` for ``role``.
+
+    ``text_model`` (ROLE_TEXT) or ``vision_model`` (ROLE_VISION) of the
+    returned copy is the chosen id; None for an unset / stale ref.
+    """
+    field_name = _role_field(role)
+    profile = resolve_model_ref(config, ref)
+    if profile is None:
+        return None
+    return dataclasses.replace(profile, **{field_name: ref.model})
+
+
+def _resolve_role(config: AppConfig, ref: ModelRef, role: str) -> LLMProfile | None:
+    field_name = _role_field(role)
+    if ref.is_set():
+        return bind_model_ref(config, ref, role)
+    # Legacy configs (single ``active_profile``, no targets) keep working.
+    active = get_active_profile(config)
+    if active is None or not getattr(active, field_name):
+        return None
+    return active
+
+
+def resolve_text_profile(config: AppConfig) -> LLMProfile | None:
+    """Profile bound to the current 文本模型 (``text_model`` = the chosen id)."""
+    if not isinstance(config, AppConfig):
+        raise ValidationError(f"config must be an AppConfig, got {type(config).__name__}")
+    return _resolve_role(config, config.text_target, ROLE_TEXT)
+
+
+def resolve_vision_profile(config: AppConfig) -> LLMProfile | None:
+    """Profile bound to the current 视觉模型 (``vision_model`` = the chosen id)."""
+    if not isinstance(config, AppConfig):
+        raise ValidationError(f"config must be an AppConfig, got {type(config).__name__}")
+    return _resolve_role(config, config.vision_target, ROLE_VISION)
+
+
+def _upgrade_profile(profile: LLMProfile) -> LLMProfile:
+    enabled = profile.enabled_models
+    if not enabled and not profile.models:
+        # Never touched by the pool UI: its legacy defaults become the switches.
+        # (A profile with a catalog but nothing enabled was switched off on purpose.)
+        enabled = tuple(
+            dict.fromkeys(m for m in (profile.text_model, profile.vision_model) if m)
+        )
+    missing = tuple(m for m in enabled if m not in profile.models)
+    if enabled == profile.enabled_models and not missing:
+        return profile
+    return dataclasses.replace(
+        profile, models=profile.models + missing, enabled_models=enabled
+    )
+
+
+def upgrade_legacy_targets(config: AppConfig) -> AppConfig:
+    """Derive pool state from a pre-pool config. Idempotent.
+
+    * A profile with neither ``models`` nor ``enabled_models`` enables its
+      ``text_model`` / ``vision_model`` (and lists them in ``models``).
+    * Unset ``text_target`` / ``vision_target`` are pointed at the
+      ``active_profile``'s models when it has them. The pool UI saves
+      ``active_profile=""``, so a target the user cleared on purpose is not
+      resurrected on the next load.
+    """
+    if not isinstance(config, AppConfig):
+        raise ValidationError(f"config must be an AppConfig, got {type(config).__name__}")
+    profiles = tuple(_upgrade_profile(p) for p in config.profiles)
+    text_target = config.text_target
+    vision_target = config.vision_target
+    active = get_active_profile(config)
+    if active is not None:
+        if not text_target.is_set() and active.text_model:
+            text_target = ModelRef(profile=active.name, model=active.text_model)
+        if not vision_target.is_set() and active.vision_model:
+            vision_target = ModelRef(profile=active.name, model=active.vision_model)
+    if (
+        profiles == config.profiles
+        and text_target == config.text_target
+        and vision_target == config.vision_target
+    ):
+        return config
+    return dataclasses.replace(
+        config, profiles=profiles, text_target=text_target, vision_target=vision_target
+    )
 
 
 def mask_secret(value: str) -> str:

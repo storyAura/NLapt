@@ -22,7 +22,15 @@ from nlapt.app import NLaptApp
 from nlapt.batch.progress import BatchController, BatchReport
 from nlapt.captions.chips import join_chips, split_chips
 from nlapt.captions.store import CaptionRecord
-from nlapt.core.config import AppConfig, LLMProfile, get_active_profile
+from nlapt.core.config import (
+    ROLE_VISION,
+    AppConfig,
+    LLMProfile,
+    ModelRef,
+    bind_model_ref,
+    resolve_text_profile,
+    resolve_vision_profile,
+)
 from nlapt.core.errors import LLMConfigError, NLaptError, ValidationError
 from nlapt.core.events import EVT_ENCODING_ISSUES, EVT_TXT_CONFLICT, Event
 from nlapt.core.models import DatasetScanResult, ImageFile
@@ -41,6 +49,14 @@ from nlapt.ops.prefix_suffix import PrefixSuffixOperation, PrefixSuffixSpec
 
 from nlapt_gui.history_model import FileHistory
 from nlapt_gui.layered_prompts import count_words, estimate_tokens
+from nlapt_gui.model_targets import (
+    ModelChoice,
+    current_target,
+    persist_targets,
+    pool_choices,
+    role_label,
+    switch_target,
+)
 from nlapt_gui.settings import UISettings, load_ui_settings, save_ui_settings
 from nlapt_gui.workers import run_async
 
@@ -50,7 +66,7 @@ _LOGGER = get_logger(__name__)
 FOLDER_ROOT_LABEL = "根目录"
 EDITOR_MODES: tuple[str, ...] = ("chips", "sents", "text")
 VIEW_MODES: tuple[str, ...] = ("list", "mid", "big")
-SCOPES: tuple[str, ...] = ("current", "selected", "all")
+SCOPES: tuple[str, ...] = ("current", "folder", "selected", "all")
 MULTI_PREVIEW_LIMIT = 4
 AS_TAG_JOINER = ", "
 
@@ -76,6 +92,8 @@ TOAST_NO_MATCH = "没有找到匹配内容"
 TOAST_PS_EMPTY = "请输入前缀/后缀内容"
 LABEL_UNDO = "撤销"
 LABEL_FIND_REPLACE = "查找替换"
+TOAST_MODEL_SWITCHED = "已切换{role}: {model}"
+TOAST_MODEL_CLEARED = "已清除{role}"
 POSITION_PREFIX = "prefix"
 POSITION_SUFFIX = "suffix"
 WORD_PREFIX = "添加前缀"
@@ -464,6 +482,20 @@ class AppController(QObject):
         """All keys inside one relative folder (根目录 for root files)."""
         return tuple(k for k in self._keys if self.folder_of(k) == folder)
 
+    def folder_tree_keys(self, folder: str) -> tuple[str, ...]:
+        """Keys in ``folder`` and every nested subfolder.
+
+        ``根目录`` (or any unknown empty label) returns the whole dataset.
+        """
+        if not folder or folder == FOLDER_ROOT_LABEL:
+            return self._keys
+        prefix = folder + "/"
+        return tuple(
+            key
+            for key in self._keys
+            if key.startswith(prefix) or self.folder_of(key) == folder
+        )
+
     def unlabeled_keys(self, keys: Sequence[str]) -> tuple[str, ...]:
         """Subset of ``keys`` whose caption is 未标注 (empty body text)."""
         return tuple(
@@ -729,7 +761,25 @@ class AppController(QObject):
             return self.selected_keys()
         if scope == "all":
             return self._keys
+        if scope == "folder":
+            if self._current is None:
+                return ()
+            return self.folder_tree_keys(self.folder_of(self._current))
         return (self._current,) if self._current is not None else ()
+
+    def begin_work(self) -> bool:
+        """Claim the single in-flight lock for a non-caption batch (image tools)."""
+        if self._batch_in_flight or self._rescanning:
+            self.toast_requested.emit(self.TOAST_BUSY, TOAST_WARN)
+            return False
+        self._batch_in_flight = True
+        self.busy_changed.emit(True)
+        return True
+
+    def end_work(self) -> None:
+        """Release the lock taken by :meth:`begin_work`."""
+        self._batch_in_flight = False
+        self.busy_changed.emit(False)
 
     def count_matches(
         self, find: str, case_sensitive: bool, scope: str, *, whole_word: bool = False
@@ -762,10 +812,10 @@ class AppController(QObject):
         if not find:
             self.toast_requested.emit(TOAST_FIND_EMPTY, TOAST_WARN)
             return
-        if scope == "selected" and not self._selected:
+        keys = self.scope_keys(scope)
+        if not keys:
             self.toast_requested.emit(TOAST_NO_SELECTION, TOAST_WARN)
             return
-        keys = self.scope_keys(scope)
         total, _files = self.count_matches(
             find, case_sensitive, scope, whole_word=whole_word
         )
@@ -793,9 +843,6 @@ class AppController(QObject):
         stripped = text.strip()
         if not stripped:
             self.toast_requested.emit(TOAST_PS_EMPTY, TOAST_WARN)
-            return
-        if scope == "selected" and not self._selected:
-            self.toast_requested.emit(TOAST_NO_SELECTION, TOAST_WARN)
             return
         keys = self.scope_keys(scope)
         if not keys:
@@ -989,9 +1036,51 @@ class AppController(QObject):
         self._translator = None
         self._translator_resolved = False
 
-    def active_profile(self) -> LLMProfile | None:
-        """The currently selected LLM profile, or None when unconfigured."""
-        return get_active_profile(self._app.config)
+    def text_profile(self) -> LLMProfile | None:
+        """Profile bound to the 当前文本模型, or None when unconfigured / stale."""
+        return resolve_text_profile(self._app.config)
+
+    def vision_profile(self) -> LLMProfile | None:
+        """Profile bound to the 当前视觉模型, or None when unconfigured / stale."""
+        return resolve_vision_profile(self._app.config)
+
+    def request_concurrency(self) -> int:
+        """Configured parallel request count (设置 ▸ 并发请求数)."""
+        return max(1, self._app.config.request.concurrency)
+
+    def profile_for_ref(self, ref: ModelRef) -> LLMProfile | None:
+        """Pool profile for ``ref`` with ``vision_model`` bound to it (None if stale)."""
+        return bind_model_ref(self._app.config, ref, ROLE_VISION)
+
+    def model_pool(self) -> tuple[ModelChoice, ...]:
+        """Every switched-on model across the API profiles (工具弹层 quick switch)."""
+        return pool_choices(self._app.config)
+
+    def model_target(self, role: str) -> ModelRef:
+        """The stored ref for ``role`` (text / vision); may be unset or stale."""
+        return current_target(self._app.config, role)
+
+    def set_model_target(self, role: str, ref: ModelRef) -> None:
+        """Point ``role`` (text / vision) at ``ref``, persist, reload, toast.
+
+        Raises ``ValidationError`` for a ref outside the pool; persistence
+        errors surface as a toast (the in-memory config is left untouched).
+        """
+        config = switch_target(self._app.config, role, ref)
+        try:
+            persist_targets(config)
+        except NLaptError as exc:
+            _LOGGER.exception("could not persist model target")
+            self.toast_requested.emit(str(exc), TOAST_ERR)
+            return
+        self.reload_config(config)
+        label = role_label(role)
+        if ref.is_set():
+            self.toast_requested.emit(
+                TOAST_MODEL_SWITCHED.format(role=label, model=ref.model), TOAST_OK
+            )
+        else:
+            self.toast_requested.emit(TOAST_MODEL_CLEARED.format(role=label), TOAST_INFO)
 
     def make_vision_captioner_or_none(
         self,
@@ -1001,11 +1090,11 @@ class AppController(QObject):
     ) -> Callable[[Path, str, str], str] | None:
         """A ``(image_path, system, user_prompt) -> caption`` callable, or None.
 
-        None when no active profile / base URL / vision model is configured
-        (统一模式 saves the shared model into ``vision_model`` too, so that
-        field alone decides vision availability). Pass ``profile`` to override
-        the active archive (CHA标注 per-scheme models). The callable blocks
-        on the HTTP round-trip — run it on the worker pool.
+        None when no 当前视觉模型 / base URL is configured (``vision_model``
+        of the resolved profile decides vision availability). Pass
+        ``profile`` to override the resolved profile (CHA标注 per-scheme
+        models). The callable blocks on the HTTP round-trip — run it on the
+        worker pool.
 
         Requests run under the spec-8 controls (``config.request``): retries
         with exponential backoff on transient request errors and one shared
@@ -1016,7 +1105,7 @@ class AppController(QObject):
         so tests never really wait.
         """
         config = self._app.config
-        resolved = profile if profile is not None else get_active_profile(config)
+        resolved = profile if profile is not None else resolve_vision_profile(config)
         if resolved is None or not resolved.base_url or not resolved.vision_model:
             return None
         request_control = config.request

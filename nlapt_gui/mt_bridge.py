@@ -26,12 +26,14 @@ from nlapt.llm.translate import Direction
 from nlapt.local.mt_catalog import (
     DEFAULT_TIER,
     HYMT_DIRECTION_LANG,
+    MT_PARAGRAPH_SEPARATOR,
     MTModel,
     find_mt_model,
     hymt_prompt,
     is_mt_downloaded,
     mt_download_url,
     mt_model_path,
+    split_mt_paragraphs,
 )
 from nlapt.local.runtime import ensure_runtime
 from nlapt.local.server import GPU_LAYERS_ALL, LocalServerManager, ServerSpec
@@ -226,10 +228,16 @@ class LocalMTProvider:
         return self.translate_to(text, HYMT_DIRECTION_LANG[direction])
 
     def translate_to(self, text: str, target_lang: str) -> str:
+        """Translate ``text`` paragraph by paragraph and rejoin with blank lines.
+
+        Hy-MT2 only translates the block after the last blank line of the
+        prompt (earlier blocks read as untranslated context), so a caption
+        with its own blank lines is split and sent one paragraph per request.
+        """
         stripped = text.strip()
         if not stripped:
             raise LLMRequestError("there is no text to translate")
-        prompt = hymt_prompt(stripped, target_lang)
+        paragraphs = split_mt_paragraphs(stripped)
         stopper = (
             self._idle_stopper
             if self._idle_stopper is not None
@@ -240,15 +248,24 @@ class LocalMTProvider:
             base = self._ensure() if self._ensure is not None else ensure_mt_server(
                 self._model.tier, models_dir=self._models_dir
             )
-            data = with_retry(
-                lambda: self._request(base, prompt),
-                HYMT_RETRY_POLICY,
-                sleep=self._retry_sleep,
-                retry_on=(LLMRequestError,),
-            )
-            return clean_llm_output(_parse_mt_text(data))
+            translated = [
+                self._translate_paragraph(base, paragraph, target_lang)
+                for paragraph in paragraphs
+            ]
+            return MT_PARAGRAPH_SEPARATOR.join(translated)
         finally:
             stopper.note_finished()
+
+    def _translate_paragraph(self, base: str, paragraph: str, target_lang: str) -> str:
+        """One completed, cleaned translation of a single paragraph."""
+        prompt = hymt_prompt(paragraph, target_lang)
+        data = with_retry(
+            lambda: self._request(base, prompt),
+            HYMT_RETRY_POLICY,
+            sleep=self._retry_sleep,
+            retry_on=(LLMRequestError,),
+        )
+        return clean_llm_output(_parse_mt_text(data))
 
     def _request(self, base: str, prompt: str) -> dict[str, object]:
         """Send one chat request; log transport failures before retrying."""

@@ -13,6 +13,7 @@ from nlapt.llm.base import register_client
 from nlapt.llm.mock import MockLLMClient
 
 from nlapt_gui.controller import AppController
+from nlapt_gui.layered_prompts import CardParts
 from nlapt_gui.prompt_store import (
     DEFAULT_USER_PROMPT,
     ENGINE_LLM,
@@ -447,6 +448,55 @@ class TestRequestLayeredBatch:
         request = _Recorder.last.requests[0]
         assert request.system == "scene-sys"
         assert request.messages[0].text == "scene-user"
+
+    def test_same_outfit_header_keeps_card(self, qtbot, vision_controller) -> None:
+        _RESPONSES[:] = ["OUTFIT: SAME\n\nscene paragraph"]
+        bridge = VisionBridge(vision_controller)
+        parts = CardParts("ema, black hair.", "She wears a red dress.")
+        with qtbot.waitSignal(vision_controller.batch_finished, timeout=4000):
+            assert bridge.request_layered_batch(
+                ("0001.png",),
+                ENGINE_LLM,
+                card_text="ema, black hair. She wears a red dress.",
+                scene_system="s",
+                scene_user="u",
+                card_parts=parts,
+            )
+        text = vision_controller.record("0001.png").text
+        assert text == "ema, black hair. She wears a red dress.\n\nscene paragraph"
+
+    def test_rewritten_outfit_replaces_clothing_block(
+        self, qtbot, vision_controller
+    ) -> None:
+        _RESPONSES[:] = ["OUTFIT: She wears a blue swimsuit.\n\nscene paragraph"]
+        bridge = VisionBridge(vision_controller)
+        parts = CardParts("ema, black hair.", "She wears a red dress.")
+        with qtbot.waitSignal(vision_controller.batch_finished, timeout=4000):
+            assert bridge.request_layered_batch(
+                ("0001.png",),
+                ENGINE_LLM,
+                card_text="ema, black hair. She wears a red dress.",
+                scene_system="s",
+                scene_user="u",
+                card_parts=parts,
+            )
+        text = vision_controller.record("0001.png").text
+        assert text == "ema, black hair. She wears a blue swimsuit.\n\nscene paragraph"
+
+    def test_rewrite_without_card_parts_keeps_card(
+        self, qtbot, vision_controller
+    ) -> None:
+        _RESPONSES[:] = ["OUTFIT: She wears a blue swimsuit.\n\nscene paragraph"]
+        bridge = VisionBridge(vision_controller)
+        with qtbot.waitSignal(vision_controller.batch_finished, timeout=4000):
+            assert bridge.request_layered_batch(
+                ("0001.png",),
+                ENGINE_LLM,
+                card_text="locked card",
+                scene_system="s",
+                scene_user="u",
+            )
+        assert vision_controller.record("0001.png").text == "locked card\n\nscene paragraph"
 
     def test_local_captioner_assembles(self, qtbot, vision_controller) -> None:
         bridge = VisionBridge(

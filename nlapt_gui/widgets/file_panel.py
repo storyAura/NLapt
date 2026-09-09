@@ -12,9 +12,9 @@ image cell (这张图片, or 已选 + 全部 when it is part of a multi-selectio
 a folder header (此文件夹 / 此文件夹未标注 / 全部), or the ALL row and the
 根目录 group (全部 / 全部未标注 only). All state
 flows through :class:`AppController`; outward signals are
-``open_folder_requested``, ``infer_requested(keys, engine)`` and
-``layered_infer_requested(keys)`` (the main window routes the latter two
-into the vision bridge).
+``open_folder_requested``, ``infer_requested(keys, engine)``,
+``layered_infer_requested(keys)`` and ``compare_infer_requested(keys)`` (the
+main window routes the latter three into the vision bridge / dialogs).
 """
 
 from __future__ import annotations
@@ -369,6 +369,8 @@ class FilePanel(QFrame):
     infer_requested = Signal(object, str)
     # 分层推标 wizard: keys tuple (engine is chosen inside the dialog).
     layered_infer_requested = Signal(object)
+    # 多对比推标 review window: keys tuple (models come from 设置).
+    compare_infer_requested = Signal(object)
 
     def __init__(
         self,
@@ -663,6 +665,10 @@ class FilePanel(QFrame):
     def _request_layered(self, keys: tuple[str, ...]) -> None:
         """Open the 分层推标 wizard (confirm lives on the last wizard page)."""
         self.layered_infer_requested.emit(tuple(keys))
+
+    def _request_compare(self, keys: tuple[str, ...]) -> None:
+        """Open 多对比推标 (the review window is the confirmation step)."""
+        self.compare_infer_requested.emit(tuple(keys))
 
     def _toggle_folder(self, group: _FolderGroup) -> None:
         open_ = not group.is_open

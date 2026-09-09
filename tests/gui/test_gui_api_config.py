@@ -6,11 +6,19 @@ import json
 
 import pytest
 
-from nlapt.core.config import AppConfig, LLMProfile, RequestControl, load_config, save_config
+from nlapt.core.config import (
+    AppConfig,
+    LLMProfile,
+    ModelRef,
+    RequestControl,
+    load_config,
+    save_config,
+)
 from nlapt.core.errors import StorageError
 
 from nlapt_gui.api_config import (
     API_FILE_NAME,
+    API_FORMAT_VERSION,
     CHAApi,
     ApiConfig,
     TranslateCredentials,
@@ -47,7 +55,92 @@ class TestRoundTrip:
         )
         save_api_config(original)
         assert api_config_path().name == API_FILE_NAME
-        assert load_api_config() == original
+        # Loading derives the pool state from the legacy single-profile fields.
+        loaded = load_api_config()
+        assert loaded == original.upgraded()
+        assert loaded.text_target == ModelRef("default", "text-1")
+        assert loaded.vision_target == ModelRef("default", "vision-1")
+        assert loaded.profiles[0].enabled_models == ("text-1", "vision-1")
+        assert loaded.translate == original.translate and loaded.cha == original.cha
+
+    def test_v2_targets_round_trip_and_are_not_resurrected(self) -> None:
+        alpha = LLMProfile(
+            name="alpha",
+            api_type="openai",
+            base_url="http://a",
+            models=("a1", "a2"),
+            enabled_models=("a1",),
+        )
+        beta = LLMProfile(
+            name="beta",
+            api_type="ollama",
+            base_url="http://b",
+            text_model="legacy-default",
+            models=("b1",),
+            enabled_models=(),
+        )
+        original = ApiConfig(
+            profiles=(alpha, beta),
+            text_target=ModelRef("alpha", "a1"),
+            vision_target=ModelRef(),  # cleared on purpose
+        )
+        save_api_config(original)
+        raw = json.loads(api_config_path().read_text(encoding="utf-8"))
+        assert raw["version"] == API_FORMAT_VERSION == 2
+        assert raw["llm"]["text_target"] == {"profile": "alpha", "model": "a1"}
+        assert raw["llm"]["profiles"][0]["enabled_models"] == ["a1"]
+        loaded = load_api_config()
+        assert loaded == original
+        assert not loaded.vision_target.is_set()
+        assert loaded.profiles[1].enabled_models == ()
+
+    def test_v1_file_upgrades_on_load(self) -> None:
+        target = api_config_path()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "llm": {
+                        "active_profile": "default",
+                        "profiles": [
+                            {
+                                "name": "default",
+                                "api_type": "openai",
+                                "base_url": "http://llm.local",
+                                "api_key": "sk-main",
+                                "text_model": "gpt-a",
+                                "vision_model": "gpt-a",
+                            }
+                        ],
+                    },
+                    "translate": {},
+                    "cha": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+        loaded = load_api_config()
+        assert loaded.text_target == ModelRef("default", "gpt-a")
+        assert loaded.vision_target == ModelRef("default", "gpt-a")
+        assert loaded.profiles[0].models == ("gpt-a",)
+        assert loaded.profiles[0].enabled_models == ("gpt-a",)
+
+    def test_invalid_target_is_left_unset(self) -> None:
+        target = api_config_path()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            json.dumps({"version": 2, "llm": {"text_target": "alpha/a1", "profiles": []}}),
+            encoding="utf-8",
+        )
+        assert not load_api_config().text_target.is_set()
+
+    def test_update_targets_only(self) -> None:
+        save_api_config(ApiConfig(profiles=(_profile(),), active_profile="default"))
+        update_api_config(text_target=ModelRef("default", "vision-1"))
+        loaded = load_api_config()
+        assert loaded.text_target == ModelRef("default", "vision-1")
+        assert loaded.profiles[0].api_key == "sk-main"
 
     def test_update_replaces_only_one_section(self) -> None:
         save_api_config(
@@ -87,11 +180,13 @@ class TestAppConfigSplit:
         loaded = load_app_config()
         assert loaded.profiles[0].api_key == "sk-main"
         assert loaded.active_profile == "default"
+        assert loaded.text_target == ModelRef("default", "text-1")
         assert loaded.request.concurrency == 8
         assert loaded.snapshot_retention == 7
         on_disk = load_config(config_path())
         assert on_disk.profiles == ()
         assert on_disk.active_profile == ""
+        assert not on_disk.text_target.is_set()
         assert "sk-main" not in config_path().read_text(encoding="utf-8")
         assert "sk-main" in api_config_path().read_text(encoding="utf-8")
 

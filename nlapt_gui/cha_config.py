@@ -3,20 +3,29 @@
 The wizard defaults to the main LLM profile (``api_mode=sync``). Own-API
 endpoint fields live in ``Documents/NLapt/api.json``; ``api_mode`` and
 per-scheme models stay in ``app_data_dir()/cha_annotation.json``.
+
+Per-scheme models are :class:`ModelRef`s with three meanings:
+
+* ``ModelRef("p", "m")`` — model ``m`` of pool profile ``p`` (any API);
+* ``ModelRef("", "m")`` — a typed id used on the CHA base endpoint;
+* ``ModelRef()`` — 留空: the base endpoint's 视觉模型.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Callable
 
-from nlapt.core.config import LLMProfile
+from nlapt.core.config import LLMProfile, ModelRef
 from nlapt.core.errors import StorageError
 from nlapt.diagnostics import get_logger
 from nlapt.storage.atomic import atomic_write_text
 
 from nlapt_gui.api_config import CHAApi, load_api_config, update_api_config
+from nlapt_gui.model_targets import model_ref_from_value
 from nlapt_gui.resources import app_data_dir
 
 _LOGGER = get_logger(__name__)
@@ -28,19 +37,25 @@ API_MODE_OWN = "own"
 API_MODES: tuple[str, ...] = (API_MODE_SYNC, API_MODE_OWN)
 DEFAULT_API_TYPE = "openai"
 CARD_SLOTS = 3
-EMPTY_CARD_MODELS: tuple[str, ...] = ("", "", "")
+EMPTY_CARD_MODELS: tuple[ModelRef, ...] = (ModelRef(), ModelRef(), ModelRef())
+
+ProfileLookup = Callable[[ModelRef], LLMProfile | None]
 
 
 @dataclass(frozen=True)
 class CHASettings:
-    """Immutable CHA标注 API mode + per-scheme vision models."""
+    """Immutable CHA标注 API mode + per-scheme vision models.
+
+    ``card_models`` / ``batch_model`` accept bare strings for convenience
+    (legacy files, tests) and are normalised to :class:`ModelRef`.
+    """
 
     api_mode: str = API_MODE_SYNC
     api_type: str = DEFAULT_API_TYPE
     base_url: str = ""
     api_key: str = ""
-    card_models: tuple[str, ...] = EMPTY_CARD_MODELS
-    batch_model: str = ""
+    card_models: tuple[ModelRef, ...] = EMPTY_CARD_MODELS
+    batch_model: ModelRef = ModelRef()
 
     def __post_init__(self) -> None:
         mode = self.api_mode if self.api_mode in API_MODES else API_MODE_SYNC
@@ -50,7 +65,7 @@ class CHASettings:
         object.__setattr__(self, "base_url", self.base_url.strip())
         object.__setattr__(self, "api_key", self.api_key.strip())
         object.__setattr__(self, "card_models", models)
-        object.__setattr__(self, "batch_model", self.batch_model.strip())
+        object.__setattr__(self, "batch_model", model_ref_from_value(self.batch_model))
 
     def with_changes(self, **changes: object) -> "CHASettings":
         """Return a copy with the given fields replaced (immutable update)."""
@@ -68,8 +83,8 @@ def load_cha_settings(path: Path | None = None) -> CHASettings:
     api_mode = API_MODE_SYNC
     legacy_api_type = DEFAULT_API_TYPE
     legacy_base_url = ""
-    card_models: tuple[str, ...] = EMPTY_CARD_MODELS
-    batch_model = ""
+    card_models: tuple[ModelRef, ...] = EMPTY_CARD_MODELS
+    batch_model = ModelRef()
     if target.exists():
         try:
             raw = json.loads(target.read_text(encoding="utf-8"))
@@ -87,7 +102,7 @@ def load_cha_settings(path: Path | None = None) -> CHASettings:
             legacy_api_type = str(raw.get("api_type", DEFAULT_API_TYPE) or DEFAULT_API_TYPE)
             legacy_base_url = str(raw.get("base_url", ""))
             card_models = _normalize_card_models(raw.get("card_models"))
-            batch_model = str(raw.get("batch_model", ""))
+            batch_model = model_ref_from_value(raw.get("batch_model", ""))
     endpoint = load_api_config().cha
     return CHASettings(
         api_mode=api_mode,
@@ -113,8 +128,8 @@ def save_cha_settings(settings: CHASettings, path: Path | None = None) -> None:
     target = path if path is not None else cha_settings_path()
     payload = {
         "api_mode": settings.api_mode,
-        "batch_model": settings.batch_model,
-        "card_models": list(settings.card_models),
+        "batch_model": dataclasses.asdict(settings.batch_model),
+        "card_models": [dataclasses.asdict(ref) for ref in settings.card_models],
     }
     atomic_write_text(target, json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
     _LOGGER.info("CHA settings saved (api_mode=%s)", settings.api_mode)
@@ -149,44 +164,61 @@ def resolve_base_profile(
 
 
 def resolve_card_profile(
-    settings: CHASettings, active: LLMProfile | None, index: int
+    settings: CHASettings,
+    active: LLMProfile | None,
+    index: int,
+    *,
+    lookup: ProfileLookup | None = None,
 ) -> LLMProfile | None:
-    """Profile for candidate ``index`` (empty model falls back to the base)."""
-    return _with_model(settings, active, _card_model(settings, index))
+    """Profile for candidate ``index`` (empty model falls back to the base).
+
+    ``lookup`` resolves pool refs (``profile`` set) to their own API profile
+    with ``vision_model`` bound — see :meth:`AppController.profile_for_ref`.
+    A pool ref without a lookup, or one that is stale, resolves to None.
+    """
+    return _with_model(settings, active, _card_model(settings, index), lookup)
 
 
 def resolve_batch_profile(
-    settings: CHASettings, active: LLMProfile | None
+    settings: CHASettings,
+    active: LLMProfile | None,
+    *,
+    lookup: ProfileLookup | None = None,
 ) -> LLMProfile | None:
-    """Profile for the whole-batch 画面段 pass."""
-    return _with_model(settings, active, settings.batch_model)
+    """Profile for the whole-batch 画面段 pass (same ``lookup`` semantics)."""
+    return _with_model(settings, active, settings.batch_model, lookup)
 
 
 def _with_model(
-    settings: CHASettings, active: LLMProfile | None, override: str
+    settings: CHASettings,
+    active: LLMProfile | None,
+    override: ModelRef,
+    lookup: ProfileLookup | None,
 ) -> LLMProfile | None:
+    if override.profile:
+        return lookup(override) if lookup is not None else None
     base = resolve_base_profile(settings, active)
     if base is None:
         return None
-    model = (override or base.vision_model).strip()
+    model = (override.model or base.vision_model).strip()
     if not model:
         return None
     return replace(base, vision_model=model)
 
 
-def _card_model(settings: CHASettings, index: int) -> str:
+def _card_model(settings: CHASettings, index: int) -> ModelRef:
     if index < 0 or index >= len(settings.card_models):
-        return ""
+        return ModelRef()
     return settings.card_models[index]
 
 
-def _normalize_card_models(raw: object) -> tuple[str, ...]:
-    items: list[str] = []
+def _normalize_card_models(raw: object) -> tuple[ModelRef, ...]:
+    items: list[ModelRef] = []
     if isinstance(raw, (list, tuple)):
         for item in raw[:CARD_SLOTS]:
-            items.append(item.strip() if isinstance(item, str) else "")
+            items.append(model_ref_from_value(item))
     while len(items) < CARD_SLOTS:
-        items.append("")
+        items.append(ModelRef())
     return tuple(items)
 
 

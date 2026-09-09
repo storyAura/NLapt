@@ -114,7 +114,18 @@ class ResizeGrip(QWidget):
         super().__init__(parent)
         self.setFixedHeight(_GRIP_HEIGHT)
         self.setCursor(Qt.CursorShape.SizeVerCursor)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
         self._last_y: float | None = None
+        self._hover = False
+
+    def event(self, ev: QEvent) -> bool:  # noqa: N802 - Qt override
+        if ev.type() == QEvent.Type.HoverEnter:
+            self._hover = True
+            self.update()
+        elif ev.type() == QEvent.Type.HoverLeave:
+            self._hover = False
+            self.update()
+        return super().event(ev)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt override
         if event.button() == Qt.MouseButton.LeftButton:
@@ -142,6 +153,8 @@ class ResizeGrip(QWidget):
         super().mouseReleaseEvent(event)
 
     def paintEvent(self, event: QPaintEvent) -> None:  # noqa: N802 - Qt override
+        if not self._hover:
+            return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         color = self.palette().color(QPalette.ColorRole.PlaceholderText)

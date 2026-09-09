@@ -106,3 +106,7 @@ class DownloadCancelledError(LocalInferenceError):
 
 class LocalServerError(LocalInferenceError):
     """The local inference server could not start, respond, or stop."""
+
+
+class ImageProcessingError(NLaptError):
+    """Pixel-level image work failed (missing Pillow, unreadable file, IO)."""

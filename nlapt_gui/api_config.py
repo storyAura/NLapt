@@ -18,9 +18,12 @@ from typing import Any
 from nlapt.core.config import (
     AppConfig,
     LLMProfile,
+    ModelRef,
     load_config,
+    model_ref_from_dict,
     profiles_from_list,
     save_config,
+    upgrade_legacy_targets,
 )
 from nlapt.core.errors import StorageError, ValidationError
 from nlapt.diagnostics import get_logger
@@ -32,7 +35,8 @@ from nlapt_gui.resources import app_data_dir, config_path
 _LOGGER = get_logger(__name__)
 
 API_FILE_NAME = "api.json"
-API_FORMAT_VERSION = 1
+# v2: ``llm.text_target`` / ``llm.vision_target`` + per-profile model switches.
+API_FORMAT_VERSION = 2
 DEFAULT_CHA_API_TYPE = "openai"
 
 # Legacy locations read during fallback / migrate (do not import those modules).
@@ -70,7 +74,9 @@ class ApiConfig:
     """Immutable union of every interface the GUI can call."""
 
     profiles: tuple[LLMProfile, ...] = ()
-    active_profile: str = ""
+    active_profile: str = ""  # legacy; the pool UI writes ""
+    text_target: ModelRef = ModelRef()
+    vision_target: ModelRef = ModelRef()
     translate: TranslateCredentials = TranslateCredentials()
     cha: CHAApi = CHAApi()
 
@@ -80,6 +86,22 @@ class ApiConfig:
     def with_changes(self, **changes: object) -> "ApiConfig":
         """Return a copy with the given fields replaced."""
         return replace(self, **changes)  # type: ignore[arg-type]
+
+    def upgraded(self) -> "ApiConfig":
+        """Pool state derived from legacy fields (see ``upgrade_legacy_targets``)."""
+        core = upgrade_legacy_targets(
+            AppConfig(
+                profiles=self.profiles,
+                active_profile=self.active_profile,
+                text_target=self.text_target,
+                vision_target=self.vision_target,
+            )
+        )
+        return self.with_changes(
+            profiles=core.profiles,
+            text_target=core.text_target,
+            vision_target=core.vision_target,
+        )
 
 
 def api_config_path() -> Path:
@@ -96,7 +118,7 @@ def load_api_config() -> ApiConfig:
     if raw is None:
         _LOGGER.warning("api config %s missing or corrupt; using defaults", target)
         return ApiConfig()
-    return _api_from_dict(raw)
+    return _api_from_dict(raw).upgraded()
 
 
 def save_api_config(config: ApiConfig) -> None:
@@ -108,6 +130,8 @@ def save_api_config(config: ApiConfig) -> None:
         "version": API_FORMAT_VERSION,
         "llm": {
             "active_profile": config.active_profile,
+            "text_target": dataclasses.asdict(config.text_target),
+            "vision_target": dataclasses.asdict(config.vision_target),
             "profiles": [dataclasses.asdict(profile) for profile in config.profiles],
         },
         "translate": dataclasses.asdict(config.translate),
@@ -122,6 +146,8 @@ def update_api_config(
     *,
     profiles: tuple[LLMProfile, ...] | None = None,
     active_profile: str | None = None,
+    text_target: ModelRef | None = None,
+    vision_target: ModelRef | None = None,
     translate: TranslateCredentials | None = None,
     cha: CHAApi | None = None,
 ) -> ApiConfig:
@@ -132,6 +158,10 @@ def update_api_config(
         changes["profiles"] = profiles
     if active_profile is not None:
         changes["active_profile"] = active_profile
+    if text_target is not None:
+        changes["text_target"] = text_target
+    if vision_target is not None:
+        changes["vision_target"] = vision_target
     if translate is not None:
         changes["translate"] = translate
     if cha is not None:
@@ -145,15 +175,32 @@ def load_app_config() -> AppConfig:
     """AppConfig from AppData, with profiles overlaid from ``api.json``."""
     base = load_config(config_path())
     api = load_api_config()
-    return replace(base, profiles=api.profiles, active_profile=api.active_profile)
+    return replace(
+        base,
+        profiles=api.profiles,
+        active_profile=api.active_profile,
+        text_target=api.text_target,
+        vision_target=api.vision_target,
+    )
 
 
 def save_app_config(config: AppConfig) -> None:
-    """Write profiles to ``api.json``; write the rest to ``config.json``."""
+    """Write profiles + targets to ``api.json``; write the rest to ``config.json``."""
     if not isinstance(config, AppConfig):
         raise StorageError(f"expected AppConfig, got {type(config).__name__}")
-    update_api_config(profiles=config.profiles, active_profile=config.active_profile)
-    stripped = replace(config, profiles=(), active_profile="")
+    update_api_config(
+        profiles=config.profiles,
+        active_profile=config.active_profile,
+        text_target=config.text_target,
+        vision_target=config.vision_target,
+    )
+    stripped = replace(
+        config,
+        profiles=(),
+        active_profile="",
+        text_target=ModelRef(),
+        vision_target=ModelRef(),
+    )
     save_config(config_path(), stripped)
 
 
@@ -193,9 +240,19 @@ def _api_from_dict(raw: dict[str, Any]) -> ApiConfig:
     return ApiConfig(
         profiles=profiles,
         active_profile=active if isinstance(active, str) else "",
+        text_target=_target_from_dict(llm_obj.get("text_target"), "text_target"),
+        vision_target=_target_from_dict(llm_obj.get("vision_target"), "vision_target"),
         translate=_translate_from_dict(translate_raw if isinstance(translate_raw, dict) else {}),
         cha=_cha_from_dict(cha_raw if isinstance(cha_raw, dict) else {}),
     )
+
+
+def _target_from_dict(raw: Any, context: str) -> ModelRef:
+    try:
+        return model_ref_from_dict(raw, context)
+    except ValidationError:
+        _LOGGER.warning("api.json llm.%s is invalid; leaving it unset", context)
+        return ModelRef()
 
 
 def _translate_from_dict(raw: dict[str, Any]) -> TranslateCredentials:
@@ -253,7 +310,7 @@ def _legacy_api_config() -> ApiConfig:
     )
     return ApiConfig(
         profiles=profiles, active_profile=active, translate=translate, cha=cha
-    )
+    ).upgraded()
 
 
 def _has_content(config: ApiConfig) -> bool:
@@ -272,7 +329,16 @@ def _strip_legacy_files() -> None:
     except (StorageError, ValidationError):
         cfg = None
     if cfg is not None and (cfg.profiles or cfg.active_profile):
-        save_config(config_path(), replace(cfg, profiles=(), active_profile=""))
+        save_config(
+            config_path(),
+            replace(
+                cfg,
+                profiles=(),
+                active_profile="",
+                text_target=ModelRef(),
+                vision_target=ModelRef(),
+            ),
+        )
 
     translate_path = app_data_dir() / LEGACY_TRANSLATE_PUBLIC
     public = _read_json_object(translate_path)

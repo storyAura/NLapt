@@ -397,6 +397,14 @@ class TestScopesAndBatches:
         with pytest.raises(ValidationError):
             controller.scope_keys("everything")
 
+    def test_folder_scope_includes_nested_keys(self, controller: AppController) -> None:
+        controller.set_current(K3)
+        assert controller.scope_keys("folder") == (K3, K4)
+        controller.set_current(K1)
+        assert controller.scope_keys("folder") == ALL_KEYS
+        assert controller.folder_tree_keys("10_concept") == (K3, K4)
+        assert controller.folder_tree_keys(FOLDER_ROOT_LABEL) == ALL_KEYS
+
     def test_count_matches(self, controller: AppController) -> None:
         assert controller.count_matches("1girl", False, "all") == (3, 3)
         assert controller.count_matches("hair", False, "all") == (2, 2)
@@ -557,13 +565,63 @@ class TestServices:
         ctrl = AppController(NLaptApp(config=config), settings=UISettings())
         with qtbot.waitSignal(ctrl.dataset_opened, timeout=2000):
             ctrl.open_dataset(demo_dataset)
-        assert ctrl.active_profile() is not None
-        assert ctrl.active_profile().vision_model == "active-vis"
+        assert ctrl.vision_profile() is not None
+        assert ctrl.vision_profile().vision_model == "active-vis"
+        assert ctrl.text_profile().text_model == "t"
         captioner = ctrl.make_vision_captioner_or_none(profile=override)
         assert captioner is not None
         captioner(ctrl.image_path(K1), "sys", "user")
         assert recorded
         assert recorded[0].requests[0].model == "card-vis"
+
+    def test_model_pool_and_set_model_target(self, qtbot, demo_dataset: Path) -> None:
+        from nlapt.core.config import ModelRef
+        from nlapt.core.errors import ValidationError
+
+        from nlapt_gui.api_config import load_api_config
+        from nlapt_gui.model_targets import ROLE_TEXT, ROLE_VISION
+
+        alpha = LLMProfile(
+            name="alpha",
+            api_type="mock-gui-controller-pool",
+            base_url="http://alpha",
+            models=("a-text", "a-vl"),
+            enabled_models=("a-text", "a-vl"),
+        )
+        beta = LLMProfile(
+            name="beta",
+            api_type="mock-gui-controller-pool",
+            base_url="http://beta",
+            models=("b-vl",),
+            enabled_models=("b-vl",),
+        )
+        config = AppConfig(
+            profiles=(alpha, beta),
+            text_target=ModelRef("alpha", "a-text"),
+            vision_target=ModelRef("alpha", "a-vl"),
+        )
+        ctrl = AppController(NLaptApp(config=config), settings=UISettings())
+        with qtbot.waitSignal(ctrl.dataset_opened, timeout=2000):
+            ctrl.open_dataset(demo_dataset)
+        assert [c.ref for c in ctrl.model_pool()] == [
+            ModelRef("alpha", "a-text"),
+            ModelRef("alpha", "a-vl"),
+            ModelRef("beta", "b-vl"),
+        ]
+        bound = ctrl.profile_for_ref(ModelRef("beta", "b-vl"))
+        assert bound is not None and bound.base_url == "http://beta"
+        assert bound.vision_model == "b-vl"
+        assert ctrl.profile_for_ref(ModelRef("beta", "nope")) is None
+        ctrl.set_model_target(ROLE_VISION, ModelRef("beta", "b-vl"))
+        assert ctrl.vision_profile().base_url == "http://beta"
+        assert ctrl.vision_profile().vision_model == "b-vl"
+        assert ctrl.text_profile().text_model == "a-text"
+        saved = load_api_config()
+        assert saved.vision_target == ModelRef("beta", "b-vl")
+        assert saved.text_target == ModelRef("alpha", "a-text")
+        with pytest.raises(ValidationError):
+            ctrl.set_model_target(ROLE_TEXT, ModelRef("beta", "nope"))
+        assert ctrl.text_profile().text_model == "a-text"
 
 
 class TestClose:

@@ -89,27 +89,17 @@ ACTION_SETTINGS = "设置…"
 # top-level entry); the placeholder is disabled until real tools land.
 ACTION_TOOLS_PLACEHOLDER = "更多工具(规划中)"
 # 快捷键 was removed from 帮助 (spec module 3.5): the status bar at the bottom
-# of the window already lists the live shortcut hints.
-ACTION_GUIDE = "使用说明"
+# of the window already lists the live shortcut hints. 使用说明 was dropped
+# from the logo / help menus; the product sheet lives in docs/功能清单.md.
 ACTION_ABOUT = "关于"
 ABOUT_TITLE = "关于 NLapt"
-GUIDE_TITLE = "使用说明"
-GUIDE_TEXT = (
-    "NLapt 采用轨 + 文件 + 预览编辑的工作流:\n\n"
-    "左侧图标轨 — 打开文件夹、保存、导出、撤销 / 重做、主题与设置。"
-    "「修改工具」从轨上抽出查找替换、前缀 / 后缀、翻译对照、历史记录。\n\n"
-    "文件栏 — 浏览数据集,支持 Shift 范围选、Alt 取消选,右键批量推标。\n\n"
-    "预览 + 编辑 — 图片预览与三种编辑模式(胶囊 / 分句 / 文本),"
-    "悬浮工具栏可分段 / 插入 / 翻译 / 重译。\n\n"
-    "保存与快照:标注仅在显式「保存 / 全部保存」时写入 .txt 文件;"
-    "批量操作会自动创建快照,未保存的草稿在崩溃后可恢复。"
-)
+AUTHOR = "storyAura"
 ABOUT_TEXT = (
     f"{APP_NAME}\n"
     f"{VERSION_LABEL}\n\n"
-    "面向自然语言标注(caption)处理的桌面编辑工具。\n"
-    "在轨 + 两栏界面中高效编辑、批量修改并翻译图像标注,\n"
-    "兼容 kohya 等「图片 + 同名 .txt」数据集格式。"
+    "面向图像生成与 LoRA 训练的桌面标注编辑器。\n"
+    "处理「图片 + 同名 .txt」，单张精修，批量可回滚。\n\n"
+    f"作者：{AUTHOR}"
 )
 VIEW_MODE_LABELS: tuple[tuple[str, str], ...] = (
     ("list", "列表视图"),
@@ -329,13 +319,10 @@ class TitleBar(QFrame):
         tools_menu.addAction(self.action_tools_placeholder)
 
         help_menu = QMenu(MENU_HELP, self)
-        # 快捷键 deliberately absent (module 3.5) — the status bar shows them live.
-        self.action_guide = QAction(ACTION_GUIDE, self)
-        self.action_guide.triggered.connect(self.show_guide)
+        # 快捷键 / 使用说明 deliberately absent — the status bar shows shortcuts,
+        # and the logo menu (live UI) only keeps 关于 / 退出.
         self.action_about = QAction(ACTION_ABOUT, self)
         self.action_about.triggered.connect(self.show_about)
-        help_menu.addAction(self.action_guide)
-        help_menu.addSeparator()
         help_menu.addAction(self.action_about)
 
         for label, menu in (
@@ -436,10 +423,6 @@ class TitleBar(QFrame):
     def toggle_max_restore(self) -> None:
         """Delegate to the main window's animated toggle (fullscreen-safe)."""
         toggle_window_max_restore(self)
-
-    def show_guide(self) -> None:
-        """Explain the three-column workflow and the save/snapshot model."""
-        show_message(self.window(), GUIDE_TITLE, GUIDE_TEXT)
 
     def show_about(self) -> None:
         show_message(self.window(), ABOUT_TITLE, ABOUT_TEXT)

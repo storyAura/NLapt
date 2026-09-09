@@ -33,8 +33,8 @@ from nlapt.diagnostics import get_logger
 
 from nlapt_gui.controller import AppController, TOAST_ERR, TOAST_INFO, TOAST_OK, TOAST_WARN
 from nlapt_gui.translate_bridge import NOTE_UNCONFIGURED, TranslateBridge, has_cjk
+from nlapt_gui.widgets.sections.common import CONTENT_MARGINS, ROW_GAP, BUTTON_H, ScopeRow
 from nlapt_gui.widgets.tools_panel import (
-    ScopeSelector,
     SegmentedBar,
     repolish,
     resolve_tokens,
@@ -45,7 +45,6 @@ _LOGGER = get_logger(__name__)
 # Exact UI strings.
 BUTTON_ALL_EN = "中文全部转为英文"
 BUTTON_ALL_EN_BUSY = "翻译中 {i}/{n}"
-LABEL_SCOPE_CAPTION = "应用范围"
 # 对照方式: per-segment rows vs the whole caption as one unit.
 MODE_SEGMENTS = "segments"
 MODE_WHOLE = "whole"
@@ -73,9 +72,7 @@ _ROWS_MAX_HEIGHT = 218
 _ROW_GAP = 6
 _ROW_MARGINS = (9, 6, 9, 6)
 _SWAP_SIZE = 24
-_BUTTON_HEIGHT = 29
-_CONTENT_MARGINS = (13, 2, 13, 13)
-_CONTENT_GAP = 8
+_BUTTON_HEIGHT = BUTTON_H
 # Debounce for live caption edits so typing does not fire one LLM request per
 # keystroke; only the settled text is translated.
 _DEBOUNCE_MS = 400
@@ -186,20 +183,16 @@ class TranslateSection(QWidget):
         )
         self.all_en_button.clicked.connect(self.translate_all_to_english)
 
-        # Scope selector (指定范围翻译): 当前 / 选中 n / 全部 N.
-        scope_caption = QLabel(LABEL_SCOPE_CAPTION, self)
-        scope_caption.setProperty("muted", True)
-        scope_caption.setStyleSheet("font-size: 10.5px;")
-        self.scope = ScopeSelector(controller, self)
+        self.scope_row = ScopeRow(controller, self)
+        self.scope = self.scope_row.selector
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(*_CONTENT_MARGINS)
-        layout.setSpacing(_CONTENT_GAP)
+        layout.setContentsMargins(*CONTENT_MARGINS)
+        layout.setSpacing(ROW_GAP)
         layout.addLayout(mode_row)
         layout.addWidget(scroll)
         layout.addWidget(self.hint_row)
-        layout.addWidget(scope_caption)
-        layout.addWidget(self.scope)
+        layout.addWidget(self.scope_row)
         layout.addWidget(self.all_en_button)
 
         self.bridge.segment_ready.connect(self._on_segment_ready)

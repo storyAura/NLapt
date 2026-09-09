@@ -41,7 +41,9 @@ from nlapt_gui.controller import AppController
 from nlapt_gui.layered_prompts import (
     LAYERED_BATCH_DESCRIPTION_FMT,
     LAYERED_BATCH_HISTORY,
-    assemble_caption,
+    CardParts,
+    assemble_layered,
+    parse_scene_reply,
 )
 from nlapt_gui.local_bridge import (
     get_idle_stopper,
@@ -246,6 +248,7 @@ class VisionBridge(QObject):
         scene_system: str,
         scene_user: str,
         profile: LLMProfile | None = None,
+        card_parts: CardParts | None = None,
     ) -> bool:
         """Batch-caption ``keys`` as 人物卡 + blank + 画面段.
 
@@ -254,6 +257,11 @@ class VisionBridge(QObject):
         (with a warn toast) when the engine is not ready or a batch is
         already running. ``profile`` overrides the active LLM archive;
         ignored for local.
+
+        Each reply is parsed for the ``OUTFIT:`` header: ``SAME`` (or no
+        header) keeps ``card_text`` verbatim; a rewritten outfit replaces
+        ``card_parts.outfit`` while ``card_parts.appearance`` stays fixed.
+        Without ``card_parts`` the card can never be rewritten.
         """
         captioner, error = self._make_captioner(engine, profile)
         if captioner is None:
@@ -270,9 +278,18 @@ class VisionBridge(QObject):
         if stopper is not None:
             stopper.note_request()
 
-        def caption_one(_key: str, image_path: Path) -> str:
-            scene = captioner(image_path, scene_system, scene_user)
-            return assemble_caption(card_text, scene)
+        parts = card_parts if card_parts is not None else CardParts(card_text, "")
+
+        def caption_one(key: str, image_path: Path) -> str:
+            reply = captioner(image_path, scene_system, scene_user)
+            outfit, scene = parse_scene_reply(reply)
+            if outfit is not None and not parts.outfit:
+                _LOGGER.warning(
+                    "layered reply for %s rewrote the outfit but the card has no "
+                    "clothing block; keeping the card verbatim",
+                    key,
+                )
+            return assemble_layered(card_text, parts, outfit, scene)
 
         def finished(_report: object) -> None:
             if stopper is not None:

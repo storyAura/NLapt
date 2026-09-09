@@ -78,6 +78,27 @@ class TestHeader:
         assert controller.current_key == K1
         assert panel.pos_label.text() == "1 / 4"
 
+    def test_header_labels_are_mouse_transparent(self, panel: PreviewPanel) -> None:
+        attr = Qt.WidgetAttribute.WA_TransparentForMouseEvents
+        for widget in (
+            panel.name_label,
+            panel.meta_pill,
+            panel.dim_label,
+            panel.size_label,
+            panel.mtime_label,
+            panel.pos_label,
+        ):
+            assert widget.testAttribute(attr)
+
+    def test_long_filename_elides_and_keeps_tooltip(self, panel: PreviewPanel) -> None:
+        long_name = "a_very_long_character_and_series_filename_that_should_elide.webp"
+        panel.header.resize(360, 46)
+        panel.header.set_file_name(long_name)
+        shown = panel.name_label.text()
+        assert panel.name_label.toolTip() == long_name
+        assert shown != long_name
+        assert len(shown) < len(long_name)
+
 
 class TestFilteredNavigation:
     def test_empty_filter_results_disable_navigation_and_keep_preview(

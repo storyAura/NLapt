@@ -16,7 +16,7 @@ from PySide6.QtCore import Qt, QThreadPool, QUrl
 from PySide6.QtGui import QDesktopServices, QShowEvent
 from PySide6.QtWidgets import QFileDialog, QTreeWidgetItem, QWidget
 
-from nlapt.core.config import LLMProfile
+from nlapt.core.config import LLMProfile, ModelRef
 from nlapt.core.errors import NLaptError, StorageError, ValidationError
 from nlapt.diagnostics import get_logger
 from nlapt.local.advisor import RunAssessment, RunGrade, assess, estimate_memory
@@ -712,7 +712,12 @@ class LocalTab(QWidget):
         self._apply_profile(family)
 
     def _apply_profile(self, family: ModelFamily) -> None:
-        """Register/refresh the ``local`` profile and make it active."""
+        """Register/refresh the ``local`` profile and point the pool targets at it.
+
+        The family becomes the profile's only (enabled) model; the 当前文本模型
+        switches to it, and the 当前视觉模型 too when the family has vision —
+        a text-only family leaves the vision target as it was.
+        """
         try:
             existing = load_app_config()
         except (ValidationError, StorageError):
@@ -727,12 +732,17 @@ class LocalTab(QWidget):
             api_key="",
             text_model=family.family_id,
             vision_model=family.family_id if family.vision else "",
+            models=(family.family_id,),
+            enabled_models=(family.family_id,),
         )
         others = tuple(p for p in existing.profiles if p.name != LOCAL_PROFILE_NAME)
+        local_ref = ModelRef(profile=LOCAL_PROFILE_NAME, model=family.family_id)
         config = _dc_replace(
             existing,
             profiles=(profile, *others),
-            active_profile=LOCAL_PROFILE_NAME,
+            active_profile="",
+            text_target=local_ref,
+            vision_target=local_ref if family.vision else existing.vision_target,
             request=_dc_replace(existing.request, concurrency=settings.parallel),
         )
         try:

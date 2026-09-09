@@ -1,16 +1,20 @@
-"""Tests for the reworked 设置 dialog (spec module 3): tabs, 统一模型,
-并发设置, 获取模型 and the 提示词 / 本地推理 tabs."""
+"""Tests for the tabbed 设置 dialog (spec module 3): tabs, shared model
+across both roles, 并发设置, 获取模型 and the 提示词 / 本地推理 tabs."""
 
 from __future__ import annotations
 
 from typing import Iterator
 
 import pytest
+from PySide6.QtCore import Qt
 
 from nlapt.app import NLaptApp
 from nlapt.core.config import (
+    ROLE_TEXT,
+    ROLE_VISION,
     AppConfig,
     LLMProfile,
+    ModelRef,
     RequestControl,
     load_config,
     save_config,
@@ -24,9 +28,9 @@ from nlapt_gui.controller import AppController
 from nlapt_gui.prompt_store import load_vision_prompts
 from nlapt_gui.settings import UISettings
 from nlapt_gui.widgets.dialogs import CenteredDialog
-from nlapt_gui.widgets.model_picker import VISION_TAG, ModelPickerDialog
 from nlapt_gui.widgets.settings_dialog import (
     TAB_CHA,
+    TAB_COMPARE,
     TAB_LLM,
     TAB_LOCAL,
     TAB_PROMPTS,
@@ -45,18 +49,48 @@ def dlg_controller(qtbot) -> Iterator[AppController]:
 
 
 def _make_dialog(qtbot, controller: AppController) -> SettingsDialog:
+    """Dialog with one profile, one enabled model and the text target set."""
     dialog = SettingsDialog(controller, api_types=(API_TYPE, "openai"))
     qtbot.addWidget(dialog)
-    dialog.base_url.setText("http://mock.local")
-    dialog.text_model.setText("text-model-1")
+    tab = dialog.llm_tab
+    tab.add_profile()
+    tab.name_edit.setText("main")
+    tab.base_url.setText("http://mock.local")
+    tab.new_model_edit.setText("text-model-1")
+    tab.add_model()
+    tab.set_target(ROLE_TEXT, ModelRef("main", "text-model-1"))
     return dialog
 
 
 class TestTabs:
-    def test_five_tabs_in_order(self, qtbot, dlg_controller) -> None:
+    def test_six_tabs_in_order(self, qtbot, dlg_controller) -> None:
         dialog = _make_dialog(qtbot, dlg_controller)
         labels = [dialog.tabs.tabText(i) for i in range(dialog.tabs.count())]
-        assert labels == [TAB_TRANSLATE, TAB_LLM, TAB_PROMPTS, TAB_LOCAL, TAB_CHA]
+        assert labels == [
+            TAB_TRANSLATE, TAB_LLM, TAB_PROMPTS, TAB_LOCAL, TAB_CHA, TAB_COMPARE
+        ]
+
+    def test_compare_tab_follows_pool_and_persists(self, qtbot, dlg_controller) -> None:
+        from nlapt_gui.compare_config import load_compare_settings
+
+        dialog = _make_dialog(qtbot, dlg_controller)
+        tab = dialog.compare_tab
+        assert tab.model_list.checked_refs() == ()
+        # Add a second model on the LLM tab -> appears in the compare list live.
+        dialog.llm_tab.new_model_edit.setText("vl-2")
+        dialog.llm_tab.add_model()
+        refs = [
+            tab.model_list.item(i).data(Qt.ItemDataRole.UserRole)
+            for i in range(tab.model_list.count())
+        ]
+        assert ModelRef("main", "text-model-1") in refs and ModelRef("main", "vl-2") in refs
+        tab.model_list.set_checked((ModelRef("main", "text-model-1"), ModelRef("main", "vl-2")))
+        with qtbot.waitSignal(dialog.saved, timeout=1000):
+            dialog.save_button.click()
+        assert load_compare_settings().models == (
+            ModelRef("main", "text-model-1"),
+            ModelRef("main", "vl-2"),
+        )
 
     def test_is_a_centered_fading_dialog(self, qtbot, dlg_controller) -> None:
         dialog = _make_dialog(qtbot, dlg_controller)
@@ -77,45 +111,27 @@ class TestTabs:
         from nlapt_gui.resources import app_data_dir
 
         dialog = _make_dialog(qtbot, dlg_controller)
-        dialog.api_type.setCurrentIndex(0)
         dialog.local_tab.parallel_spin.setValue(9)
         with qtbot.waitSignal(dialog.saved, timeout=1000):
             dialog.save_button.click()
         assert load_local_settings(app_data_dir() / "local_llm.json").parallel == 9
 
 
-class TestUnifiedModel:
-    def test_unified_hides_vision_row_and_relabels(self, qtbot, dlg_controller) -> None:
-        dialog = _make_dialog(qtbot, dlg_controller)
-        dialog.show()
-        dialog.tabs.setCurrentIndex(1)
-        assert not dialog.is_unified()
-        dialog.unified_check.setChecked(True)
-        assert dialog._text_model_label.text() == "模型"
-        assert not dialog.vision_model.isVisibleTo(dialog)
-        assert "多模态" in dialog.model_hint.text()
-        dialog.unified_check.setChecked(False)
-        assert dialog._text_model_label.text() == "文本模型"
-        assert dialog.vision_model.isVisibleTo(dialog)
+class TestSharedModel:
+    """One multimodal model may back both roles: pick the same ref twice."""
 
-    def test_unified_profile_shares_model(self, qtbot, dlg_controller) -> None:
+    def test_same_ref_for_both_roles_persists(self, qtbot, dlg_controller) -> None:
         dialog = _make_dialog(qtbot, dlg_controller)
-        dialog.unified_check.setChecked(True)
-        profile = dialog.current_profile()
-        assert profile.text_model == profile.vision_model == "text-model-1"
-
-    def test_unified_save_persists_shared_model(self, qtbot, dlg_controller) -> None:
-        dialog = _make_dialog(qtbot, dlg_controller)
-        dialog.api_type.setCurrentIndex(0)
-        dialog.unified_check.setChecked(True)
+        dialog.llm_tab.set_target(ROLE_VISION, ModelRef("main", "text-model-1"))
         with qtbot.waitSignal(dialog.saved, timeout=1000):
             dialog.save_button.click()
         stored = load_app_config()
-        profile = stored.profiles[0]
-        assert profile.text_model == profile.vision_model == "text-model-1"
+        assert stored.text_target == stored.vision_target == ModelRef("main", "text-model-1")
         assert "text-model-1" not in config_path().read_text(encoding="utf-8")
+        assert dlg_controller.text_profile().text_model == "text-model-1"
+        assert dlg_controller.vision_profile().vision_model == "text-model-1"
 
-    def test_prefill_detects_unified(self, qtbot, dlg_controller) -> None:
+    def test_prefill_shared_legacy_profile(self, qtbot, dlg_controller) -> None:
         profile = LLMProfile(
             name="default",
             api_type=API_TYPE,
@@ -126,9 +142,11 @@ class TestUnifiedModel:
         save_app_config(AppConfig(profiles=(profile,), active_profile="default"))
         dialog = SettingsDialog(dlg_controller, api_types=(API_TYPE,))
         qtbot.addWidget(dialog)
-        assert dialog.unified_check.isChecked()
+        tab = dialog.llm_tab
+        assert tab.text_target() == tab.vision_target() == ModelRef("default", "shared")
+        assert tab.model_list.count() == 1
 
-    def test_prefill_detects_split(self, qtbot, dlg_controller) -> None:
+    def test_prefill_split_legacy_profile(self, qtbot, dlg_controller) -> None:
         profile = LLMProfile(
             name="default",
             api_type=API_TYPE,
@@ -139,8 +157,10 @@ class TestUnifiedModel:
         save_app_config(AppConfig(profiles=(profile,), active_profile="default"))
         dialog = SettingsDialog(dlg_controller, api_types=(API_TYPE,))
         qtbot.addWidget(dialog)
-        assert not dialog.unified_check.isChecked()
-        assert dialog.vision_model.text() == "v1"
+        tab = dialog.llm_tab
+        assert tab.text_target() == ModelRef("default", "t1")
+        assert tab.vision_target() == ModelRef("default", "v1")
+        assert tab.vision_combo.currentData() == ModelRef("default", "v1")
 
 
 class TestConcurrency:
@@ -161,7 +181,6 @@ class TestConcurrency:
             AppConfig(request=RequestControl(concurrency=4, timeout=77.0, max_retries=5)),
         )
         dialog = _make_dialog(qtbot, dlg_controller)
-        dialog.api_type.setCurrentIndex(0)
         dialog.concurrency_spin.setValue(12)
         with qtbot.waitSignal(dialog.saved, timeout=1000):
             dialog.save_button.click()
@@ -172,20 +191,21 @@ class TestConcurrency:
 
 
 class TestFetchModels:
-    def test_fetch_opens_picker_with_models(self, qtbot, dlg_controller, monkeypatch) -> None:
+    def test_fetch_merges_into_catalog_unchecked(
+        self, qtbot, dlg_controller, monkeypatch
+    ) -> None:
         dialog = _make_dialog(qtbot, dlg_controller)
         monkeypatch.setattr(
-            "nlapt_gui.widgets.settings_dialog.list_models",
-            lambda profile: ("model-a", "model-b"),
+            "nlapt_gui.widgets.llm_providers_tab.list_models",
+            lambda profile: ("model-a", "text-model-1", "model-b"),
         )
-        captured: list[tuple[str, ...]] = []
-        monkeypatch.setattr(
-            dialog, "_open_model_picker", lambda models: captured.append(models)
-        )
-        dialog.fetch_models()
-        qtbot.waitUntil(lambda: bool(captured), timeout=2000)
-        assert captured[0] == ("model-a", "model-b")
-        assert dialog.fetch_models_button.isEnabled()
+        tab = dialog.llm_tab
+        tab.fetch_models()
+        qtbot.waitUntil(lambda: tab.model_list.count() == 3, timeout=2000)
+        profile = tab.current_profile()
+        assert profile.models == ("text-model-1", "model-a", "model-b")
+        assert profile.enabled_models == ("text-model-1",)  # fetched ids start off
+        assert tab.fetch_models_button.isEnabled()
 
     def test_fetch_error_reenables_button(self, qtbot, dlg_controller, monkeypatch) -> None:
         dialog = _make_dialog(qtbot, dlg_controller)
@@ -193,62 +213,31 @@ class TestFetchModels:
         def boom(profile):  # noqa: ANN001
             raise LLMRequestError("endpoint down")
 
-        monkeypatch.setattr("nlapt_gui.widgets.settings_dialog.list_models", boom)
+        monkeypatch.setattr("nlapt_gui.widgets.llm_providers_tab.list_models", boom)
         collected: list[tuple[str, str]] = []
         dlg_controller.toast_requested.connect(
             lambda text, kind: collected.append((text, kind))
         )
-        dialog.fetch_models()
+        dialog.llm_tab.fetch_models()
         qtbot.waitUntil(
             lambda: any("获取模型失败" in text for text, _ in collected), timeout=2000
         )
-        assert dialog.fetch_models_button.isEnabled()
+        assert dialog.llm_tab.fetch_models_button.isEnabled()
 
     def test_fetch_without_base_url_warns(self, qtbot, dlg_controller) -> None:
         dialog = _make_dialog(qtbot, dlg_controller)
-        dialog.base_url.setText("")
+        dialog.llm_tab.base_url.setText("")
         collected: list[tuple[str, str]] = []
         dlg_controller.toast_requested.connect(
             lambda text, kind: collected.append((text, kind))
         )
-        dialog.fetch_models()
+        dialog.llm_tab.fetch_models()
         assert any("Base URL" in text for text, _ in collected)
-
-
-class TestModelPickerDialog:
-    def test_lists_models_with_vision_tag(self, qtbot) -> None:
-        picker = ModelPickerDialog(("gpt-4o", "deepseek-r1"))
-        qtbot.addWidget(picker)
-        labels = [picker.list.item(i).text() for i in range(picker.list.count())]
-        assert f"gpt-4o{VISION_TAG}" in labels
-        assert "deepseek-r1" in labels
-
-    def test_pick_text_and_vision(self, qtbot) -> None:
-        picker = ModelPickerDialog(("gpt-4o", "deepseek-r1"))
-        qtbot.addWidget(picker)
-        picked: list[tuple[str, str]] = []
-        picker.text_model_picked.connect(lambda m: picked.append(("text", m)))
-        picker.vision_model_picked.connect(lambda m: picked.append(("vision", m)))
-        picker.list.setCurrentRow(0)
-        picker.text_button.click()
-        picker.list.setCurrentRow(1)
-        picker.vision_button.click()
-        assert picked == [("text", "gpt-4o"), ("vision", "deepseek-r1")]
-
-    def test_unified_pick_sets_both(self, qtbot) -> None:
-        picker = ModelPickerDialog(("gpt-4o",), unified=True)
-        qtbot.addWidget(picker)
-        picked: list[tuple[str, str]] = []
-        picker.text_model_picked.connect(lambda m: picked.append(("text", m)))
-        picker.vision_model_picked.connect(lambda m: picked.append(("vision", m)))
-        picker.unified_button.click()
-        assert picked == [("text", "gpt-4o"), ("vision", "gpt-4o")]
 
 
 class TestPromptsIntegration:
     def test_save_persists_prompts_tab_state(self, qtbot, dlg_controller) -> None:
         dialog = _make_dialog(qtbot, dlg_controller)
-        dialog.api_type.setCurrentIndex(0)
         dialog.prompts_tab.user_edit.setPlainText("my user prompt")
         with qtbot.waitSignal(dialog.saved, timeout=1000):
             dialog.save_button.click()

@@ -8,13 +8,13 @@ import pytest
 from PySide6.QtWidgets import QTreeWidgetItem
 
 from nlapt.app import NLaptApp
-from nlapt.core.config import load_config
+from nlapt.core.config import AppConfig, LLMProfile, ModelRef, load_config
 from nlapt.core.errors import LocalServerError
 from nlapt.local.catalog import all_series, families_for
 from nlapt.local.hardware import GIB, GpuInfo, HardwareInfo
 from nlapt.local.settings import LocalSettings, load_local_settings, save_local_settings
 
-from nlapt_gui.api_config import load_app_config
+from nlapt_gui.api_config import load_app_config, save_app_config
 from nlapt_gui.controller import AppController
 from nlapt_gui.local_bridge import LocalBridge
 from nlapt_gui.resources import app_data_dir
@@ -434,14 +434,18 @@ class TestApplyProfile:
         assert tab.apply_button.isEnabled()
         tab.apply_button.click()
         stored = load_app_config()
-        assert stored.active_profile == "local"
+        assert stored.active_profile == ""
+        assert stored.text_target == ModelRef("local", "joycaption-beta-one")
+        assert stored.vision_target == ModelRef("local", "joycaption-beta-one")
         profile = stored.profiles[0]
         assert profile.name == "local"
         assert profile.api_type == "openai"
         assert profile.base_url == "http://127.0.0.1:2222/v1"
         assert profile.text_model == "joycaption-beta-one"
         assert profile.vision_model == "joycaption-beta-one"
+        assert profile.models == profile.enabled_models == ("joycaption-beta-one",)
         assert stored.request.concurrency == 4
+        assert tab_controller.vision_profile().vision_model == "joycaption-beta-one"
         assert "127.0.0.1:2222" not in config_path().read_text(encoding="utf-8")
         assert any("已切换到本地模型" in text for text, _ in tab_toasts)
 
@@ -456,7 +460,37 @@ class TestApplyProfile:
         tab.apply_button.click()
         stored = load_app_config()
         assert stored.profiles[0].vision_model == ""
+        assert stored.text_target == ModelRef("local", "gemma4-26b-a4b-heretic")
+        assert not stored.vision_target.is_set()
         assert load_config(config_path()).profiles == ()
+
+    def test_apply_text_only_family_keeps_existing_vision_target(
+        self, qtbot, tab_controller, monkeypatch
+    ) -> None:
+        remote = LLMProfile(
+            name="remote",
+            api_type="openai",
+            base_url="http://remote",
+            models=("vl",),
+            enabled_models=("vl",),
+        )
+        save_app_config(
+            AppConfig(
+                profiles=(remote,),
+                text_target=ModelRef("remote", "vl"),
+                vision_target=ModelRef("remote", "vl"),
+            )
+        )
+        tab = make_tab(qtbot, tab_controller)
+        monkeypatch.setattr(tab.bridge, "is_downloaded", lambda family, quant: True)
+        tab.tree.setCurrentItem(
+            quant_item(tab, "gemma4-26b-a4b-heretic", "i1-Q4_K_M")
+        )
+        tab.apply_button.click()
+        stored = load_app_config()
+        assert [p.name for p in stored.profiles] == ["local", "remote"]
+        assert stored.text_target == ModelRef("local", "gemma4-26b-a4b-heretic")
+        assert stored.vision_target == ModelRef("remote", "vl")
 
     def test_apply_with_unreadable_config_refuses(
         self, qtbot, tab_controller, tab_toasts, monkeypatch

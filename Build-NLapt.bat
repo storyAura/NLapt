@@ -17,11 +17,14 @@ if errorlevel 1 (
     exit /b 1
 )
 
-rem Ensure build + runtime dependencies are present.
-%PY% -m PyInstaller --version >nul 2>nul
+rem Ensure build + runtime dependencies are present. Every runtime dependency
+rem must be importable at build time: PyInstaller only WARNS about a missing
+rem hidden import and would ship an exe whose inference fails with
+rem "The 'httpx' package is required for LLM HTTP clients".
+%PY% -c "import PyInstaller, PySide6, PIL, httpx, numpy, onnxruntime" >nul 2>nul
 if errorlevel 1 (
-    echo [INFO] Installing build dependencies: pyinstaller, PySide6, Pillow ...
-    %PY% -m pip install pyinstaller PySide6 Pillow
+    echo [INFO] Installing build dependencies: pyinstaller, PySide6, Pillow, httpx, numpy, onnxruntime ...
+    %PY% -m pip install pyinstaller PySide6 Pillow httpx numpy onnxruntime
     if errorlevel 1 (
         echo [ERROR] Build dependency install failed. Check your network and retry.
         echo.

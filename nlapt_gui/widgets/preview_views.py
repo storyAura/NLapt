@@ -15,9 +15,10 @@ from PySide6.QtGui import (
     QPaintEvent,
     QPen,
     QPixmap,
+    QResizeEvent,
     QWheelEvent,
 )
-from PySide6.QtWidgets import QFrame, QWidget
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QWidget
 
 from nlapt_gui import anim
 from nlapt_gui.theme.tokens import accent_soft
@@ -27,7 +28,7 @@ from nlapt_gui.widgets.thumb_cells import (
     scrim_color,
     ui_font,
 )
-from nlapt_gui.widgets.window_chrome import WindowDragHelper
+from nlapt_gui.widgets.window_chrome import WindowButton, WindowDragHelper
 
 if TYPE_CHECKING:
     from nlapt_gui.widgets.preview_panel import PreviewPanel
@@ -46,6 +47,9 @@ WHEEL_NOTCH = 120  # one physical wheel notch == one ZOOM_STEP (finer devices ac
 IMAGE_FADE_MS = 170  # cross-fade on image change (skip-safe: content is correct meanwhile)
 IMAGE_FADE_FROM = 0.55  # starting opacity of the fade-in (fully visible content, just faint)
 TEXT_EDITING = "编辑中"
+NAME_MIN_W = 160
+NAME_MAX_RATIO = 0.40
+POS_MIN_W = 44
 
 
 class _SingleView(QWidget):
@@ -397,14 +401,102 @@ class _MultiCell(QWidget):
 
 
 class _InfoBar(QFrame):
-    """46px preview header: empty space drags the frameless window."""
+    """46px preview header: labels ignore mouse so the strip always drags."""
 
     def __init__(self, panel: "PreviewPanel") -> None:
         super().__init__(panel)
         self._drag = WindowDragHelper(self)
+        self._full_name = ""
+
+    def build_controls(
+        self,
+        *,
+        dirty_text: str,
+        prev_button: QPushButton,
+        next_button: QPushButton,
+        min_button: WindowButton,
+        max_button: WindowButton,
+        close_button: WindowButton,
+    ) -> None:
+        """Install filename / meta / nav / window-chrome widgets."""
+        bar = QHBoxLayout(self)
+        bar.setContentsMargins(14, 0, 0, 0)
+        bar.setSpacing(10)
+        self.name_label = QLabel(self)
+        self.name_label.setFont(mono_font(12.5, QFont.Weight.DemiBold))
+        bar.addWidget(self.name_label)
+        self.meta_pill = QLabel(self)
+        self.meta_pill.setProperty("pill", True)
+        self.meta_pill.setProperty("mono", True)
+        bar.addWidget(self.meta_pill)
+        self.dim_label = QLabel(self)
+        self.dim_label.setProperty("muted", True)
+        self.dim_label.setFont(ui_font(11))
+        bar.addWidget(self.dim_label)
+        self.size_label = QLabel(self)
+        self.size_label.setProperty("muted", True)
+        self.size_label.setFont(ui_font(11))
+        bar.addWidget(self.size_label)
+        self.mtime_label = QLabel(self)
+        self.mtime_label.setProperty("muted", True)
+        self.mtime_label.setFont(ui_font(11))
+        bar.addWidget(self.mtime_label)
+        self.dirty_pill = QLabel(dirty_text, self)
+        self.dirty_pill.setProperty("pill", "warn")
+        self.dirty_pill.hide()
+        bar.addWidget(self.dirty_pill)
+        self.multi_pill = QLabel(self)
+        self.multi_pill.setProperty("pill", "accentSoft")
+        self.multi_pill.hide()
+        bar.addWidget(self.multi_pill)
+        for label in (
+            self.name_label,
+            self.meta_pill,
+            self.dim_label,
+            self.size_label,
+            self.mtime_label,
+            self.dirty_pill,
+            self.multi_pill,
+        ):
+            label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        bar.addStretch(1)
+        bar.addWidget(prev_button)
+        self.pos_label = QLabel(self)
+        self.pos_label.setFont(mono_font(11.5))
+        self.pos_label.setProperty("secondary", True)
+        self.pos_label.setMinimumWidth(POS_MIN_W)
+        self.pos_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.pos_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        bar.addWidget(self.pos_label)
+        bar.addWidget(next_button)
+        for button in (min_button, max_button, close_button):
+            bar.addWidget(button)
+
+    def set_file_name(self, name: str) -> None:
+        """Show ``name``, eliding the middle when the header is tight."""
+        self._full_name = name
+        self._elide_name()
+
+    def resizeEvent(self, event: QResizeEvent) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._elide_name()
+
+    def _elide_name(self) -> None:
+        if not hasattr(self, "name_label"):
+            return
+        max_w = max(NAME_MIN_W, int(self.width() * NAME_MAX_RATIO))
+        self.name_label.setMaximumWidth(max_w)
+        metrics = QFontMetrics(self.name_label.font())
+        self.name_label.setText(
+            metrics.elidedText(self._full_name, Qt.TextElideMode.ElideMiddle, max_w)
+        )
+        self.name_label.setToolTip(self._full_name)
 
     def _on_empty(self, event: QMouseEvent) -> bool:
-        return self.childAt(event.position().toPoint()) is None
+        child = self.childAt(event.position().toPoint())
+        if child is None:
+            return True
+        return bool(child.testAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents))
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if self._drag.press(event, self._on_empty(event)):

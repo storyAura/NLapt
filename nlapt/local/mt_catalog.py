@@ -9,6 +9,7 @@ catalog in :mod:`nlapt.local.catalog`.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -39,6 +40,13 @@ HYMT_DIRECTION_LANG: dict[Direction, str] = {
     Direction.EN_TO_ZH: "zh",
     Direction.ZH_TO_EN: "en",
 }
+# Hy-MT2 was also trained on a context template whose shape is
+# ``{context}\n\n...{source_text}``: only the block after the LAST blank line
+# is translated, everything before it is treated as untranslated background.
+# A caption containing its own blank lines therefore loses every paragraph
+# but the last, so callers translate one paragraph per request and rejoin.
+MT_PARAGRAPH_SEPARATOR = "\n\n"
+_BLANK_LINE_PATTERN = re.compile(r"\n\s*\n")
 
 
 @dataclass(frozen=True)
@@ -133,3 +141,15 @@ def hymt_prompt(text: str, target_lang: str) -> str:
     if name is None:
         raise ValidationError(f"target_lang must be zh/en/ja, got {target_lang!r}")
     return HYMT_PROMPT.format(target_lang=name, source_text=text)
+
+
+def split_mt_paragraphs(text: str) -> tuple[str, ...]:
+    """Split ``text`` on blank lines into stripped, non-empty paragraphs.
+
+    Single newlines inside a paragraph are kept; a text without blank lines
+    yields exactly one paragraph. Raises ValidationError for non-strings.
+    """
+    if not isinstance(text, str):
+        raise ValidationError(f"text must be a string, got {type(text).__name__}")
+    parts = (part.strip() for part in _BLANK_LINE_PATTERN.split(text))
+    return tuple(part for part in parts if part)

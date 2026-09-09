@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from nlapt.app import NLaptApp
-from nlapt.core.config import AppConfig, LLMProfile, RequestControl
+from nlapt.core.config import AppConfig, LLMProfile, ModelRef, RequestControl
 from nlapt.core.errors import LLMConfigError
 from nlapt.llm.base import LLMRequest, register_client
 from nlapt.llm.mock import MockLLMClient
@@ -80,6 +80,58 @@ class TestMakeRewriteService:
         request = _captured_request(service._vision_client)  # noqa: SLF001
         assert request.model == "vis-model"
         assert request.timeout == TIMEOUT
+
+    def test_text_and_vision_targets_on_different_apis(self) -> None:
+        text_api = LLMProfile(
+            name="text-api",
+            api_type=API_TYPE,
+            base_url="http://text-host",
+            models=("t1",),
+            enabled_models=("t1",),
+        )
+        vision_api = LLMProfile(
+            name="vision-api",
+            api_type=API_TYPE,
+            base_url="http://vision-host",
+            models=("v1", "v-off"),
+            enabled_models=("v1",),
+        )
+        config = AppConfig(
+            profiles=(text_api, vision_api),
+            text_target=ModelRef("text-api", "t1"),
+            vision_target=ModelRef("vision-api", "v1"),
+        )
+        service = NLaptApp(config=config).make_rewrite_service()
+        service.run_one(
+            RewriteSpec(type=RewriteType.POLISH), key="a.png", caption="c", filename="a.png"
+        )
+        assert _captured_request(service._text_client).model == "t1"  # noqa: SLF001
+        service.run_one(
+            RewriteSpec(type=RewriteType.POLISH, use_vision=True),
+            key="a.png",
+            caption="c",
+            filename="a.png",
+            image=b"x",
+        )
+        assert _captured_request(service._vision_client).model == "v1"  # noqa: SLF001
+        assert service._text_client is not service._vision_client  # noqa: SLF001
+
+        # A vision target pointing at a switched-off model is "unconfigured".
+        stale = NLaptApp(
+            config=AppConfig(
+                profiles=(text_api, vision_api),
+                text_target=ModelRef("text-api", "t1"),
+                vision_target=ModelRef("vision-api", "v-off"),
+            )
+        ).make_rewrite_service()
+        with pytest.raises(LLMConfigError):
+            stale.run_one(
+                RewriteSpec(type=RewriteType.POLISH, use_vision=True),
+                key="a.png",
+                caption="c",
+                filename="a.png",
+                image=b"x",
+            )
 
 
 class TestMakeTranslator:

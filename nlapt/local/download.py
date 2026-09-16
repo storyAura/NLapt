@@ -18,9 +18,10 @@ import os
 import threading
 import urllib.error
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
+from urllib.parse import urlparse
 
 from nlapt.core.errors import DownloadCancelledError, DownloadError, ValidationError
 from nlapt.diagnostics import get_logger
@@ -34,6 +35,11 @@ USER_AGENT = "NLapt-local-downloader"
 # HTTPS only: every catalog URL is https and TLS is the transport integrity
 # layer; plain http would silently disable it.
 ALLOWED_SCHEMES = ("https://",)
+GATED_HTTP_CODES = frozenset({401, 403})
+MSG_GATED_DENIED = (
+    "下载被拒绝 (HTTP {code}): 该模型为受限模型,请确认已在 Hugging Face "
+    "网页同意条款,并在 设置▸CHA标注 填写有效 Token"
+)
 
 # done_bytes (including any resumed prefix), total_bytes (None when unknown).
 ProgressFn = Callable[[int, int | None], None]
@@ -58,11 +64,42 @@ class _StaleRangeError(Exception):
     """Internal: the server rejected our resume Range (HTTP 416)."""
 
 
+class _AuthStrippingRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Drop ``Authorization`` when a redirect changes host (HF → CDN).
+
+    urllib forwards every request header across 3xx by default. Hugging Face
+    302s LFS blobs to a CAS/CDN host that rejects a leftover Bearer token
+    (400/403). Same-host redirects keep the header so gated API hops still
+    authenticate.
+    """
+
+    def redirect_request(  # noqa: PLR0913 - urllib's signature
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new_req is None:
+            return None
+        old_host = urlparse(req.full_url).netloc.lower()
+        new_host = urlparse(new_req.full_url).netloc.lower()
+        if old_host != new_host:
+            new_req.remove_header("Authorization")
+        return new_req
+
+
+_DEFAULT_OPENER = urllib.request.build_opener(_AuthStrippingRedirectHandler())
+
+
 def _default_opener(
     request: urllib.request.Request, timeout: float
 ) -> DownloadResponse:
     """Open via urllib (scheme already validated against ALLOWED_SCHEMES)."""
-    return urllib.request.urlopen(request, timeout=timeout)  # noqa: S310
+    return _DEFAULT_OPENER.open(request, timeout=timeout)  # noqa: S310
 
 
 def part_path(dest: Path) -> Path:
@@ -100,8 +137,18 @@ def _close_quietly(response: DownloadResponse) -> None:
         _LOGGER.debug("response close failed", exc_info=True)
 
 
+def _gated_error(code: int) -> DownloadError:
+    """Actionable error for a gated Hugging Face download (401 / 403)."""
+    return DownloadError(MSG_GATED_DENIED.format(code=code))
+
+
 def _open_with_resume(
-    url: str, resume_from: int, *, opener: OpenerFn, timeout: float
+    url: str,
+    resume_from: int,
+    *,
+    opener: OpenerFn,
+    timeout: float,
+    extra_headers: Mapping[str, str] | None = None,
 ) -> tuple[DownloadResponse, int]:
     """Open ``url`` (with a Range header when resuming); return (response, status).
 
@@ -109,7 +156,8 @@ def _open_with_resume(
     caller can restart cleanly, and :class:`DownloadError` on any other
     HTTP / network failure (a non-200/206 response is closed here).
     """
-    headers = {"User-Agent": USER_AGENT}
+    headers = dict(extra_headers) if extra_headers else {}
+    headers["User-Agent"] = USER_AGENT
     if resume_from > 0:
         headers["Range"] = f"bytes={resume_from}-"
     request = urllib.request.Request(url, headers=headers)  # noqa: S310
@@ -118,10 +166,15 @@ def _open_with_resume(
     except urllib.error.HTTPError as exc:
         if exc.code == 416 and resume_from > 0:
             raise _StaleRangeError() from exc
+        if exc.code in GATED_HTTP_CODES:
+            raise _gated_error(exc.code) from exc
         raise DownloadError(f"下载失败 (HTTP {exc.code}): {url}") from exc
     except (urllib.error.URLError, OSError, TimeoutError) as exc:
         raise DownloadError(f"下载失败: {exc}") from exc
     status = int(getattr(response, "status", 200) or 200)
+    if status in GATED_HTTP_CODES:
+        _close_quietly(response)
+        raise _gated_error(status)
     if status not in (200, 206):
         _close_quietly(response)
         raise DownloadError(f"下载失败 (HTTP {status}): {url}")
@@ -222,6 +275,7 @@ def download_file(
     progress: ProgressFn | None = None,
     cancel: threading.Event | None = None,
     opener: OpenerFn | None = None,
+    headers: Mapping[str, str] | None = None,
     chunk_size: int = CHUNK_SIZE,
     timeout: float = DOWNLOAD_TIMEOUT_SECONDS,
 ) -> Path:
@@ -264,7 +318,11 @@ def download_file(
     for _attempt in range(2):
         try:
             response, status = _open_with_resume(
-                url, resume_from, opener=open_fn, timeout=timeout
+                url,
+                resume_from,
+                opener=open_fn,
+                timeout=timeout,
+                extra_headers=headers,
             )
             break
         except _StaleRangeError:

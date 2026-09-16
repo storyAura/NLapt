@@ -5,7 +5,12 @@ from __future__ import annotations
 from PySide6.QtWidgets import QWidget
 
 from nlapt_gui.theme.tokens import THEMES
-from nlapt_gui.widgets.toast import TOAST_DURATION_MS, ToastOverlay, _dot_color
+from nlapt_gui.widgets.toast import (
+    MAX_VISIBLE_TOASTS,
+    TOAST_DURATION_MS,
+    ToastOverlay,
+    _dot_color,
+)
 
 
 class TestDotColors:
@@ -32,6 +37,24 @@ class TestOverlay:
         overlay.show_toast("已保存 0001.txt", "ok")
         overlay.show_toast("已撤销", "info")
         assert overlay.active_texts() == ("已保存 0001.txt", "已撤销")
+
+    def test_fifth_toast_drops_oldest(self, qtbot) -> None:
+        overlay = ToastOverlay(duration_ms=60_000)
+        qtbot.addWidget(overlay)
+        for index in range(MAX_VISIBLE_TOASTS + 1):
+            overlay.show_toast(f"消息 {index}", "info")
+        assert overlay.active_texts() == tuple(
+            f"消息 {index}" for index in range(1, MAX_VISIBLE_TOASTS + 1)
+        )
+
+    def test_same_text_and_kind_restarts_timer(self, qtbot) -> None:
+        overlay = ToastOverlay(duration_ms=60_000)
+        qtbot.addWidget(overlay)
+        overlay.show_toast("已保存 0001.txt", "ok")
+        overlay.show_toast("已保存 0001.txt", "ok")
+        assert overlay.active_texts() == ("已保存 0001.txt",)
+        overlay.show_toast("已保存 0001.txt", "warn")
+        assert overlay.active_texts() == ("已保存 0001.txt", "已保存 0001.txt")
 
     def test_empty_text_ignored(self, qtbot) -> None:
         overlay = ToastOverlay(duration_ms=60_000)

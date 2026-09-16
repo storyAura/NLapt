@@ -21,7 +21,9 @@ from nlapt_gui.api_config import (
     API_FORMAT_VERSION,
     CHAApi,
     ApiConfig,
+    HuggingFaceAuth,
     TranslateCredentials,
+    _has_content,
     api_config_path,
     load_api_config,
     load_app_config,
@@ -166,6 +168,31 @@ class TestRoundTrip:
     def test_save_rejects_wrong_type(self) -> None:
         with pytest.raises(StorageError):
             save_api_config("nope")  # type: ignore[arg-type]
+
+    def test_huggingface_token_round_trip(self) -> None:
+        original = ApiConfig(huggingface=HuggingFaceAuth(token="hf_secret"))
+        save_api_config(original)
+        raw = json.loads(api_config_path().read_text(encoding="utf-8"))
+        assert raw["huggingface"]["token"] == "hf_secret"
+        loaded = load_api_config()
+        assert loaded.huggingface.token == "hf_secret"
+
+    def test_update_huggingface_only(self) -> None:
+        save_api_config(
+            ApiConfig(
+                profiles=(_profile(),),
+                active_profile="default",
+                huggingface=HuggingFaceAuth(token="hf_old"),
+            )
+        )
+        update_api_config(huggingface=HuggingFaceAuth(token="hf_new"))
+        loaded = load_api_config()
+        assert loaded.huggingface.token == "hf_new"
+        assert loaded.profiles[0].api_key == "sk-main"
+
+    def test_has_content_includes_huggingface_token(self) -> None:
+        assert _has_content(ApiConfig()) is False
+        assert _has_content(ApiConfig(huggingface=HuggingFaceAuth(token="hf_x"))) is True
 
 
 class TestAppConfigSplit:

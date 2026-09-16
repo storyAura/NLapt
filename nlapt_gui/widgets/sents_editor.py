@@ -52,6 +52,7 @@ _LOGGER = get_logger(__name__)
 ADD_SENT_TEXT = "+ 添加分段"
 ROW_EDIT_TOOLTIP = "点击编辑"
 ROW_DELETE_TOOLTIP = "删除该段"
+REMOVE_GLYPH = "×"
 HANDLE_TOOLTIP = "拖拽排序"
 INSERT_BADGE_TEXT = "+"
 
@@ -268,7 +269,7 @@ class SentRow(QWidget):
         row.addWidget(self._label, 1)
         remove = QPushButton(self)
         remove.setProperty("variant", "danger-ghost")
-        remove.setText("×")
+        remove.setText(REMOVE_GLYPH)
         remove.setFixedSize(24, 24)
         remove.setToolTip(ROW_DELETE_TOOLTIP)
         remove.setFocusPolicy(Qt.FocusPolicy.NoFocus)

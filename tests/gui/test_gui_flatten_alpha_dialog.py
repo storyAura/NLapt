@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QObject, Signal
+from PySide6.QtWidgets import QDialog
 
 from nlapt.images.alpha import MODE_FIXED, MODE_RANDOM, FlattenReport, FlattenSpec
 
 from nlapt_gui.image_tools_bridge import OP_FLATTEN
 from nlapt_gui.widgets.flatten_alpha_dialog import (
+    BUTTON_CANCEL,
     BUTTON_RUN,
     STATS_SCANNING,
     FlattenAlphaDialog,
@@ -71,3 +73,12 @@ def test_finished_accepts(qtbot, controller) -> None:
     assert dialog.current_spec().mode == MODE_RANDOM
     dialog._on_progress(OP_FLATTEN, 1, 2)
     assert dialog.progress.value() == 1
+
+
+def test_cancel_rejects(qtbot, controller) -> None:
+    bridge = _FakeBridge()
+    dialog = FlattenAlphaDialog(controller, bridge)  # type: ignore[arg-type]
+    qtbot.addWidget(dialog)
+    assert dialog.cancel_button.text() == BUTTON_CANCEL
+    dialog.cancel_button.click()
+    assert dialog.result() == QDialog.DialogCode.Rejected

@@ -1,10 +1,10 @@
 """Unified API configuration in ``Documents/NLapt/api.json``.
 
-LLM profiles, translation credentials, and the CHA own-API endpoint live
-in one file. ``%APPDATA%/NLapt/config.json`` keeps non-interface AppConfig
-fields; ``translate.json`` / ``cha_annotation.json`` keep provider choice
-and CHA public options. ``NLAPT_DOCUMENTS_DIR`` isolates the Documents
-root in tests.
+LLM profiles, translation credentials, the CHA own-API endpoint, and the
+global Hugging Face token live in one file. ``%APPDATA%/NLapt/config.json``
+keeps non-interface AppConfig fields; ``translate.json`` /
+``cha_annotation.json`` keep provider choice and CHA public options.
+``NLAPT_DOCUMENTS_DIR`` isolates the Documents root in tests.
 """
 
 from __future__ import annotations
@@ -70,6 +70,13 @@ class CHAApi:
 
 
 @dataclass(frozen=True)
+class HuggingFaceAuth:
+    """Global Hugging Face token (gated model downloads)."""
+
+    token: str = ""
+
+
+@dataclass(frozen=True)
 class ApiConfig:
     """Immutable union of every interface the GUI can call."""
 
@@ -79,6 +86,7 @@ class ApiConfig:
     vision_target: ModelRef = ModelRef()
     translate: TranslateCredentials = TranslateCredentials()
     cha: CHAApi = CHAApi()
+    huggingface: HuggingFaceAuth = HuggingFaceAuth()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "profiles", tuple(self.profiles))
@@ -136,6 +144,7 @@ def save_api_config(config: ApiConfig) -> None:
         },
         "translate": dataclasses.asdict(config.translate),
         "cha": dataclasses.asdict(config.cha),
+        "huggingface": dataclasses.asdict(config.huggingface),
     }
     text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     atomic_write_text(api_config_path(), text)
@@ -150,6 +159,7 @@ def update_api_config(
     vision_target: ModelRef | None = None,
     translate: TranslateCredentials | None = None,
     cha: CHAApi | None = None,
+    huggingface: HuggingFaceAuth | None = None,
 ) -> ApiConfig:
     """Read-modify-write ``api.json``, replacing only the provided sections."""
     current = load_api_config()
@@ -166,6 +176,8 @@ def update_api_config(
         changes["translate"] = translate
     if cha is not None:
         changes["cha"] = cha
+    if huggingface is not None:
+        changes["huggingface"] = huggingface
     updated = current.with_changes(**changes) if changes else current
     save_api_config(updated)
     return updated
@@ -237,6 +249,7 @@ def _api_from_dict(raw: dict[str, Any]) -> ApiConfig:
     active = llm_obj.get("active_profile", "")
     translate_raw = raw.get("translate")
     cha_raw = raw.get("cha")
+    hf_raw = raw.get("huggingface")
     return ApiConfig(
         profiles=profiles,
         active_profile=active if isinstance(active, str) else "",
@@ -244,6 +257,7 @@ def _api_from_dict(raw: dict[str, Any]) -> ApiConfig:
         vision_target=_target_from_dict(llm_obj.get("vision_target"), "vision_target"),
         translate=_translate_from_dict(translate_raw if isinstance(translate_raw, dict) else {}),
         cha=_cha_from_dict(cha_raw if isinstance(cha_raw, dict) else {}),
+        huggingface=_huggingface_from_dict(hf_raw if isinstance(hf_raw, dict) else {}),
     )
 
 
@@ -266,6 +280,10 @@ def _translate_from_dict(raw: dict[str, Any]) -> TranslateCredentials:
         custom_api_key=str(raw.get("custom_api_key", raw.get("api_key", ""))),
         custom_model=str(raw.get("custom_model", raw.get("model", ""))),
     )
+
+
+def _huggingface_from_dict(raw: dict[str, Any]) -> HuggingFaceAuth:
+    return HuggingFaceAuth(token=str(raw.get("token", "")).strip())
 
 
 def _cha_from_dict(raw: dict[str, Any]) -> CHAApi:
@@ -319,7 +337,9 @@ def _has_content(config: ApiConfig) -> bool:
     if any(dataclasses.asdict(config.translate).values()):
         return True
     cha = config.cha
-    return bool(cha.base_url or cha.api_key or (cha.api_type and cha.api_type != DEFAULT_CHA_API_TYPE))
+    if cha.base_url or cha.api_key or (cha.api_type and cha.api_type != DEFAULT_CHA_API_TYPE):
+        return True
+    return bool(config.huggingface.token)
 
 
 def _strip_legacy_files() -> None:

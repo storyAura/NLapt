@@ -13,7 +13,7 @@ from nlapt.llm.base import register_client
 from nlapt.llm.mock import MockLLMClient
 
 from nlapt_gui.controller import AppController
-from nlapt_gui.layered_prompts import CardParts
+from nlapt_gui.layered_prompts import CardRoster, CharacterCard, LayeredSummary
 from nlapt_gui.prompt_store import (
     DEFAULT_USER_PROMPT,
     ENGINE_LLM,
@@ -427,6 +427,17 @@ class TestRequestCustom:
         assert bridge.configured(profile=override)
 
 
+EMA_CARD = "ema, black hair. She wears a red dress."
+RIN_CARD = "rin, white hair. She wears a blue uniform."
+SOLO = CardRoster((CharacterCard.from_text("ema", "", EMA_CARD),))
+DUO = CardRoster(
+    (
+        CharacterCard.from_text("ema", "", EMA_CARD),
+        CharacterCard.from_text("rin", "", RIN_CARD),
+    )
+)
+
+
 class TestRequestLayeredBatch:
     def test_writes_card_blank_scene_and_history(
         self, qtbot, vision_controller
@@ -438,65 +449,96 @@ class TestRequestLayeredBatch:
             assert bridge.request_layered_batch(
                 keys,
                 ENGINE_LLM,
-                card_text="locked card",
+                roster=SOLO,
                 scene_system="scene-sys",
                 scene_user="scene-user",
             )
         for key in keys:
-            assert vision_controller.record(key).text == "locked card\n\nscene paragraph"
+            assert vision_controller.record(key).text == f"{EMA_CARD}\n\nscene paragraph"
             assert vision_controller.history.entries(key)[0].label == "CHA标注"
         request = _Recorder.last.requests[0]
         assert request.system == "scene-sys"
         assert request.messages[0].text == "scene-user"
 
     def test_same_outfit_header_keeps_card(self, qtbot, vision_controller) -> None:
-        _RESPONSES[:] = ["OUTFIT: SAME\n\nscene paragraph"]
+        _RESPONSES[:] = ["CARD: 1\nOUTFIT 1: SAME\n\nscene paragraph"]
         bridge = VisionBridge(vision_controller)
-        parts = CardParts("ema, black hair.", "She wears a red dress.")
         with qtbot.waitSignal(vision_controller.batch_finished, timeout=4000):
             assert bridge.request_layered_batch(
-                ("0001.png",),
-                ENGINE_LLM,
-                card_text="ema, black hair. She wears a red dress.",
-                scene_system="s",
-                scene_user="u",
-                card_parts=parts,
+                ("0001.png",), ENGINE_LLM, roster=SOLO, scene_system="s", scene_user="u"
             )
         text = vision_controller.record("0001.png").text
-        assert text == "ema, black hair. She wears a red dress.\n\nscene paragraph"
+        assert text == f"{EMA_CARD}\n\nscene paragraph"
 
     def test_rewritten_outfit_replaces_clothing_block(
         self, qtbot, vision_controller
     ) -> None:
-        _RESPONSES[:] = ["OUTFIT: She wears a blue swimsuit.\n\nscene paragraph"]
+        _RESPONSES[:] = ["CARD: 1\nOUTFIT 1: She wears a blue swimsuit.\n\nscene paragraph"]
         bridge = VisionBridge(vision_controller)
-        parts = CardParts("ema, black hair.", "She wears a red dress.")
         with qtbot.waitSignal(vision_controller.batch_finished, timeout=4000):
             assert bridge.request_layered_batch(
-                ("0001.png",),
-                ENGINE_LLM,
-                card_text="ema, black hair. She wears a red dress.",
-                scene_system="s",
-                scene_user="u",
-                card_parts=parts,
+                ("0001.png",), ENGINE_LLM, roster=SOLO, scene_system="s", scene_user="u"
             )
         text = vision_controller.record("0001.png").text
         assert text == "ema, black hair. She wears a blue swimsuit.\n\nscene paragraph"
 
-    def test_rewrite_without_card_parts_keeps_card(
+    def test_multi_card_match_writes_both_cards(self, qtbot, vision_controller) -> None:
+        _RESPONSES[:] = ["CARD: 1, 2\nOUTFIT 1: SAME\nOUTFIT 2: SAME\n\nscene paragraph"]
+        bridge = VisionBridge(vision_controller)
+        with qtbot.waitSignal(bridge.layered_finished, timeout=4000) as blocker:
+            assert bridge.request_layered_batch(
+                ("0001.png",), ENGINE_LLM, roster=DUO, scene_system="s", scene_user="u"
+            )
+        text = vision_controller.record("0001.png").text
+        assert text == f"{EMA_CARD}\n\n{RIN_CARD}\n\nscene paragraph"
+        summary = blocker.args[0]
+        assert isinstance(summary, LayeredSummary)
+        assert summary.matched_counts == (1, 1)
+        assert summary.none_keys == () and summary.failed_keys == ()
+        assert not summary.cancelled
+
+    def test_none_skips_file_and_is_listed_in_summary(
         self, qtbot, vision_controller
     ) -> None:
-        _RESPONSES[:] = ["OUTFIT: She wears a blue swimsuit.\n\nscene paragraph"]
+        _RESPONSES[:] = ["CARD: NONE"]
         bridge = VisionBridge(vision_controller)
-        with qtbot.waitSignal(vision_controller.batch_finished, timeout=4000):
+        before = vision_controller.record("0001.png").text
+        with qtbot.waitSignal(bridge.layered_finished, timeout=4000) as blocker:
             assert bridge.request_layered_batch(
-                ("0001.png",),
-                ENGINE_LLM,
-                card_text="locked card",
-                scene_system="s",
-                scene_user="u",
+                ("0001.png",), ENGINE_LLM, roster=DUO, scene_system="s", scene_user="u"
             )
-        assert vision_controller.record("0001.png").text == "locked card\n\nscene paragraph"
+        summary = blocker.args[0]
+        assert summary.none_keys == ("0001.png",)
+        assert vision_controller.record("0001.png").text == before
+        labels = [entry.label for entry in vision_controller.history.entries("0001.png")]
+        assert "CHA标注" not in labels
+        assert summary.matched_counts == (0, 0)
+        assert summary.failed_keys == ()
+
+    def test_second_card_match_counts_only_that_card(
+        self, qtbot, vision_controller
+    ) -> None:
+        _RESPONSES[:] = ["CARD: 2\nOUTFIT 2: SAME\n\nscene"]
+        bridge = VisionBridge(vision_controller)
+        with qtbot.waitSignal(bridge.layered_finished, timeout=4000) as blocker:
+            assert bridge.request_layered_batch(
+                ("0001.png",), ENGINE_LLM, roster=DUO, scene_system="s", scene_user="u"
+            )
+        assert vision_controller.record("0001.png").text == f"{RIN_CARD}\n\nscene"
+        assert blocker.args[0].matched_counts == (0, 1)
+
+    def test_unparseable_multi_reply_fails_item(self, qtbot, vision_controller) -> None:
+        _RESPONSES[:] = ["just a scene without any header"]
+        bridge = VisionBridge(vision_controller)
+        before = vision_controller.record("0001.png").text
+        with qtbot.waitSignal(bridge.layered_finished, timeout=4000) as blocker:
+            assert bridge.request_layered_batch(
+                ("0001.png",), ENGINE_LLM, roster=DUO, scene_system="s", scene_user="u"
+            )
+        assert vision_controller.record("0001.png").text == before
+        summary = blocker.args[0]
+        assert summary.failed_keys == ("0001.png",)
+        assert summary.matched_counts == (0, 0)
 
     def test_local_captioner_assembles(self, qtbot, vision_controller) -> None:
         bridge = VisionBridge(
@@ -507,13 +549,9 @@ class TestRequestLayeredBatch:
         )
         with qtbot.waitSignal(vision_controller.batch_finished, timeout=4000):
             assert bridge.request_layered_batch(
-                ("0001.png",),
-                ENGINE_LOCAL,
-                card_text="CARD",
-                scene_system="SS",
-                scene_user="SU",
+                ("0001.png",), ENGINE_LOCAL, roster=SOLO, scene_system="SS", scene_user="SU"
             )
-        assert vision_controller.record("0001.png").text == "CARD\n\nSS|SU|0001.png"
+        assert vision_controller.record("0001.png").text == f"{EMA_CARD}\n\nSS|SU|0001.png"
 
 
 class TestFlorenceGuard:

@@ -2,24 +2,39 @@
 
 from __future__ import annotations
 
+import pytest
+
+from nlapt.core.errors import LLMOutputError, ValidationError
+
 from nlapt_gui.layered_prompts import (
     CARD_APPEARANCE_SKILL,
     CARD_BAN_WORDS,
     CARD_CLOTHING_SKILL,
+    CARD_PLACEHOLDERS,
     CARD_VARIANT_HINTS,
     CHARACTER_CARD_PROMPT,
+    MAX_CARDS,
     OUTFIT_PREFIX,
     OUTFIT_REFERENCE_MISSING,
     POSE_SCENE_PROMPT,
     SCENE_HEDGE_WORDS,
+    SCENE_PLACEHOLDERS,
     CardParts,
+    CardRoster,
+    CharacterCard,
+    LayeredVerdict,
     assemble_caption,
     assemble_layered,
+    assemble_roster_caption,
     build_card_prompt,
     build_scene_prompt,
     count_words,
+    effective_card_template,
+    effective_scene_template,
     estimate_tokens,
     format_card_stats,
+    missing_placeholders,
+    parse_layered_reply,
     parse_scene_reply,
     split_card,
 )
@@ -31,19 +46,29 @@ APPEARANCE = (
 )
 OUTFIT = "She wears a white cropped shirt, blue denim shorts, and white sneakers."
 CARD = f"{APPEARANCE} {OUTFIT}"
+CARD_B_APPEARANCE = "rin, has short black hair. Her eyes are red."
+CARD_B_OUTFIT = "She wears a black school uniform and loafers."
+CARD_B = f"{CARD_B_APPEARANCE} {CARD_B_OUTFIT}"
+EMA = CharacterCard.from_text("ema", "monosaba", CARD)
+RIN = CharacterCard.from_text("rin", "", CARD_B)
+ROSTER = CardRoster((EMA, RIN))
+SOLO = CardRoster((EMA,))
 
 
 class TestCardPrompt:
     def test_opening_includes_series(self) -> None:
         text = build_card_prompt("ema", "monosaba")
-        assert "ema from monosaba, " in text
+        assert "ema from monosaba" in text
+        assert "ema from monosaba," not in text
+        assert "ema from monosaba has" in text
         assert "{name}" not in text
         assert "{opening}" not in text
 
     def test_opening_without_series(self) -> None:
         text = build_card_prompt("ema")
         assert "ema from " not in text
-        assert "ema, " in text
+        assert "ema has" in text
+        assert "ema, brown hair, long, wavy" in text
 
     def test_variants_differ(self) -> None:
         a = build_card_prompt("ema", variant=0)
@@ -74,7 +99,7 @@ class TestCardPrompt:
         assert color_at < lower.find("length")
         assert color_at < lower.find("twintails")
         assert color_at < lower.find("bangs")
-        assert color_at < lower.find("ribbons")
+        assert "hair-worn ornaments" not in lower
 
     def test_appearance_skill_requires_tattoos(self) -> None:
         lower = CARD_APPEARANCE_SKILL.lower()
@@ -98,6 +123,21 @@ class TestCardPrompt:
         assert '"{name} wears"' in CARD_CLOTHING_SKILL
         assert '"ema wears"' in build_card_prompt("ema")
 
+    def test_appearance_skill_moves_headwear_to_clothing(self) -> None:
+        appear = CARD_APPEARANCE_SKILL.lower()
+        cloth = CARD_CLOTHING_SKILL.lower()
+        assert "nothing worn on the head" in appear
+        assert "those are clothing" in appear
+        assert "hair-worn ornaments" not in appear
+        assert cloth.find("headwear and hair ornaments") < cloth.find("neckwear")
+
+    def test_card_prompt_bans_comma_fragments(self) -> None:
+        lower = CHARACTER_CARD_PROMPT.lower()
+        assert "comma-separated" in lower
+        assert "tag lists" in lower
+        joined = " ".join(CARD_VARIANT_HINTS).lower()
+        assert "no tag-like comma lists" in joined
+
     def test_variants_keep_appearance_first(self) -> None:
         joined = " ".join(CARD_VARIANT_HINTS).lower()
         assert "never start with garments" in joined
@@ -111,12 +151,44 @@ class TestCardPrompt:
             assert "lead with outer layers" not in hint.lower()
 
 
+class TestCustomTemplates:
+    def test_effective_falls_back_to_builtin(self) -> None:
+        assert effective_card_template("") is CHARACTER_CARD_PROMPT
+        assert effective_card_template("   ") is CHARACTER_CARD_PROMPT
+        assert effective_scene_template("") is POSE_SCENE_PROMPT
+        assert effective_card_template("custom card") == "custom card"
+        assert effective_scene_template("custom scene") == "custom scene"
+
+    def test_missing_placeholders(self) -> None:
+        assert missing_placeholders("hello {name}", CARD_PLACEHOLDERS) == ("{opening}",)
+        assert missing_placeholders(CHARACTER_CARD_PROMPT, CARD_PLACEHOLDERS) == ()
+        assert missing_placeholders(POSE_SCENE_PROMPT, SCENE_PLACEHOLDERS) == ()
+
+    def test_build_card_prompt_uses_custom_template(self) -> None:
+        text = build_card_prompt("ema", "monosaba", template="Lead:{opening} Name:{name}")
+        assert "Lead:ema from monosaba Name:ema" in text
+        assert "alternative 1" in text
+
+    def test_build_scene_prompt_uses_custom_template(self) -> None:
+        text = build_scene_prompt(ROSTER, template="R={ROSTER}\nN={NAMES}")
+        assert "Card 1 — name: ema" in text
+        assert "N=ema, rin" in text
+        assert "You are an image analysis system" not in text
+
+
 class TestScenePrompt:
-    def test_locks_name(self) -> None:
-        text = build_scene_prompt("ema")
-        assert "{NAME}" not in text
-        assert "{OUTFIT}" not in text
-        assert text.count("ema") >= 3
+    def test_lists_every_card_and_locks_names(self) -> None:
+        text = build_scene_prompt(ROSTER)
+        assert "{ROSTER}" not in text and "{NAMES}" not in text
+        assert "Card 1 — name: ema" in text
+        assert "Card 2 — name: rin" in text
+        assert APPEARANCE in text and OUTFIT in text
+        assert CARD_B_OUTFIT in text
+        assert "(ema, rin)" in text
+
+    def test_duplicate_names_listed_once(self) -> None:
+        roster = CardRoster((EMA, CharacterCard.from_text("ema", "", CARD_B)))
+        assert "(ema)" in build_scene_prompt(roster)
 
     def test_skill_lists_hedge_bans_and_clothing_ban(self) -> None:
         lower = POSE_SCENE_PROMPT.lower()
@@ -126,16 +198,120 @@ class TestScenePrompt:
         assert "tattoos" in lower
         assert "200–300" in POSE_SCENE_PROMPT or "200-300" in POSE_SCENE_PROMPT
 
-    def test_outfit_check_injects_official_outfit(self) -> None:
-        text = build_scene_prompt("ema", official_outfit=OUTFIT)
-        assert OUTFIT in text
-        assert OUTFIT_PREFIX in text
-        assert "OUTFIT: SAME" in text
-        assert OUTFIT_REFERENCE_MISSING not in text
+    def test_skill_explains_card_identification(self) -> None:
+        assert "CARD: NONE" in POSE_SCENE_PROMPT
+        assert "CARD: 1, 3" in POSE_SCENE_PROMPT
+        assert "OUTFIT <n>: SAME" in POSE_SCENE_PROMPT
+        lower = POSE_SCENE_PROMPT.lower()
+        assert "appearance first" in lower
+        assert "several costumes" in lower
+        assert "closest outfit" in lower
+
+    def test_same_requires_every_item_worn_as_described(self) -> None:
+        """Held / removed / open items must rewrite the outfit, never SAME."""
+        lower = POSE_SCENE_PROMPT.lower()
+        assert "only when every garment and accessory" in lower
+        for phrase in ("held in the hand", "taken off", "hanging from the arm", "unbuttoned"):
+            assert phrase in lower
+        assert "holds the black hat in her right hand" in lower
+        assert "leave out items that are absent" in lower
+        # Cropped / occluded parts are still not a difference.
+        assert '"not visible" is not "not worn"' in lower
+        assert "out of frame" in lower
 
     def test_missing_outfit_reference_tells_model_to_answer_same(self) -> None:
-        text = build_scene_prompt("ema")
+        bare = CharacterCard.from_text("ema", "", "ema, black hair and red eyes.")
+        text = build_scene_prompt(CardRoster((bare,)))
         assert OUTFIT_REFERENCE_MISSING in text
+        assert OUTFIT_PREFIX[:-1] in text
+        assert OUTFIT_REFERENCE_MISSING not in build_scene_prompt(SOLO)
+
+
+class TestRoster:
+    def test_from_text_splits_outfit(self) -> None:
+        assert EMA.parts == CardParts(APPEARANCE, OUTFIT)
+        assert EMA.series == "monosaba"
+
+    def test_size_limits(self) -> None:
+        assert MAX_CARDS == 8
+        with pytest.raises(ValidationError):
+            CardRoster(())
+        with pytest.raises(ValidationError):
+            CardRoster(tuple([EMA] * (MAX_CARDS + 1)))
+        assert len(CardRoster(tuple([EMA] * MAX_CARDS))) == MAX_CARDS
+
+
+class TestParseLayeredReply:
+    def test_single_match_with_same(self) -> None:
+        verdict = parse_layered_reply("CARD: 2\nOUTFIT 2: SAME\n\nscene", 2)
+        assert verdict == LayeredVerdict((1,), (None,), "scene")
+
+    def test_multi_match_with_rewrite_and_wrapped_line(self) -> None:
+        reply = (
+            "CARD: 1, 3\n"
+            "OUTFIT 1: SAME\n"
+            "OUTFIT 3: She wears a blue swimsuit\nand sandals.\n\n"
+            "scene one\n\nscene two"
+        )
+        verdict = parse_layered_reply(reply, 3)
+        assert verdict.matched == (0, 2)
+        assert verdict.outfits == (None, "She wears a blue swimsuit and sandals.")
+        assert verdict.scene == "scene one\n\nscene two"
+
+    def test_none_skips(self) -> None:
+        assert parse_layered_reply("CARD: NONE", 3) == LayeredVerdict((), (), "")
+        assert parse_layered_reply("card: none.\n\nstray text", 3).matched == ()
+        assert parse_layered_reply("   ", 3).matched == ()
+
+    def test_out_of_range_numbers_dropped_and_sorted(self) -> None:
+        verdict = parse_layered_reply("CARD: 3, 1, 9\n\nscene", 3)
+        assert verdict.matched == (0, 2)
+        assert verdict.outfits == (None, None)
+
+    def test_full_roster_reaches_the_last_card(self) -> None:
+        reply = f"CARD: 1, {MAX_CARDS}\nOUTFIT {MAX_CARDS}: She wears a cloak.\n\nscene"
+        verdict = parse_layered_reply(reply, MAX_CARDS)
+        assert verdict.matched == (0, MAX_CARDS - 1)
+        assert verdict.outfits == (None, "She wears a cloak.")
+        # One past the roster is still dropped.
+        assert parse_layered_reply(f"CARD: {MAX_CARDS + 1}\n\nscene", MAX_CARDS).matched == ()
+
+    def test_unnumbered_outfit_applies_to_single_match(self) -> None:
+        verdict = parse_layered_reply("CARD: 2\nOUTFIT: She wears a red dress.\n\nscene", 2)
+        assert verdict.outfits == ("She wears a red dress.",)
+        multi = parse_layered_reply("CARD: 1, 2\nOUTFIT: She wears a red dress.\n\nscene", 2)
+        assert multi.outfits == (None, None)
+
+    def test_legacy_single_card_shapes(self) -> None:
+        legacy = parse_layered_reply("OUTFIT: She wears a swimsuit.\n\nscene", 1)
+        assert legacy == LayeredVerdict((0,), ("She wears a swimsuit.",), "scene")
+        assert parse_layered_reply("just a scene", 1) == LayeredVerdict((0,), (None,), "just a scene")
+
+    def test_multi_roster_requires_card_line(self) -> None:
+        with pytest.raises(LLMOutputError):
+            parse_layered_reply("just a scene", 2)
+        with pytest.raises(LLMOutputError):
+            parse_layered_reply("OUTFIT 1: SAME\n\nscene", 2)
+
+
+class TestAssembleRoster:
+    def test_none_returns_none(self) -> None:
+        assert assemble_roster_caption(ROSTER, LayeredVerdict((), (), "")) is None
+
+    def test_multi_cards_in_roster_order_with_rewrite(self) -> None:
+        verdict = LayeredVerdict((0, 1), (None, "She wears a red dress."), "scene")
+        result = assemble_roster_caption(ROSTER, verdict)
+        assert result == f"{CARD}\n\n{CARD_B_APPEARANCE} She wears a red dress.\n\nscene"
+        assert "uniform" not in result
+
+    def test_card_without_outfit_block_never_rewritten(self) -> None:
+        bare = CharacterCard.from_text("ema", "", "ema, black hair and red eyes.")
+        verdict = LayeredVerdict((0,), ("She wears a dress.",), "scene")
+        assert assemble_roster_caption(CardRoster((bare,)), verdict) == f"{bare.text}\n\nscene"
+
+    def test_missing_scene_fails(self) -> None:
+        with pytest.raises(LLMOutputError):
+            assemble_roster_caption(SOLO, LayeredVerdict((0,), (None,), "  "))
 
 
 class TestSplitCard:
@@ -226,13 +402,55 @@ class TestStats:
 
 class TestLayeredStore:
     def test_round_trip(self, tmp_path) -> None:
-        from nlapt_gui.layered_store import LayeredMemory, load_layered_memory, save_layered_memory
+        from nlapt_gui.layered_store import (
+            LayeredMemory,
+            SlotMemory,
+            load_layered_memory,
+            save_layered_memory,
+        )
 
         path = tmp_path / "layered_infer.json"
-        memory = LayeredMemory(name="ema", series="monosaba", card_text="card")
+        memory = LayeredMemory(
+            slots=(
+                SlotMemory(name="ema", series="monosaba", card_text="card"),
+                SlotMemory(name="rin", series="", card_text="card b"),
+            )
+        )
         save_layered_memory(memory, path)
         loaded = load_layered_memory(path)
         assert loaded == memory
+        assert loaded.name == "ema" and loaded.series == "monosaba"
+
+    def test_legacy_single_card_file_becomes_first_slot(self, tmp_path) -> None:
+        from nlapt_gui.layered_store import LayeredMemory, SlotMemory, load_layered_memory
+
+        path = tmp_path / "layered_infer.json"
+        path.write_text(
+            '{"name": "ema", "series": "monosaba", "card_text": "card"}', encoding="utf-8"
+        )
+        assert load_layered_memory(path) == LayeredMemory(
+            slots=(SlotMemory(name="ema", series="monosaba", card_text="card"),)
+        )
+
+    def test_slots_capped_and_too_many_rejected(self, tmp_path) -> None:
+        from nlapt.core.errors import StorageError
+
+        from nlapt_gui.layered_store import (
+            LayeredMemory,
+            SlotMemory,
+            load_layered_memory,
+            save_layered_memory,
+        )
+
+        path = tmp_path / "layered_infer.json"
+        many = [{"name": f"n{i}", "series": "", "card_text": ""} for i in range(MAX_CARDS + 2)]
+        path.write_text(f'{{"slots": {many}}}'.replace("'", '"'), encoding="utf-8")
+        assert len(load_layered_memory(path).slots) == MAX_CARDS
+        with pytest.raises(StorageError):
+            save_layered_memory(
+                LayeredMemory(slots=tuple(SlotMemory(name="x") for _ in range(MAX_CARDS + 1))),
+                path,
+            )
 
     def test_missing_and_corrupt_are_empty(self, tmp_path) -> None:
         from nlapt_gui.layered_store import LayeredMemory, load_layered_memory
@@ -242,3 +460,4 @@ class TestLayeredStore:
         bad = tmp_path / "bad.json"
         bad.write_text("{not-json", encoding="utf-8")
         assert load_layered_memory(bad) == LayeredMemory()
+        assert load_layered_memory(bad).name == ""

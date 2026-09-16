@@ -658,6 +658,7 @@ class FilePanel(QFrame):
             self.window(),
             CONFIRM_INFER_TITLE,
             CONFIRM_INFER_TEXT.format(word=word, n=len(keys)),
+            destructive=True,
         ):
             return
         self.infer_requested.emit(tuple(keys), engine)

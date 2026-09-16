@@ -13,15 +13,18 @@ Covers the additive work owned by the aesthetics pass:
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
 from typing import Iterator
-from urllib.parse import quote
 
 import pytest
 from PySide6.QtCore import QAbstractAnimation, QPropertyAnimation, QRect
+from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import QComboBox, QWidget
 
 from nlapt_gui import anim
 from nlapt_gui.theme import ThemeManager, build_qss
+from nlapt_gui.theme.glyphs import ensure_glyphs
 from nlapt_gui.theme.tokens import (
     RADIUS_CARD_PX,
     SHADOW_CARD,
@@ -69,13 +72,19 @@ class TestQssPolish:
         assert "{{" not in qss and "}}" not in qss
 
     @pytest.mark.parametrize("name", ALL_THEMES)
-    def test_combo_arrow_uses_theme_token_color(self, name: str) -> None:
+    def test_combo_arrow_uses_theme_token_color(
+        self, name: str, tmp_path: Path, qapp
+    ) -> None:
         tokens = THEMES[name]
-        qss = build_qss(tokens)
-        # The chevron is an inline data URI; its stroke is the text3 token with
-        # the leading '#' URL-encoded to %23 (proves it is not hardcoded).
-        assert quote(tokens.text3, safe="") in qss
-        assert "data:image/svg+xml" in qss
+        glyphs = ensure_glyphs(tokens, tmp_path)
+        assert glyphs is not None
+        qss = build_qss(tokens, glyphs)
+        match = re.search(r'QComboBox::down-arrow\s*\{[^}]*url\("([^"\n]+)"\)', qss)
+        assert match is not None
+        svg_path = Path(match.group(1))
+        svg = svg_path.read_text(encoding="utf-8")
+        assert f'stroke="{tokens.text3}"' in svg
+        assert QPixmap(str(svg_path)).isNull() is False
 
     def test_scrollbar_thickness_preserved(self) -> None:
         # The theme suite asserts 10px; keep that invariant after the polish.

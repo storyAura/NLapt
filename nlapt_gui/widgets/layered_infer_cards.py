@@ -7,7 +7,9 @@ from collections.abc import Sequence
 from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QMouseEvent, QPixmap, QResizeEvent
 from PySide6.QtWidgets import (
+    QComboBox,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QPlainTextEdit,
@@ -32,14 +34,19 @@ CARD_MODEL_FMT = "模型: {model}"
 BUTTON_REGEN_ONE = "重新生成"
 PLACEHOLDER_CARD = "生成中…"
 PLACEHOLDER_ZH = "中文对照将显示在这里"
+REF_FOLDER_ALL_FMT = "全部 {n}"
+REF_FOLDER_FMT = "{folder} {n}"
+# Combo item data for the "every folder" entry (folder names are never empty).
+REF_FOLDER_ALL = ""
 ENGLISH_MIN_H = 88
 THUMB_H = 110
 THUMB_W = 110
-STRIP_H = 132
+GRID_SPACING = 6
+GRID_MIN_H = 2 * THUMB_H + GRID_SPACING
 PREVIEW_MIN_H = 200
 # Scroll viewport stays this size so long 中文对照 cannot inflate the wizard.
-CARDS_SCROLL_HINT = QSize(480, 360)
-CARDS_SCROLL_MIN = QSize(240, 160)
+CARDS_SCROLL_HINT = QSize(1040, 380)
+CARDS_SCROLL_MIN = QSize(480, 200)
 
 
 class CandidateCard(QFrame):
@@ -219,7 +226,11 @@ class RefThumb(QFrame):
 
 
 class RefPickerGrid(QScrollArea):
-    """Horizontal strip of clickable thumbs; ``picked`` fires on selection."""
+    """Wrapping grid of clickable thumbs; ``picked`` fires on selection.
+
+    Cells reflow to as many columns as the viewport width allows (at least
+    one) and the grid scrolls vertically, so a whole dataset stays browsable.
+    """
 
     picked = Signal(str)
 
@@ -234,28 +245,64 @@ class RefPickerGrid(QScrollArea):
         super().__init__(parent)
         self._controller = controller
         self._loader = loader
+        self._tokens = tokens
         self._selected = ""
         self._thumbs: dict[str, RefThumb] = {}
+        self._columns = 1
         self.setWidgetResizable(True)
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setFixedHeight(STRIP_H)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setMinimumHeight(GRID_MIN_H)
         self.setFrameShape(QFrame.Shape.NoFrame)
 
-        inner = QWidget(self)
-        row = QHBoxLayout(inner)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(6)
-        for key in keys:
-            thumb = RefThumb(key, tokens, inner)
-            thumb.clicked.connect(self.select)
-            self._thumbs[key] = thumb
-            row.addWidget(thumb)
-            self._request_thumb(key, thumb)
-        row.addStretch(1)
-        self.setWidget(inner)
+        self._inner = QWidget(self)
+        self._grid = QGridLayout(self._inner)
+        self._grid.setContentsMargins(0, 0, 0, 0)
+        self._grid.setSpacing(GRID_SPACING)
+        self._grid.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.setWidget(self._inner)
+        self.set_keys(keys)
         if loader is not None:
             loader.ready.connect(self._on_thumb_ready)
+
+    def keys(self) -> tuple[str, ...]:
+        """Keys currently shown in the grid, in display order."""
+        return tuple(self._thumbs)
+
+    def columns(self) -> int:
+        """Columns the grid currently wraps at (≥ 1)."""
+        return self._columns
+
+    def set_keys(self, keys: Sequence[str]) -> None:
+        """Rebuild the grid for ``keys``; the highlight survives when still listed."""
+        for cell in self._thumbs.values():
+            self._grid.removeWidget(cell)
+            cell.deleteLater()
+        self._thumbs = {}
+        for key in keys:
+            thumb = RefThumb(key, self._tokens, self._inner)
+            thumb.clicked.connect(self.select)
+            self._thumbs[key] = thumb
+            self._request_thumb(key, thumb)
+        self._reflow()
+        if self._selected in self._thumbs:
+            self.select(self._selected, notify=False)
+
+    def resizeEvent(self, event: QResizeEvent) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        if self._columns_for_width() != self._columns:
+            self._reflow()
+
+    def _columns_for_width(self) -> int:
+        width = self.viewport().width()
+        return max(1, (width + GRID_SPACING) // (THUMB_W + GRID_SPACING))
+
+    def _reflow(self) -> None:
+        self._columns = self._columns_for_width()
+        for cell in self._thumbs.values():
+            self._grid.removeWidget(cell)
+        for index, cell in enumerate(self._thumbs.values()):
+            self._grid.addWidget(cell, index // self._columns, index % self._columns)
 
     def selected_key(self) -> str:
         """Currently highlighted reference key (empty when none)."""
@@ -294,3 +341,88 @@ class RefPickerGrid(QScrollArea):
         thumb = self._thumbs.get(key)
         if thumb is not None:
             thumb.set_pixmap(pixmap)
+
+
+class RefPickerPanel(QWidget):
+    """Folder filter + :class:`RefPickerGrid` over the WHOLE dataset.
+
+    The reference image for a character card may live in any folder, not
+    only in the batch being captioned, so the strip lists every key and the
+    combo narrows it per folder (hidden when the dataset has one folder).
+    """
+
+    picked = Signal(str)
+
+    def __init__(
+        self,
+        keys: Sequence[str],
+        controller: AppController,
+        loader: ThumbnailLoader | None,
+        tokens: ThemeTokens,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._controller = controller
+        self._all_keys = tuple(keys)
+        self.folder_combo = QComboBox(self)
+        self.folder_combo.addItem(
+            REF_FOLDER_ALL_FMT.format(n=len(self._all_keys)), REF_FOLDER_ALL
+        )
+        folders = controller.folders()
+        for folder in folders:
+            count = len(controller.folder_keys(folder))
+            self.folder_combo.addItem(REF_FOLDER_FMT.format(folder=folder, n=count), folder)
+        self.folder_combo.setVisible(len(folders) > 1)
+        self.folder_combo.currentIndexChanged.connect(self._on_folder_changed)
+
+        self.grid = RefPickerGrid(self._all_keys, controller, loader, tokens, self)
+        self.grid.picked.connect(self.picked)
+
+        filter_row = QHBoxLayout()
+        filter_row.setContentsMargins(0, 0, 0, 0)
+        filter_row.addWidget(self.folder_combo)
+        filter_row.addStretch(1)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        layout.addLayout(filter_row)
+        layout.addWidget(self.grid)
+
+    def current_folder(self) -> str:
+        """Folder the strip is narrowed to (``REF_FOLDER_ALL`` for everything)."""
+        return str(self.folder_combo.currentData() or REF_FOLDER_ALL)
+
+    def keys(self) -> tuple[str, ...]:
+        """Keys currently visible in the strip."""
+        return self.grid.keys()
+
+    def selected_key(self) -> str:
+        return self.grid.selected_key()
+
+    def thumb(self, key: str) -> RefThumb | None:
+        return self.grid.thumb(key)
+
+    def set_folder(self, folder: str) -> None:
+        """Narrow the strip to ``folder`` (``REF_FOLDER_ALL`` shows every key)."""
+        index = self.folder_combo.findData(folder)
+        if index < 0:
+            index = 0
+        if index == self.folder_combo.currentIndex():
+            return
+        self.folder_combo.setCurrentIndex(index)
+
+    def select(self, key: str, *, notify: bool = True) -> None:
+        """Highlight ``key``, widening the filter to its folder when hidden."""
+        if key not in self._all_keys:
+            return
+        if key not in self.grid.keys():
+            self.set_folder(self._controller.folder_of(key))
+        self.grid.select(key, notify=notify)
+
+    def _on_folder_changed(self, _index: int) -> None:
+        folder = self.current_folder()
+        if folder == REF_FOLDER_ALL:
+            keys: Sequence[str] = self._all_keys
+        else:
+            keys = tuple(k for k in self._all_keys if self._controller.folder_of(k) == folder)
+        self.grid.set_keys(keys)

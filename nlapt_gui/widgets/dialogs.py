@@ -142,6 +142,7 @@ def show_message(
     box.setWindowTitle(title)
     box.setText(text)
     box.setStandardButtons(QMessageBox.StandardButton.Ok)
+    box.setDefaultButton(QMessageBox.StandardButton.Ok)
     box.exec()
 
 
@@ -152,13 +153,20 @@ def ask_confirm(
     *,
     confirm_text: str = CONFIRM_OK_TEXT,
     cancel_text: str = CONFIRM_CANCEL_TEXT,
+    destructive: bool = False,
 ) -> bool:
-    """Centered, fading confirm dialog; True when the user confirms."""
+    """Centered, fading confirm dialog; True when the user confirms.
+
+    Escape always cancels. When ``destructive`` is true the default (Enter)
+    button is Cancel so a destructive action is not committed by accident.
+    """
     box = FadingMessageBox(parent)
     box.setIcon(QMessageBox.Icon.Question)
     box.setWindowTitle(title)
     box.setText(text)
     confirm = box.addButton(confirm_text, QMessageBox.ButtonRole.AcceptRole)
-    box.addButton(cancel_text, QMessageBox.ButtonRole.RejectRole)
+    cancel = box.addButton(cancel_text, QMessageBox.ButtonRole.RejectRole)
+    box.setEscapeButton(cancel)
+    box.setDefaultButton(cancel if destructive else confirm)
     box.exec()
     return box.clickedButton() is confirm

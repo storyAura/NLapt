@@ -31,6 +31,7 @@ WINDOW_TITLE = "查找雷同图片"
 HINT = "用感知哈希找出范围内视觉相近或完全相同的图片，确认后再移出数据集。"
 LABEL_DISTANCE = "汉明距离 {n}（0 = 完全相同）"
 BUTTON_SCAN = "开始检索"
+BUTTON_CLOSE = "关闭"
 BUTTON_QUARANTINE = "将未保留的 {n} 张移到 .backups/duplicates/"
 CONFIRM_TITLE = "移出雷同图片"
 CONFIRM_TEXT = "将把 {n} 张图片（及同名 txt）移到 .backups/duplicates/，可从「撤销上次图像操作」恢复。"
@@ -108,6 +109,10 @@ class DuplicateReviewDialog(CenteredDialog):
         scroll.setWidget(self._stack)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
+        self.close_button = QPushButton(BUTTON_CLOSE, self)
+        self.close_button.setProperty("variant", "outline")
+        self.close_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.close_button.clicked.connect(self.reject)
         self.quarantine_button = QPushButton(BUTTON_QUARANTINE.format(n=0), self)
         self.quarantine_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.quarantine_button.setEnabled(False)
@@ -124,7 +129,11 @@ class DuplicateReviewDialog(CenteredDialog):
         layout.addWidget(self.progress)
         layout.addWidget(self.empty_label)
         layout.addWidget(scroll, 1)
-        layout.addWidget(self.quarantine_button)
+        actions = QHBoxLayout()
+        actions.addWidget(self.close_button)
+        actions.addStretch(1)
+        actions.addWidget(self.quarantine_button)
+        layout.addLayout(actions)
 
         loader.ready.connect(self._on_thumb)
         bridge.progress.connect(self._on_progress)
@@ -256,7 +265,12 @@ class DuplicateReviewDialog(CenteredDialog):
         paths = self._drop_paths()
         if not paths:
             return
-        if not ask_confirm(self, CONFIRM_TITLE, CONFIRM_TEXT.format(n=len(paths))):
+        if not ask_confirm(
+            self,
+            CONFIRM_TITLE,
+            CONFIRM_TEXT.format(n=len(paths)),
+            destructive=True,
+        ):
             return
         self.quarantine_button.setEnabled(False)
         self._bridge.quarantine(paths)

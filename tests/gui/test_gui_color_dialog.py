@@ -65,6 +65,23 @@ class TestLiveApplication:
         target.picked.emit("石墨")
         assert manager.theme_name == "石墨"
 
+    def test_reject_restores_snapshot(self, dialog, manager) -> None:
+        opened_theme = manager.theme_name
+        opened_accent = manager.accent
+        dialog.apply_theme("墨黑")
+        dialog.apply_accent("#AB34CD")
+        assert manager.theme_name == "墨黑"
+        dialog.reject()
+        assert manager.theme_name == opened_theme
+        assert manager.accent == opened_accent
+
+    def test_accept_keeps_live_changes(self, dialog, manager) -> None:
+        dialog.apply_theme("墨黑")
+        dialog.apply_accent("#AB34CD")
+        dialog.accept()
+        assert manager.theme_name == "墨黑"
+        assert manager.accent == "#AB34CD"
+
     def test_invalid_custom_color_rejected_by_manager(self, dialog, manager) -> None:
         # A cancelled QColorDialog returns an invalid color: nothing changes.
         before = manager.accent

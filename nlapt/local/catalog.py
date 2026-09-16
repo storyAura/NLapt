@@ -14,11 +14,14 @@ values read from the HuggingFace API (LFS oids), so
 round-trip. Download counts are a display-only snapshot taken on
 :data:`CATALOG_SNAPSHOT_DATE`.
 
-Families run on one of two engines: :data:`ENGINE_LLAMA` (a GGUF served by
-llama-server) or :data:`ENGINE_FLORENCE` (the Florence-2 ONNX pipeline of
-:mod:`nlapt.local.florence`, which llama.cpp cannot serve). Florence
-families list their sibling ONNX/tokenizer files in ``extra_files``; every
-listed file downloads into the same per-family directory.
+Families run on one of three engines: :data:`ENGINE_LLAMA` (a GGUF served by
+llama-server), :data:`ENGINE_FLORENCE` (the Florence-2 ONNX pipeline of
+:mod:`nlapt.local.florence`, which llama.cpp cannot serve), or
+:data:`ENGINE_TAGGER` (CL Tagger ONNX, CHA 角色识别 only — registered in
+``_FAMILIES_BY_ID`` but not listed in :data:`ALL_FAMILIES`, so the 本地推理
+tree never offers it as a captioner). Florence / tagger families list
+sibling ONNX files in ``extra_files``; every listed file downloads into the
+same per-family directory.
 
 ``kv_bytes_per_token`` is a deliberately coarse fp16 K+V-cache heuristic per
 family (hybrid/sliding-window attention makes exact numbers configuration
@@ -45,7 +48,7 @@ from nlapt.local.florence import (
 )
 
 # Date the download counts / file listings were captured from huggingface.co.
-CATALOG_SNAPSHOT_DATE = "2026-08-01"
+CATALOG_SNAPSHOT_DATE = "2026-09-14"
 # Base pattern for direct file downloads from a public HuggingFace repo.
 HF_RESOLVE_BASE = "https://huggingface.co/{repo_id}/resolve/main/{path}"
 # Base pattern for a repo's human-readable page.
@@ -60,10 +63,12 @@ SERIES_GEMMA4_HERETIC = "gemma4-heretic"
 SERIES_TORIIGATE = "toriigate"
 SERIES_JOYCAPTION = "joycaption"
 SERIES_FLORENCE = "florence2-promptgen"
+SERIES_TAGGER = "cl-tagger"
 
 # Inference engines a family can run on.
 ENGINE_LLAMA = "llama"  # single GGUF (+ optional mmproj) served by llama-server
 ENGINE_FLORENCE = "florence"  # ONNX pipeline run in-process (nlapt.local.florence)
+ENGINE_TAGGER = "tagger"  # ONNX multi-label tagger (nlapt.local.tagger)
 
 
 @dataclass(frozen=True)
@@ -105,6 +110,10 @@ class ModelFamily:
     # (official Florence-2 knows none of the PromptGen additions). The
     # first entry is the fallback when the persisted task is unsupported.
     florence_tasks: tuple[str, ...] = ()
+    # Hugging Face gated repo: download needs Authorization: Bearer <token>.
+    gated: bool = False
+    # False = provisional / overwritten in place: skip size + SHA256 checks.
+    pinned: bool = True
 
 
 @dataclass(frozen=True)
@@ -841,7 +850,43 @@ ALL_FAMILIES: tuple[ModelFamily, ...] = (
     ),
 )
 
+# CHA 角色识别 (optional). Not in ALL_FAMILIES / ALL_SERIES — the 本地推理
+# tree must not offer it as a caption model. find_family still resolves it.
+TAGGER_FAMILY_ID = "cl-tagger-v2"
+TAGGER_QUANT_LABEL = "ONNX"
+CHARACTER_CSV_FILENAME = "danbooru_character_tags.csv"
+CHARACTER_CSV_URL = (
+    "https://huggingface.co/datasets/StoryAura/Danbooru-Dataset-csv/"
+    "resolve/main/danbooru_character_tags.csv"
+)
+TAGGER_FAMILY = ModelFamily(
+    family_id=TAGGER_FAMILY_ID,
+    series_id=SERIES_TAGGER,
+    name="CL Tagger v2.01a",
+    repo_id="cella110n/cl_tagger_v2",
+    downloads=1,
+    params_label="400M",
+    vision=True,
+    kv_bytes_per_token=1,
+    quants=(
+        _q("ONNX", "v2_01a/model.onnx.data", 2_211_645_300, "", recommended=True),
+    ),
+    license="CL Tagger v2 Model License v1.0（禁止再分发）",
+    notes=(
+        "受限模型,需 Hugging Face Token;v2_01a 为暂定版,官方可同名覆盖,"
+        "故不校验大小/SHA256。角色识别可选模块,不作标注引擎。"
+    ),
+    engine=ENGINE_TAGGER,
+    extra_files=(
+        _q("model", "v2_01a/model.onnx", 791_773, ""),
+        _q("vocabulary", "v2_01a/model_vocabulary.json", 14_594_140, ""),
+    ),
+    gated=True,
+    pinned=False,
+)
+
 _FAMILIES_BY_ID: dict[str, ModelFamily] = {f.family_id: f for f in ALL_FAMILIES}
+_FAMILIES_BY_ID[TAGGER_FAMILY.family_id] = TAGGER_FAMILY
 
 # -- curated LoRAs (内置 LoRA, downloadable like models) ------------------------------
 # Per-user directory name (inside models_dir) holding downloaded LoRAs.

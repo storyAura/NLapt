@@ -32,11 +32,16 @@ import time
 from collections.abc import Mapping, Sequence
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 from nlapt.core.errors import LocalInferenceError, ValidationError
 from nlapt.diagnostics import get_logger
 from nlapt.local.lora import MSG_LORA_NO_MATCH, load_adapter, merge_into_onnx
+from nlapt.local.onnx_session import (
+    InferenceSession,
+    SessionFactory,
+    default_session_factory as _default_session_factory,
+)
 
 _LOGGER = get_logger(__name__)
 
@@ -117,14 +122,6 @@ IMAGE_MEAN = (0.485, 0.456, 0.406)
 IMAGE_STD = (0.229, 0.224, 0.225)
 IMAGE_RESCALE = 1.0 / 255.0
 
-# Providers tried in order when onnxruntime supports them (CPU always works;
-# DirectML/CUDA appear when the user installed that onnxruntime flavour).
-PREFERRED_PROVIDERS = (
-    "CUDAExecutionProvider",
-    "DmlExecutionProvider",
-    "CPUExecutionProvider",
-)
-
 MSG_MISSING_DEPS = (
     "本地打标模型需要 onnxruntime 与 numpy 组件 — "
     "请先运行 pip install onnxruntime numpy 后重试"
@@ -141,39 +138,6 @@ def _require_numpy() -> Any:
     except ImportError as exc:  # pragma: no cover - environment dependent
         raise LocalInferenceError(MSG_MISSING_DEPS) from exc
     return numpy
-
-
-def _require_onnxruntime() -> Any:
-    try:
-        import onnxruntime
-    except ImportError as exc:  # pragma: no cover - environment dependent
-        raise LocalInferenceError(MSG_MISSING_DEPS) from exc
-    return onnxruntime
-
-
-_ort_dlls_preloaded = False
-
-
-def _preload_ort_dlls(ort: Any) -> None:
-    """Load CUDA/cuDNN DLLs from ``nvidia-*`` pip packages before sessions.
-
-    ``onnxruntime-gpu`` lists CUDA as available even when ``cudnn64_9.dll``
-    is missing from PATH; the first Conv then fails with NOT_IMPLEMENTED.
-    ``preload_dlls(directory="")`` picks up
-    ``pip install onnxruntime-gpu[cuda,cudnn]`` site-packages. Missing
-    optional GPU DLLs must not block CPU inference.
-    """
-    global _ort_dlls_preloaded
-    if _ort_dlls_preloaded:
-        return
-    _ort_dlls_preloaded = True
-    preload = getattr(ort, "preload_dlls", None)
-    if not callable(preload):
-        return
-    try:
-        preload(cuda=True, cudnn=True, directory="")
-    except Exception:  # pragma: no cover - environment dependent
-        pass
 
 
 def _require_pillow() -> Any:
@@ -331,64 +295,6 @@ class FlorenceTokenizer:
             byte_run.extend(token)
         flush()
         return "".join(chunks)
-
-
-# -- ONNX session plumbing -----------------------------------------------------------
-class TensorSpec(Protocol):
-    """Name + shape of one session input/output (onnxruntime NodeArg)."""
-
-    name: str
-    shape: Sequence[Any]
-
-
-class InferenceSession(Protocol):
-    """Minimal onnxruntime.InferenceSession surface the engine relies on."""
-
-    def run(
-        self, output_names: Sequence[str] | None, input_feed: Mapping[str, Any]
-    ) -> list[Any]: ...
-
-    def get_inputs(self) -> Sequence[TensorSpec]: ...
-
-    def get_outputs(self) -> Sequence[TensorSpec]: ...
-
-
-class SessionFactory(Protocol):
-    """Creates a session for ``path``; called with ``initializers`` (an
-    initializer-name -> numpy-array mapping to override in the graph)
-    only when a LoRA is active, so plain unary callables keep working."""
-
-    def __call__(
-        self, path: str, initializers: Mapping[str, Any] | None = None
-    ) -> InferenceSession: ...
-
-
-def _default_session_factory(
-    path: str, initializers: Mapping[str, Any] | None = None
-) -> InferenceSession:
-    ort = _require_onnxruntime()
-    _preload_ort_dlls(ort)
-    available = set(ort.get_available_providers())
-    providers = [p for p in PREFERRED_PROVIDERS if p in available]
-    options = None
-    keepalive: list[Any] = []
-    if initializers:
-        # Merged LoRA weights replace the baked-in graph constants at
-        # session creation (nothing is written back to the model file).
-        options = ort.SessionOptions()
-        for name, array in initializers.items():
-            value = ort.OrtValue.ortvalue_from_numpy(array)
-            options.add_initializer(name, value)
-            keepalive.append(value)
-    session = ort.InferenceSession(
-        path, sess_options=options, providers=providers or None
-    )
-    if keepalive:
-        # ORT mandates added initializers outlive the session (it keeps raw
-        # pointers into them) — tie the OrtValues to the session object so
-        # both are released together.
-        session.nlapt_lora_keepalive = keepalive
-    return session
 
 
 def _load_pixels(image_path: Path) -> Any:

@@ -145,6 +145,7 @@ class MTModelsDialog(CenteredDialog):
             self,
             CONFIRM_DELETE_TITLE,
             CONFIRM_DELETE.format(name=model.name),
+            destructive=True,
         ):
             return
         delete_mt_model(tier, models_dir=self._models_dir)

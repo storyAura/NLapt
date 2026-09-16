@@ -5,10 +5,12 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
+from PySide6.QtWidgets import QDialog
 
 from nlapt.images.hashing import DuplicateGroup, ImageFingerprint
 
 from nlapt_gui.widgets.duplicate_review_dialog import (
+    BUTTON_CLOSE,
     BUTTON_SCAN,
     DEFAULT_DISTANCE,
     DuplicateReviewDialog,
@@ -80,3 +82,13 @@ def test_rebuild_groups_and_drop_paths(qtbot, controller, demo_dataset: Path) ->
     dropped = dialog._drop_paths()
     assert p2 in dropped
     assert p1 not in dropped
+
+
+def test_close_rejects(qtbot, controller) -> None:
+    bridge = _FakeBridge()
+    loader = ThumbnailLoader()
+    dialog = DuplicateReviewDialog(controller, bridge, loader)  # type: ignore[arg-type]
+    qtbot.addWidget(dialog)
+    assert dialog.close_button.text() == BUTTON_CLOSE
+    dialog.close_button.click()
+    assert dialog.result() == QDialog.DialogCode.Rejected

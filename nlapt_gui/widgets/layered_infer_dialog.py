@@ -1,4 +1,4 @@
-"""分层推标 wizard: lock a character card, then batch-caption pose/scene."""
+"""CHA标注 wizard: lock 1..MAX_CARDS character cards, then batch-caption pose/scene."""
 
 from __future__ import annotations
 
@@ -7,8 +7,6 @@ from collections.abc import Sequence
 
 from PySide6.QtGui import QGuiApplication, QPixmap
 from PySide6.QtWidgets import (
-    QButtonGroup,
-    QFormLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -16,6 +14,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QStackedWidget,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -32,19 +31,25 @@ from nlapt_gui.cha_config import (
     resolve_card_profile,
 )
 from nlapt_gui.controller import AppController
-from nlapt_gui.model_targets import choice_label
 from nlapt_gui.layered_prompts import (
-    LABEL_CARD_APPEARANCE,
-    LABEL_CARD_OUTFIT,
-    TIP_FLORENCE_NO_LAYERED,
-    WARN_SPLIT_FAILED,
+    MAX_CARDS,
+    CardRoster,
+    CharacterCard,
     build_card_prompt,
     build_scene_prompt,
+    effective_card_template,
+    effective_scene_template,
     format_card_stats,
-    split_card,
 )
-from nlapt_gui.layered_store import LayeredMemory, load_layered_memory, save_layered_memory
+from nlapt_gui.layered_store import (
+    LayeredMemory,
+    SlotMemory,
+    load_layered_memory,
+    save_layered_memory,
+)
+from nlapt_gui.model_targets import choice_label
 from nlapt_gui.prompt_store import ENGINE_LLM, ENGINE_LOCAL, load_vision_prompts
+from nlapt_gui.tagger_bridge import TaggerBridge, release_tagger_engine
 from nlapt_gui.translate_bridge import TranslateBridge
 from nlapt_gui.vision_bridge import VisionBridge, local_engine_is_florence
 from nlapt_gui.widgets.dialogs import CenteredDialog
@@ -53,7 +58,19 @@ from nlapt_gui.widgets.layered_infer_cards import (
     CandidateCard,
     CardsScrollArea,
     PreviewPane,
-    RefPickerGrid,
+    RefPickerPanel,
+)
+from nlapt_gui.widgets.layered_infer_identify import IdentifyCoordinator
+from nlapt_gui.widgets.layered_infer_role_page import (
+    ENGINE_LOCAL_TEXT,
+    RolePage,
+)
+from nlapt_gui.widgets.layered_infer_slots import (
+    CARD_COUNT,
+    SlotCardsPage,
+    SlotConfirmView,
+    SlotRoleForm,
+    SlotWidgets,
 )
 from nlapt_gui.widgets.thumb_cells import tokens_for_settings
 from nlapt_gui.widgets.thumbnails import ThumbnailLoader, bucket_height
@@ -61,39 +78,29 @@ from nlapt_gui.widgets.thumbnails import ThumbnailLoader, bucket_height
 _LOGGER = get_logger(__name__)
 
 WINDOW_TITLE = "CHA标注 · 组合分层推标 (Combined Hierarchical Annotation)"
-LABEL_NAME = "角色名"
-LABEL_SERIES = "作品名"
-LABEL_ENGINE = "推理引擎"
-LABEL_REF = "参考图"
-HINT_NAME = "必填，将锁定为全程主语"
-HINT_SERIES = "选填，写入人物卡首句 name from series"
-HINT_CARDS = "审阅并编辑英文；中文仅供对照。选定一套后用于整批。"
+HINT_CARDS = "审阅并编辑英文；中文仅供对照。每张角色卡选定一套后用于整批。"
 HINT_CONFIRM = (
-    "确认后为每张图生成画面段，并拼接「人物卡 + 空行 + 画面段」。"
-    "每张图会同时核对服装：与官方服装不同时保留固定外貌、改写服装段。"
+    "确认后为每张图判定属于哪几张角色卡，并拼接「匹配的人物卡 + 空行 + 画面段」；"
+    "都不属于的图会跳过不写。每张图同时核对服装：与官方服装不同时保留固定外貌、改写服装段。"
 )
 LABEL_BATCH_MODEL_FMT = "整批画面模型: {model}"
-HINT_REF = "点击下方缩略图选择参考图"
-ENGINE_LLM_TEXT = "LLM"
-ENGINE_LOCAL_TEXT = "本地模型"
 BUTTON_BACK = "上一步"
 BUTTON_GENERATE = "生成人物卡"
 BUTTON_NEXT = "下一步"
 BUTTON_CONFIRM = "开始CHA标注"
-STATUS_NEED_NAME = "请先填写角色名"
+STATUS_NEED_NAME = "请先填写每张角色卡的角色名"
 STATUS_GENERATING = "正在生成人物卡…"
 STATUS_TRANSLATING = "正在翻译对照…"
-STATUS_PICK = "请选定一套人物卡"
+STATUS_PICK = "请为每张角色卡选定一套人物卡"
 STATUS_READY = "将写入 {n} 张标注"
 STATUS_ENGINE = "当前引擎未配置"
 TRANSLATE_FAILED_FMT = "翻译失败: {message}"
 TRANSLATE_FAILED_UNKNOWN = "未知错误"
 PREVIEW_SCENE = "画面提示词预览"
-LABEL_CHOSEN_CARD = "选定人物卡"
-CARD_COUNT = 3
+REQUEST_PREFIX = "card"
 PREVIEW_DECODE_H = 480
-DIALOG_MIN_W = 720
-DIALOG_MIN_H = 680
+DIALOG_MIN_W = 1180
+DIALOG_MIN_H = 720
 SCREEN_MARGIN = 24
 PAGE_ROLE = 0
 PAGE_CARDS = 1
@@ -102,7 +109,7 @@ TARGET_ZH = "zh"
 
 
 class LayeredInferDialog(CenteredDialog):
-    """Three-page wizard: role → three card candidates → confirm batch."""
+    """Three-page wizard: roles (1..MAX_CARDS slots) → candidates per slot → confirm."""
 
     def __init__(
         self,
@@ -115,6 +122,7 @@ class LayeredInferDialog(CenteredDialog):
         memory: LayeredMemory | None = None,
         florence: bool | None = None,
         cha_settings: CHASettings | None = None,
+        tagger_bridge: TaggerBridge | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -130,10 +138,16 @@ class LayeredInferDialog(CenteredDialog):
         self._memory = memory if memory is not None else load_layered_memory()
         self._cha = cha_settings if cha_settings is not None else load_cha_settings()
         self._florence = local_engine_is_florence() if florence is None else florence
+        self._tagger = (
+            tagger_bridge if tagger_bridge is not None else TaggerBridge(parent=self)
+        )
+        self._identify = IdentifyCoordinator(controller, self._tagger, parent=self)
         self._pending: set[str] = set()
         self._translating: set[str] = set()
         self._zh_queue: deque[tuple[str, str]] = deque()
         self._zh_inflight: str | None = None
+        self.slots: list[SlotWidgets] = []
+        self._next_uid = 0
 
         self.setWindowTitle(WINDOW_TITLE)
         self.setModal(True)
@@ -173,12 +187,53 @@ class LayeredInferDialog(CenteredDialog):
         self._refresh_ref_preview()
         self._sync_chrome()
 
+    # -- public accessors (current slot) ----------------------------------------
+    @property
+    def current_slot(self) -> SlotWidgets:
+        """Slot shown on the role tabs (the one the reference strip edits)."""
+        index = max(0, self.role_tabs.currentIndex())
+        return self.slots[min(index, len(self.slots) - 1)]
+
+    @property
+    def name_edit(self) -> QLineEdit:
+        return self.current_slot.role.name_edit
+
+    @property
+    def series_edit(self) -> QLineEdit:
+        return self.current_slot.role.series_edit
+
+    @property
+    def cards(self) -> list[CandidateCard]:
+        """Candidate cards of the current slot."""
+        return self.current_slot.cards_page.cards
+
+    @property
+    def cards_scroll(self) -> CardsScrollArea:
+        return self.current_slot.cards_page.cards_scroll
+
+    @property
+    def confirm_card(self) -> QPlainTextEdit:
+        return self.current_slot.confirm.confirm_card
+
+    @property
+    def confirm_card_stats(self) -> QLabel:
+        return self.current_slot.confirm.confirm_card_stats
+
+    @property
+    def confirm_appearance(self) -> QPlainTextEdit:
+        return self.current_slot.confirm.confirm_appearance
+
+    @property
+    def confirm_outfit(self) -> QPlainTextEdit:
+        return self.current_slot.confirm.confirm_outfit
+
+    @property
+    def confirm_split_warning(self) -> QLabel:
+        return self.current_slot.confirm.confirm_split_warning
+
     def selected_card_text(self) -> str:
-        """English body of the checked candidate (empty when none)."""
-        for card in self.cards:
-            if card.radio.isChecked():
-                return card.english_text()
-        return self.cards[0].english_text() if self.cards else ""
+        """English body of the current slot's checked candidate."""
+        return self.current_slot.cards_page.selected_card_text()
 
     def current_engine(self) -> str:
         """Engine radio value (LLM unless 本地 is checked and enabled)."""
@@ -187,99 +242,84 @@ class LayeredInferDialog(CenteredDialog):
         return ENGINE_LLM
 
     def reference_key(self) -> str:
-        """Image key used for character-card generation."""
-        selected = self.ref_picker.selected_key()
-        if selected:
-            return selected
-        return self._keys[0] if self._keys else ""
+        """Image key used for the current slot's character-card generation."""
+        return self._slot_ref(self.current_slot)
+
+    def roster(self) -> CardRoster | None:
+        """Locked cards of every slot; None while a slot has no card yet."""
+        cards = []
+        for slot in self.slots:
+            text = slot.cards_page.selected_card_text()
+            name = slot.role.name()
+            if not text or not name:
+                return None
+            cards.append(CharacterCard.from_text(name, slot.role.series(), text))
+        return CardRoster(tuple(cards))
 
     # -- pages ----------------------------------------------------------------
     def _build_role_page(self) -> QWidget:
-        page = QWidget(self)
-        self.name_edit = QLineEdit(page)
-        self.name_edit.setPlaceholderText(HINT_NAME)
-        self.name_edit.textChanged.connect(lambda _text: self._sync_chrome())
-        self.series_edit = QLineEdit(page)
-        self.series_edit.setPlaceholderText(HINT_SERIES)
-
-        self.engine_llm = QRadioButton(ENGINE_LLM_TEXT, page)
-        self.engine_local = QRadioButton(ENGINE_LOCAL_TEXT, page)
-        engines = QButtonGroup(page)
-        engines.addButton(self.engine_llm)
-        engines.addButton(self.engine_local)
-        self.engine_llm.setChecked(True)
-        self.florence_tip = QLabel(TIP_FLORENCE_NO_LAYERED, page)
-        self.florence_tip.setProperty("muted", True)
-        self.florence_tip.setWordWrap(True)
-        if self._florence:
-            self.engine_local.setEnabled(False)
-            self.florence_tip.setVisible(True)
-        else:
-            self.florence_tip.setVisible(False)
-
-        engine_row = QHBoxLayout()
-        engine_row.setContentsMargins(0, 0, 0, 0)
-        engine_row.addWidget(self.engine_llm)
-        engine_row.addWidget(self.engine_local)
-        engine_row.addStretch(1)
-
         tokens = tokens_for_settings(self._controller.settings)
-        self.ref_picker = RefPickerGrid(
-            self._keys, self._controller, self._loader, tokens, page
+        # Reference images come from the WHOLE dataset; ``self._keys`` is only
+        # the batch that gets written.
+        self.role_page = RolePage(
+            self._controller.keys(),
+            self._controller,
+            self._loader,
+            tokens,
+            florence=self._florence,
+            parent=self,
         )
-        current = self._controller.current_key
-        initial = current if current in self._keys else (self._keys[0] if self._keys else "")
-        if initial:
-            self.ref_picker.select(initial, notify=False)
-        self.ref_picker.picked.connect(lambda _key: self._refresh_ref_preview())
-
-        ref_label = QLabel(LABEL_REF, page)
-        ref_hint = QLabel(HINT_REF, page)
-        ref_hint.setProperty("muted", True)
-        self.preview = PreviewPane(page)
-
-        form = QFormLayout()
-        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-        form.addRow(LABEL_NAME, self.name_edit)
-        form.addRow(LABEL_SERIES, self.series_edit)
-        form.addRow(LABEL_ENGINE, engine_row)
-
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(10)
-        layout.addLayout(form)
-        layout.addWidget(self.florence_tip)
-        layout.addWidget(ref_label)
-        layout.addWidget(ref_hint)
-        layout.addWidget(self.ref_picker)
-        layout.addWidget(self.preview, 1)
+        page = self.role_page
+        page.role_tabs.currentChanged.connect(self._on_role_tab_changed)
+        page.add_slot_button.clicked.connect(lambda: self.add_slot())
+        page.remove_slot_button.clicked.connect(self.remove_current_slot)
+        page.ref_picker.picked.connect(self._on_ref_picked)
         return page
+
+    # Page-1 controls live on ``role_page``; keep the historical names.
+    @property
+    def role_tabs(self) -> QTabWidget:
+        return self.role_page.role_tabs
+
+    @property
+    def add_slot_button(self) -> QPushButton:
+        return self.role_page.add_slot_button
+
+    @property
+    def remove_slot_button(self) -> QPushButton:
+        return self.role_page.remove_slot_button
+
+    @property
+    def engine_llm(self) -> QRadioButton:
+        return self.role_page.engine_llm
+
+    @property
+    def engine_local(self) -> QRadioButton:
+        return self.role_page.engine_local
+
+    @property
+    def florence_tip(self) -> QLabel:
+        return self.role_page.florence_tip
+
+    @property
+    def ref_picker(self) -> RefPickerPanel:
+        return self.role_page.ref_picker
+
+    @property
+    def preview(self) -> PreviewPane:
+        return self.role_page.preview
 
     def _build_cards_page(self) -> QWidget:
         page = QWidget(self)
         hint = QLabel(HINT_CARDS, page)
         hint.setProperty("muted", True)
         hint.setWordWrap(True)
-        inner = QWidget(page)
-        self.cards: list[CandidateCard] = []
-        self._card_group = QButtonGroup(inner)
-        cards_layout = QVBoxLayout(inner)
-        cards_layout.setContentsMargins(0, 0, 0, 0)
-        cards_layout.setSpacing(8)
-        for index in range(CARD_COUNT):
-            card = CandidateCard(index, inner)
-            card.regen_requested.connect(self._regen_one)
-            self._card_group.addButton(card.radio, index)
-            self.cards.append(card)
-            cards_layout.addWidget(card)
-        self.cards[0].radio.setChecked(True)
-        self.cards_scroll = CardsScrollArea(page)
-        self.cards_scroll.setWidget(inner)
+        self.cards_tabs = QTabWidget(page)
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
         layout.addWidget(hint)
-        layout.addWidget(self.cards_scroll, 1)
+        layout.addWidget(self.cards_tabs, 1)
         return page
 
     def _build_confirm_page(self) -> QWidget:
@@ -289,58 +329,147 @@ class LayeredInferDialog(CenteredDialog):
         hint.setWordWrap(True)
         self.confirm_model = QLabel("", page)
         self.confirm_model.setProperty("muted", True)
-        self.confirm_card = QPlainTextEdit(page)
-        self.confirm_card.setReadOnly(True)
-        self.confirm_card_stats = QLabel(format_card_stats(""), page)
-        self.confirm_card_stats.setProperty("muted", True)
-        self.confirm_appearance = QPlainTextEdit(page)
-        self.confirm_appearance.setReadOnly(True)
-        self.confirm_outfit = QPlainTextEdit(page)
-        self.confirm_outfit.setReadOnly(True)
-        self.confirm_split_warning = QLabel(WARN_SPLIT_FAILED, page)
-        self.confirm_split_warning.setProperty("muted", True)
-        self.confirm_split_warning.hide()
+        self.confirm_tabs = QTabWidget(page)
         self.confirm_scene = QPlainTextEdit(page)
         self.confirm_scene.setReadOnly(True)
         self.confirm_scene_stats = QLabel(format_card_stats(""), page)
         self.confirm_scene_stats.setProperty("muted", True)
-        card_title = QLabel(LABEL_CHOSEN_CARD, page)
-        card_title.setProperty("sectionTitle", True)
-        appearance_title = QLabel(LABEL_CARD_APPEARANCE, page)
-        appearance_title.setProperty("sectionTitle", True)
-        outfit_title = QLabel(LABEL_CARD_OUTFIT, page)
-        outfit_title.setProperty("sectionTitle", True)
         scene_title = QLabel(PREVIEW_SCENE, page)
         scene_title.setProperty("sectionTitle", True)
+        scene_column = QVBoxLayout()
+        scene_column.setContentsMargins(0, 0, 0, 0)
+        scene_column.setSpacing(8)
+        scene_column.addWidget(scene_title)
+        scene_column.addWidget(self.confirm_scene, 1)
+        scene_column.addWidget(self.confirm_scene_stats)
+        columns = QHBoxLayout()
+        columns.setContentsMargins(0, 0, 0, 0)
+        columns.setSpacing(12)
+        columns.addWidget(self.confirm_tabs, 1)
+        columns.addLayout(scene_column, 1)
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
         layout.addWidget(hint)
         layout.addWidget(self.confirm_model)
-        layout.addWidget(card_title)
-        layout.addWidget(self.confirm_card, 1)
-        layout.addWidget(self.confirm_card_stats)
-        layout.addWidget(appearance_title)
-        layout.addWidget(self.confirm_appearance, 1)
-        layout.addWidget(outfit_title)
-        layout.addWidget(self.confirm_outfit, 1)
-        layout.addWidget(self.confirm_split_warning)
-        layout.addWidget(scene_title)
-        layout.addWidget(self.confirm_scene, 1)
-        layout.addWidget(self.confirm_scene_stats)
+        layout.addLayout(columns, 1)
         return page
+
+    # -- slots ------------------------------------------------------------------
+    def add_slot(self, memory: SlotMemory | None = None) -> SlotWidgets | None:
+        """Append a card slot (up to MAX_CARDS) and make it current."""
+        if len(self.slots) >= MAX_CARDS:
+            return None
+        uid = self._next_uid
+        self._next_uid += 1
+        slot = SlotWidgets(
+            uid=uid,
+            role=SlotRoleForm(self),
+            cards_page=SlotCardsPage(self),
+            confirm=SlotConfirmView(self),
+        )
+        current = self._controller.current_key
+        slot.ref_key = current if current in self._controller.keys() else self._default_ref()
+        if memory is not None:
+            slot.role.name_edit.setText(memory.name)
+            slot.role.series_edit.setText(memory.series)
+        slot.role.name_changed.connect(self._on_slot_name_changed)
+        self._identify.bind_slot(slot)
+        slot.cards_page.regen_requested.connect(
+            lambda index, uid=uid: self._request_card(uid, index)
+        )
+        self.slots.append(slot)
+        position = len(self.slots) - 1
+        title = slot.tab_title(position)
+        self.role_tabs.addTab(slot.role, title)
+        self.cards_tabs.addTab(slot.cards_page, title)
+        self.confirm_tabs.addTab(slot.confirm, title)
+        self.role_tabs.setCurrentIndex(position)
+        self._sync_slot_buttons()
+        self._sync_chrome()
+        return slot
+
+    def remove_current_slot(self) -> None:
+        """Drop the current slot (at least one slot always remains)."""
+        if len(self.slots) <= 1:
+            return
+        position = self.role_tabs.currentIndex()
+        slot = self.slots.pop(position)
+        for tabs in (self.role_tabs, self.cards_tabs, self.confirm_tabs):
+            tabs.removeTab(position)
+        prefix = self._request_prefix(slot.uid)
+        for request_id in [rid for rid in self._pending if rid.startswith(prefix)]:
+            self._pending.discard(request_id)
+            self._drop_zh(request_id)
+        slot.role.deleteLater()
+        slot.cards_page.deleteLater()
+        slot.confirm.deleteLater()
+        self._retitle_tabs()
+        self._sync_slot_buttons()
+        self._sync_chrome()
+
+    def _slot_by_uid(self, uid: int) -> SlotWidgets | None:
+        for slot in self.slots:
+            if slot.uid == uid:
+                return slot
+        return None
+
+    def _default_ref(self) -> str:
+        """First batch key: the fallback reference when a slot has none."""
+        return self._keys[0] if self._keys else ""
+
+    def _slot_ref(self, slot: SlotWidgets) -> str:
+        if slot.ref_key in self._controller.keys():
+            return slot.ref_key
+        return self._default_ref()
+
+    def _sync_slot_buttons(self) -> None:
+        self.add_slot_button.setEnabled(len(self.slots) < MAX_CARDS)
+        self.remove_slot_button.setEnabled(len(self.slots) > 1)
+
+    def _retitle_tabs(self) -> None:
+        for position, slot in enumerate(self.slots):
+            title = slot.tab_title(position)
+            for tabs in (self.role_tabs, self.cards_tabs, self.confirm_tabs):
+                tabs.setTabText(position, title)
+
+    def _on_slot_name_changed(self) -> None:
+        self._retitle_tabs()
+        self._sync_chrome()
+
+    def _on_role_tab_changed(self, _index: int) -> None:
+        if not self.slots:
+            return
+        key = self.reference_key()
+        if key:
+            self.ref_picker.select(key, notify=False)
+        self._refresh_ref_preview()
+        self._sync_chrome()
+
+    def _on_ref_picked(self, key: str) -> None:
+        self.current_slot.ref_key = key
+        self._refresh_ref_preview()
+
+    def _all_named(self) -> bool:
+        return bool(self.slots) and all(slot.role.name() for slot in self.slots)
+
+    def _all_picked(self) -> bool:
+        return bool(self.slots) and all(
+            slot.cards_page.selected_card_text() for slot in self.slots
+        )
 
     # -- navigation ------------------------------------------------------------
     def _on_next(self) -> None:
         page = self._stack.currentIndex()
         if page == PAGE_ROLE:
-            if not self.name_edit.text().strip():
+            if not self._all_named():
+                self._focus_first_unnamed()
                 self.status_label.setText(STATUS_NEED_NAME)
                 return
             self._generate_all()
             self._stack.setCurrentIndex(PAGE_CARDS)
         elif page == PAGE_CARDS:
-            if not self.selected_card_text() or self._pending:
+            if not self._all_picked() or self._pending:
                 self.status_label.setText(STATUS_PICK)
                 return
             self._fill_confirm()
@@ -355,13 +484,22 @@ class LayeredInferDialog(CenteredDialog):
             self._stack.setCurrentIndex(page - 1)
         self._sync_chrome()
 
+    def _focus_first_unnamed(self) -> None:
+        for position, slot in enumerate(self.slots):
+            if not slot.role.name():
+                self.role_tabs.setCurrentIndex(position)
+                slot.role.name_edit.setFocus()
+                return
+
     def _sync_chrome(self) -> None:
+        if not hasattr(self, "next_button"):
+            return
         page = self._stack.currentIndex()
         self.back_button.setEnabled(page > PAGE_ROLE)
         if page == PAGE_ROLE:
             self.next_button.setText(BUTTON_GENERATE)
-            self.next_button.setEnabled(bool(self.name_edit.text().strip()) and bool(self._keys))
-            if not self.name_edit.text().strip():
+            self.next_button.setEnabled(self._all_named() and bool(self._keys))
+            if not self._all_named():
                 self.status_label.setText(STATUS_NEED_NAME)
             elif self._pending:
                 self.status_label.setText(STATUS_GENERATING)
@@ -369,7 +507,7 @@ class LayeredInferDialog(CenteredDialog):
                 self.status_label.setText(STATUS_READY.format(n=len(self._keys)))
         elif page == PAGE_CARDS:
             self.next_button.setText(BUTTON_NEXT)
-            self.next_button.setEnabled(bool(self.selected_card_text()) and not self._pending)
+            self.next_button.setEnabled(self._all_picked() and not self._pending)
             if self._pending:
                 self.status_label.setText(STATUS_GENERATING)
             elif self._translating:
@@ -378,19 +516,35 @@ class LayeredInferDialog(CenteredDialog):
                 self.status_label.setText(STATUS_PICK)
         else:
             self.next_button.setText(BUTTON_CONFIRM)
-            self.next_button.setEnabled(bool(self.selected_card_text()))
+            self.next_button.setEnabled(self._all_picked())
             self.status_label.setText(STATUS_READY.format(n=len(self._keys)))
 
     # -- generate / translate --------------------------------------------------
+    @staticmethod
+    def _request_prefix(uid: int) -> str:
+        return f"{REQUEST_PREFIX}-{uid}-"
+
+    @staticmethod
+    def _parse_request_id(request_id: str) -> tuple[int, int] | None:
+        """``card-{uid}-{index}`` → ``(uid, index)``; None for foreign ids."""
+        parts = request_id.split("-")
+        if len(parts) != 3 or parts[0] != REQUEST_PREFIX:
+            return None
+        try:
+            return int(parts[1]), int(parts[2])
+        except ValueError:
+            return None
+
     def _generate_all(self) -> None:
-        for index in range(CARD_COUNT):
-            self._request_card(index)
+        for slot in self.slots:
+            for index in range(CARD_COUNT):
+                self._request_card(slot.uid, index)
 
-    def _regen_one(self, index: int) -> None:
-        self._request_card(index)
-
-    def _request_card(self, index: int) -> None:
-        name = self.name_edit.text().strip()
+    def _request_card(self, uid: int, index: int) -> None:
+        slot = self._slot_by_uid(uid)
+        if slot is None:
+            return
+        name = slot.role.name()
         if not name or not self._keys:
             return
         engine = self.current_engine()
@@ -398,47 +552,54 @@ class LayeredInferDialog(CenteredDialog):
         if not self._vision.configured(engine, profile=profile):
             self.status_label.setText(STATUS_ENGINE)
             return
-        request_id = f"card-{index}"
+        request_id = f"{self._request_prefix(uid)}{index}"
         self._drop_zh(request_id)
         self._pending.add(request_id)
-        self.cards[index].set_english("")
-        self.cards[index].set_busy(True)
-        self.cards[index].set_chinese(PLACEHOLDER_ZH)
-        self.cards[index].set_model_name(
-            self._model_label(engine, profile, self._card_ref(index))
-        )
-        ok = self._vision.request_custom(
+        card = slot.cards_page.cards[index]
+        card.set_english("")
+        card.set_busy(True)
+        card.set_chinese(PLACEHOLDER_ZH)
+        card.set_model_name(self._model_label(engine, profile, self._card_ref(index)))
+        self._vision.request_custom(
             request_id,
-            self.reference_key(),
+            self._slot_ref(slot),
             engine,
             system="",
             user_prompt=build_card_prompt(
-                name, self.series_edit.text(), variant=index
+                name,
+                slot.role.series(),
+                variant=index,
+                template=effective_card_template(self._cha.card_prompt),
             ),
             profile=profile,
         )
-        if not ok and request_id in self._pending:
-            # Failure already emitted custom_ready (sync) or will not run.
-            pass
         self._sync_chrome()
 
+    def _card_for(self, request_id: str) -> CandidateCard | None:
+        parsed = self._parse_request_id(request_id)
+        if parsed is None:
+            return None
+        uid, index = parsed
+        slot = self._slot_by_uid(uid)
+        if slot is None or not 0 <= index < len(slot.cards_page.cards):
+            return None
+        return slot.cards_page.cards[index]
+
     def _on_custom_ready(self, request_id: str, text: str, ok: bool) -> None:
-        if not isValid(self) or not request_id.startswith("card-"):
+        if not isValid(self):
             return
-        try:
-            index = int(request_id.split("-", 1)[1])
-        except ValueError:
-            return
-        if index < 0 or index >= len(self.cards):
+        card = self._card_for(request_id)
+        if card is None:
+            self._pending.discard(request_id)
             return
         self._pending.discard(request_id)
-        self.cards[index].set_busy(False)
+        card.set_busy(False)
         if ok and text.strip():
-            self.cards[index].set_english(text.strip())
+            card.set_english(text.strip())
             self._enqueue_zh(request_id, text.strip())
         else:
-            self.cards[index].set_english("")
-            self.cards[index].set_chinese(text or PLACEHOLDER_ZH)
+            card.set_english("")
+            card.set_chinese(text or PLACEHOLDER_ZH)
         self._sync_chrome()
 
     def _enqueue_zh(self, request_id: str, english: str) -> None:
@@ -466,77 +627,72 @@ class LayeredInferDialog(CenteredDialog):
     def _on_target_ready(
         self, key: str, _source: str, lang: str, result: str, ok: bool
     ) -> None:
-        if not isValid(self) or lang != TARGET_ZH or not key.startswith("card-"):
-            return
-        try:
-            index = int(key.split("-", 1)[1])
-        except ValueError:
-            return
-        if index < 0 or index >= len(self.cards):
+        if not isValid(self) or lang != TARGET_ZH or self._parse_request_id(key) is None:
             return
         if key == self._zh_inflight:
             self._zh_inflight = None
-        if key in self._pending:
+        card = self._card_for(key)
+        if card is None or key in self._pending:
             self._translating.discard(key)
             self._pump_zh_queue()
             self._sync_chrome()
             return
         self._translating.discard(key)
         if ok and result.strip():
-            self.cards[index].set_chinese(result)
+            card.set_chinese(result)
         else:
             message = result.strip() or TRANSLATE_FAILED_UNKNOWN
-            self.cards[index].set_chinese(
-                TRANSLATE_FAILED_FMT.format(message=message)
-            )
+            card.set_chinese(TRANSLATE_FAILED_FMT.format(message=message))
         self._pump_zh_queue()
         self._sync_chrome()
 
     def _fill_confirm(self) -> None:
-        name = self.name_edit.text().strip()
-        card = self.selected_card_text()
-        parts = split_card(card, name)
-        scene = build_scene_prompt(name, official_outfit=parts.outfit)
+        roster = self.roster()
+        for slot in self.slots:
+            slot.confirm.show_card(slot.cards_page.selected_card_text(), slot.role.name())
+        scene = (
+            build_scene_prompt(
+                roster, template=effective_scene_template(self._cha.scene_prompt)
+            )
+            if roster is not None
+            else ""
+        )
         engine = self.current_engine()
         profile = self._batch_profile(engine)
         model = self._model_label(engine, profile, self._cha.batch_model)
-        self.confirm_card.setPlainText(card)
-        self.confirm_card_stats.setText(format_card_stats(card))
-        self.confirm_appearance.setPlainText(parts.appearance)
-        self.confirm_outfit.setPlainText(parts.outfit)
-        self.confirm_split_warning.setVisible(bool(card) and not parts.outfit)
         self.confirm_scene.setPlainText(scene)
         self.confirm_scene_stats.setText(format_card_stats(scene))
         self.confirm_model.setText(
             LABEL_BATCH_MODEL_FMT.format(model=model) if model else ""
         )
         self.confirm_model.setVisible(bool(model))
+        self.confirm_tabs.setCurrentIndex(self.role_tabs.currentIndex())
 
     def _start_batch(self) -> None:
-        card = self.selected_card_text()
-        name = self.name_edit.text().strip()
-        if not card or not name or not self._keys:
+        roster = self.roster()
+        if roster is None or not self._keys:
             return
         engine = self.current_engine()
         prompts = load_vision_prompts()
-        parts = split_card(card, name)
         started = self._vision.request_layered_batch(
             self._keys,
             engine,
-            card_text=card,
+            roster=roster,
             scene_system=prompts.system_text_for(engine),
-            scene_user=build_scene_prompt(name, official_outfit=parts.outfit),
+            scene_user=build_scene_prompt(
+                roster, template=effective_scene_template(self._cha.scene_prompt)
+            ),
             profile=self._batch_profile(engine),
-            card_parts=parts,
         )
         if not started:
             return
         try:
             save_layered_memory(
                 LayeredMemory(
-                    name=name,
-                    series=self.series_edit.text().strip(),
-                    card_text=card,
+                    slots=tuple(
+                        SlotMemory(name=card.name, series=card.series, card_text=card.text)
+                        for card in roster.cards
+                    )
                 )
             )
         except NLaptError as exc:
@@ -590,13 +746,19 @@ class LayeredInferDialog(CenteredDialog):
         self.setMaximumHeight(max(DIALOG_MIN_H, geo.height() - SCREEN_MARGIN))
 
     def _apply_memory(self) -> None:
-        if self._memory.name:
-            self.name_edit.setText(self._memory.name)
-        if self._memory.series:
-            self.series_edit.setText(self._memory.series)
+        """One slot per remembered slot (names / series only), at least one."""
+        remembered = self._memory.slots[:MAX_CARDS]
+        for slot_memory in remembered:
+            self.add_slot(slot_memory)
+        if not self.slots:
+            self.add_slot()
+        self.role_tabs.setCurrentIndex(0)
+        key = self.reference_key()
+        if key:
+            self.ref_picker.select(key, notify=False)
 
     def _refresh_ref_preview(self) -> None:
-        if self._loader is None:
+        if self._loader is None or not self.slots:
             return
         key = self.reference_key()
         if not key:
@@ -609,8 +771,12 @@ class LayeredInferDialog(CenteredDialog):
         if pixmap is not None:
             self.preview.set_source(pixmap)
 
+    def done(self, result: int) -> None:  # noqa: A003 - Qt override
+        release_tagger_engine()
+        super().done(result)
+
     def _on_thumb_ready(self, key: str, pixmap: QPixmap) -> None:
-        if not isValid(self) or key != self.reference_key():
+        if not isValid(self) or not self.slots or key != self.reference_key():
             return
         # Ignore the strip's small-bucket decode; only the 480px request.
         if pixmap.height() < bucket_height(PREVIEW_DECODE_H):

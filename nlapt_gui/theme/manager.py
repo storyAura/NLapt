@@ -11,6 +11,7 @@ from PySide6.QtWidgets import QApplication, QWidget
 from nlapt.diagnostics import get_logger
 
 from nlapt_gui import anim
+from nlapt_gui.theme.glyphs import ensure_glyphs
 from nlapt_gui.theme.qss import build_qss
 from nlapt_gui.theme.tokens import (
     DEFAULT_ACCENT,
@@ -107,10 +108,12 @@ class ThemeManager(QObject):
         tokens = base if resolved_accent == base.accent else with_accent(base, resolved_accent)
         app = self._app if self._app is not None else QApplication.instance()
         if app is not None:
-            # The final look is applied synchronously here; the cross-fade below
-            # is pure polish so a mid-flight theme swap is never left inconsistent.
-            app.setStyleSheet(build_qss(tokens))
+            # Clear the old stylesheet first so native controls (tabs, radios,
+            # spin boxes) repolish against the new palette instead of keeping
+            # the previous theme. Then QSS, which Qt prefers over the palette.
+            app.setStyleSheet("")
             app.setPalette(_palette_for(tokens))
+            app.setStyleSheet(build_qss(tokens, ensure_glyphs(tokens)))
         self._tokens = tokens
         self._theme_name = theme_name
         self._accent = resolved_accent

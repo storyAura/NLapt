@@ -90,6 +90,12 @@ TOAST_FIND_EMPTY = "请输入查找内容"
 TOAST_NO_SELECTION = "尚未选择任何图片"
 TOAST_NO_MATCH = "没有找到匹配内容"
 TOAST_PS_EMPTY = "请输入前缀/后缀内容"
+TOAST_ENCODING_FMT = "{n} 个文件使用非 UTF-8 编码,保存后将转换为 UTF-8"
+TOAST_CONFLICT_FMT = "{n} 个同名图片共用标注文件,仅编辑 {key}"
+TOAST_SAVED_FILE_FMT = "已保存 {name}"
+TOAST_SAVED_COUNT_FMT = "已保存 {n} 个文件"
+TOAST_REPLACED_FMT = "已在 {n} 个文件中替换 {hits} 处"
+TOAST_PREFIX_SUFFIX_FMT = "已为 {n} 个文件{word}"
 LABEL_UNDO = "撤销"
 LABEL_FIND_REPLACE = "查找替换"
 TOAST_MODEL_SWITCHED = "已切换{role}: {model}"
@@ -270,12 +276,14 @@ class AppController(QObject):
         if name == EVT_ENCODING_ISSUES:
             count = len(payload.get("keys", ()))
             self.toast_requested.emit(
-                f"{count} 个文件使用非 UTF-8 编码,保存后将转换为 UTF-8", TOAST_WARN
+                TOAST_ENCODING_FMT.format(n=count), TOAST_WARN
             )
         elif name == EVT_TXT_CONFLICT:
             excluded = payload.get("excluded", ())
             self.toast_requested.emit(
-                f"{len(excluded) + 1} 个同名图片共用标注文件,仅编辑 {payload.get('key', '')}",
+                TOAST_CONFLICT_FMT.format(
+                    n=len(excluded) + 1, key=payload.get("key", "")
+                ),
                 TOAST_WARN,
             )
 
@@ -670,7 +678,7 @@ class AppController(QObject):
             self.busy_changed.emit(False)
             self.save_state_changed.emit("saved")
             self.files_saved.emit((key,))
-            self.toast_requested.emit(f"已保存 {txt_name}", TOAST_OK)
+            self.toast_requested.emit(TOAST_SAVED_FILE_FMT.format(name=txt_name), TOAST_OK)
             self.caption_changed.emit(key)
 
         def failed(message: str) -> None:
@@ -695,7 +703,7 @@ class AppController(QObject):
             self.save_state_changed.emit("saved")
             keys = tuple(saved) if isinstance(saved, (list, tuple)) else ()
             self.files_saved.emit(keys)
-            self.toast_requested.emit(f"已保存 {len(keys)} 个文件", TOAST_OK)
+            self.toast_requested.emit(TOAST_SAVED_COUNT_FMT.format(n=len(keys)), TOAST_OK)
             for key in keys:
                 self.caption_changed.emit(key)
 
@@ -833,7 +841,9 @@ class AppController(QObject):
             keys,
             description=description,
             make_label=lambda key: f"{LABEL_FIND_REPLACE} ×{hits[key]}",
-            make_toast=lambda changed: f"已在 {len(changed)} 个文件中替换 {total} 处",
+            make_toast=lambda changed: TOAST_REPLACED_FMT.format(
+                n=len(changed), hits=total
+            ),
         )
 
     def apply_prefix_suffix(self, text: str, position: str, as_tag: bool, scope: str) -> None:
@@ -862,7 +872,9 @@ class AppController(QObject):
             keys,
             description=label,
             make_label=lambda _key: label,
-            make_toast=lambda changed: f"已为 {len(changed)} 个文件{word}",
+            make_toast=lambda changed: TOAST_PREFIX_SUFFIX_FMT.format(
+                n=len(changed), word=word
+            ),
         )
 
     # Rejection toast when a batch/save is already running (re-entrancy guard).

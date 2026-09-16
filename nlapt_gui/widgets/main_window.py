@@ -54,10 +54,12 @@ from nlapt.storage.atomic import atomic_write_text
 from nlapt_gui import anim
 from nlapt_gui.controller import TOAST_NO_DATASET, TOAST_NO_SELECTION, TOAST_WARN, AppController
 from nlapt_gui.image_tools_bridge import ImageToolsBridge
+from nlapt_gui.layered_prompts import LayeredSummary
 from nlapt_gui.resources import app_data_dir
 from nlapt_gui.theme.logo import load_app_icon
 from nlapt_gui.theme.manager import ThemeManager
 from nlapt_gui.theme.tokens import EDITOR_H_RANGE, MIN_WINDOW, ThemeTokens
+from nlapt_gui.tagger_bridge import TaggerBridge
 from nlapt_gui.translate_bridge import TranslateBridge
 from nlapt_gui.vision_bridge import VisionBridge
 from nlapt_gui.prompt_store import ENGINE_LLM, ENGINE_LOCAL
@@ -70,6 +72,8 @@ from nlapt_gui.widgets.editor_panel import EditorPanel
 from nlapt_gui.widgets.file_panel import FilePanel
 from nlapt_gui.widgets.flatten_alpha_dialog import FlattenAlphaDialog
 from nlapt_gui.widgets.layered_infer_dialog import LayeredInferDialog
+from nlapt_gui.widgets.layered_summary_dialog import LayeredSummaryDialog
+from nlapt_gui.widgets.layered_summary_flow import LayeredSummaryFlow
 from nlapt_gui.widgets.preview_panel import HEADER_H, PreviewPanel, SplitterHandle
 from nlapt_gui.widgets.toast import ToastOverlay
 from nlapt_gui.widgets.toolbar_rail import ToolbarRail
@@ -103,7 +107,6 @@ EXPORT_DIRTY_TITLE = "导出数据集"
 EXPORT_DIRTY_TEXT = (
     "有未保存的标注。导出只打包磁盘上的文件。是否先全部保存再导出？"
 )
-
 # Body splitter: thin themed handle + default / min / max panel widths.
 SPLITTER_HANDLE_W = 4
 FILE_PANEL_DEFAULT_W = 260
@@ -233,6 +236,7 @@ class MainWindow(QWidget):
         self.translate_bridge = TranslateBridge(controller, parent=self)
         self.vision_bridge = VisionBridge(controller, parent=self)
         self.image_tools = ImageToolsBridge(controller, parent=self)
+        self.tagger_bridge = TaggerBridge(parent=self)
 
         self.rail = ToolbarRail(controller, theme_manager, self)
         self.file_panel = FilePanel(controller, tokens=theme_manager.tokens, parent=self)
@@ -271,6 +275,11 @@ class MainWindow(QWidget):
         self.file_panel.layered_infer_requested.connect(self._open_layered_infer)
         self.file_panel.compare_infer_requested.connect(self._open_compare_infer)
         self._layered_dialog: LayeredInferDialog | None = None
+        self._layered_summary: LayeredSummaryDialog | None = None
+        self._summary_flow = LayeredSummaryFlow(
+            self, controller, self.image_tools, self.file_panel.thumbnail_loader, parent=self
+        )
+        self.vision_bridge.layered_finished.connect(self._show_layered_summary)
         self.rail.open_folder_requested.connect(self.pick_folder)
         self.rail.settings_requested.connect(self.tools_panel.open_settings_dialog)
         self.rail.colors_requested.connect(self.open_color_settings)
@@ -417,10 +426,17 @@ class MainWindow(QWidget):
             self.vision_bridge,
             batch,
             loader=self.file_panel.thumbnail_loader,
+            tagger_bridge=self.tagger_bridge,
             parent=self,
         )
         self._layered_dialog = dialog
         dialog.exec()
+
+    def _show_layered_summary(self, summary: object) -> None:
+        """Recap the finished CHA标注 batch: locked cards to copy, skipped keys."""
+        if not isinstance(summary, LayeredSummary):
+            return
+        self._layered_summary = self._summary_flow.show(summary)
 
     def pick_folder(self) -> None:
         """Directory dialog -> controller.open_dataset."""

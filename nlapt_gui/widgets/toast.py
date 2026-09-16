@@ -31,6 +31,8 @@ _LOGGER = get_logger(__name__)
 
 # Auto-dismiss delay from the prototype (setTimeout 2600).
 TOAST_DURATION_MS = 2600
+# Cap the stack so a burst of events cannot bury the window.
+MAX_VISIBLE_TOASTS = 4
 # Distance from the bottom edge (design: bottom 44px).
 BOTTOM_MARGIN_PX = 44
 # Gap between stacked toasts (design: gap 8px).
@@ -92,14 +94,18 @@ class ToastOverlay(QWidget):
         if not text:
             _LOGGER.warning("empty toast text ignored")
             return
+        existing = self._find_pill(text, kind)
+        if existing is not None:
+            self._restart_timer(existing)
+            _LOGGER.debug("toast refreshed (%s): %s", kind, text)
+            return
+        while len(self._pills) >= MAX_VISIBLE_TOASTS:
+            self._dismiss(self._pills[0])
         pill = self._build_pill(text, kind)
         self._pills.append(pill)
         self._stack.addWidget(pill, 0, Qt.AlignmentFlag.AlignHCenter)
         self.raise_()
-        timer = QTimer(pill)
-        timer.setSingleShot(True)
-        timer.timeout.connect(lambda: self._dismiss(pill))
-        timer.start(self._duration_ms)
+        self._arm_timer(pill)
         _LOGGER.debug("toast shown (%s): %s", kind, text)
 
     def active_texts(self) -> tuple[str, ...]:
@@ -130,6 +136,26 @@ class ToastOverlay(QWidget):
     # NOTE: toasts appear without an opacity fade on purpose - a
     # QGraphicsOpacityEffect on a pill that is alive while the user resizes
     # the window re-renders through an effect buffer and can crash Qt.
+
+    def _find_pill(self, text: str, kind: str) -> QFrame | None:
+        for pill in self._pills:
+            if pill.property("toastText") == text and pill.property("toastKind") == kind:
+                return pill
+        return None
+
+    def _arm_timer(self, pill: QFrame) -> None:
+        timer = QTimer(pill)
+        timer.setSingleShot(True)
+        timer.timeout.connect(lambda: self._dismiss(pill))
+        pill._dismiss_timer = timer  # noqa: SLF001 — owned by this overlay
+        timer.start(self._duration_ms)
+
+    def _restart_timer(self, pill: QFrame) -> None:
+        timer = getattr(pill, "_dismiss_timer", None)
+        if isinstance(timer, QTimer):
+            timer.start(self._duration_ms)
+            return
+        self._arm_timer(pill)
 
     def _dismiss(self, pill: QFrame) -> None:
         if pill not in self._pills:

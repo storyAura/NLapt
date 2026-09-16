@@ -114,6 +114,46 @@ class TestMessageHelpers:
         monkeypatch.setattr(FadingMessageBox, "exec", fake_exec)
         assert ask_confirm(None, "删除", "确认?") is False
 
+    def test_show_message_defaults_to_ok(self, qtbot, monkeypatch) -> None:
+        captured: list[FadingMessageBox] = []
+
+        def fake_exec(self: FadingMessageBox) -> int:
+            captured.append(self)
+            return 0
+
+        monkeypatch.setattr(FadingMessageBox, "exec", fake_exec)
+        show_message(None, "标题", "正文")
+        box = captured[0]
+        assert box.defaultButton() is box.button(QMessageBox.StandardButton.Ok)
+
+    def test_ask_confirm_escape_is_cancel(self, qtbot, monkeypatch) -> None:
+        captured: list[FadingMessageBox] = []
+
+        def fake_exec(self: FadingMessageBox) -> int:
+            captured.append(self)
+            return 0
+
+        monkeypatch.setattr(FadingMessageBox, "exec", fake_exec)
+        ask_confirm(None, "删除", "确认?")
+        box = captured[0]
+        assert box.buttonRole(box.escapeButton()) == QMessageBox.ButtonRole.RejectRole
+        assert box.buttonRole(box.defaultButton()) == QMessageBox.ButtonRole.AcceptRole
+
+    def test_ask_confirm_destructive_defaults_to_cancel(
+        self, qtbot, monkeypatch
+    ) -> None:
+        captured: list[FadingMessageBox] = []
+
+        def fake_exec(self: FadingMessageBox) -> int:
+            captured.append(self)
+            return 0
+
+        monkeypatch.setattr(FadingMessageBox, "exec", fake_exec)
+        ask_confirm(None, "删除", "确认?", destructive=True)
+        box = captured[0]
+        assert box.buttonRole(box.defaultButton()) == QMessageBox.ButtonRole.RejectRole
+        assert box.buttonRole(box.escapeButton()) == QMessageBox.ButtonRole.RejectRole
+
 
 class TestNoGraphicsOpacityEffect:
     def test_module_never_uses_graphics_effects(self) -> None:

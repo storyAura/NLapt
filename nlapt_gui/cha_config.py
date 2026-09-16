@@ -48,6 +48,7 @@ class CHASettings:
 
     ``card_models`` / ``batch_model`` accept bare strings for convenience
     (legacy files, tests) and are normalised to :class:`ModelRef`.
+    Empty ``card_prompt`` / ``scene_prompt`` mean the built-in CHA skills.
     """
 
     api_mode: str = API_MODE_SYNC
@@ -56,6 +57,8 @@ class CHASettings:
     api_key: str = ""
     card_models: tuple[ModelRef, ...] = EMPTY_CARD_MODELS
     batch_model: ModelRef = ModelRef()
+    card_prompt: str = ""
+    scene_prompt: str = ""
 
     def __post_init__(self) -> None:
         mode = self.api_mode if self.api_mode in API_MODES else API_MODE_SYNC
@@ -85,6 +88,8 @@ def load_cha_settings(path: Path | None = None) -> CHASettings:
     legacy_base_url = ""
     card_models: tuple[ModelRef, ...] = EMPTY_CARD_MODELS
     batch_model = ModelRef()
+    card_prompt = ""
+    scene_prompt = ""
     if target.exists():
         try:
             raw = json.loads(target.read_text(encoding="utf-8"))
@@ -103,6 +108,10 @@ def load_cha_settings(path: Path | None = None) -> CHASettings:
             legacy_base_url = str(raw.get("base_url", ""))
             card_models = _normalize_card_models(raw.get("card_models"))
             batch_model = model_ref_from_value(raw.get("batch_model", ""))
+            raw_card = raw.get("card_prompt", "")
+            card_prompt = raw_card if isinstance(raw_card, str) else ""
+            raw_scene = raw.get("scene_prompt", "")
+            scene_prompt = raw_scene if isinstance(raw_scene, str) else ""
     endpoint = load_api_config().cha
     return CHASettings(
         api_mode=api_mode,
@@ -111,6 +120,8 @@ def load_cha_settings(path: Path | None = None) -> CHASettings:
         api_key=endpoint.api_key,
         card_models=card_models,
         batch_model=batch_model,
+        card_prompt=card_prompt,
+        scene_prompt=scene_prompt,
     )
 
 
@@ -130,6 +141,8 @@ def save_cha_settings(settings: CHASettings, path: Path | None = None) -> None:
         "api_mode": settings.api_mode,
         "batch_model": dataclasses.asdict(settings.batch_model),
         "card_models": [dataclasses.asdict(ref) for ref in settings.card_models],
+        "card_prompt": settings.card_prompt,
+        "scene_prompt": settings.scene_prompt,
     }
     atomic_write_text(target, json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
     _LOGGER.info("CHA settings saved (api_mode=%s)", settings.api_mode)

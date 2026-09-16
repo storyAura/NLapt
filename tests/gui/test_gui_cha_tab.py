@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QSizePolicy
+from PySide6.QtWidgets import QLineEdit, QSizePolicy
 
 from nlapt.core.config import LLMProfile, ModelRef
 
 from nlapt_gui.cha_config import API_MODE_OWN, CHASettings
 from nlapt_gui.model_targets import ModelChoice
+from nlapt_gui.api_config import ApiConfig, HuggingFaceAuth, save_api_config
+from nlapt_gui.tagger_bridge import MSG_NEED_HF_TOKEN
 from nlapt_gui.widgets.cha_tab import (
+    BUTTON_EDIT_PROMPTS,
     GROUP_BASE_ENDPOINT,
     GROUP_HEADER_FMT,
     GROUP_STALE,
@@ -143,6 +146,21 @@ class TestForm:
         assert settings.card_models[0] == ModelRef("beta", "llava")
         assert settings.card_models[1] == ModelRef("", "b")
         assert settings.batch_model == ModelRef("default", "vision-main")
+        assert settings.card_prompt == ""
+        assert settings.scene_prompt == ""
+
+    def test_prefill_keeps_prompt_templates(self, qtbot) -> None:
+        tab = _tab(qtbot)
+        tab.prefill(
+            CHASettings(
+                card_prompt="CARD {name} {opening}",
+                scene_prompt="SCENE {ROSTER} {NAMES}",
+            )
+        )
+        settings = tab.current_settings()
+        assert settings.card_prompt == "CARD {name} {opening}"
+        assert settings.scene_prompt == "SCENE {ROSTER} {NAMES}"
+        assert tab.edit_prompts_button.text() == BUTTON_EDIT_PROMPTS
 
     def test_placeholder_on_model_fields(self, qtbot) -> None:
         tab = _tab(qtbot)
@@ -256,3 +274,18 @@ class TestProbe:
         tab.toast_requested.connect(lambda text, kind: toasts.append((text, kind)))
         assert tab._probe_profile() is None
         assert (TOAST_STALE_REF.format(label="gone · x"), "warn") in toasts
+
+
+class TestTaggerSection:
+    def test_token_prefill_and_read(self, qtbot) -> None:
+        save_api_config(ApiConfig(huggingface=HuggingFaceAuth(token="hf_secret")))
+        tab = _tab(qtbot)
+        assert tab.hf_token() == "hf_secret"
+        assert tab.tagger_section.token_edit.echoMode() == QLineEdit.EchoMode.Password
+
+    def test_download_without_token_toasts(self, qtbot) -> None:
+        tab = _tab(qtbot)
+        toasts: list[tuple[str, str]] = []
+        tab.toast_requested.connect(lambda text, kind: toasts.append((text, kind)))
+        tab.tagger_section.download_button.click()
+        assert (MSG_NEED_HF_TOKEN, "warn") in toasts

@@ -366,21 +366,25 @@ class TestPreprocess:
 
 class TestOrtDllPreload:
     def test_preload_calls_ort_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        import nlapt.local.florence as florence
+        import nlapt.local.onnx_session as onnx_session
 
         calls: list[dict[str, object]] = []
 
         def fake_preload(**kwargs: object) -> None:
             calls.append(kwargs)
 
-        monkeypatch.setattr(florence, "_ort_dlls_preloaded", False)
-        florence._preload_ort_dlls(type("Ort", (), {"preload_dlls": staticmethod(fake_preload)})())
-        florence._preload_ort_dlls(type("Ort", (), {"preload_dlls": staticmethod(fake_preload)})())
+        monkeypatch.setattr(onnx_session, "_ort_dlls_preloaded", False)
+        onnx_session.preload_ort_dlls(
+            type("Ort", (), {"preload_dlls": staticmethod(fake_preload)})()
+        )
+        onnx_session.preload_ort_dlls(
+            type("Ort", (), {"preload_dlls": staticmethod(fake_preload)})()
+        )
         assert calls == [{"cuda": True, "cudnn": True, "directory": ""}]
 
     def test_preload_without_api_is_noop(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        import nlapt.local.florence as florence
+        import nlapt.local.onnx_session as onnx_session
 
-        monkeypatch.setattr(florence, "_ort_dlls_preloaded", False)
-        florence._preload_ort_dlls(type("Ort", (), {})())
-        assert florence._ort_dlls_preloaded is True
+        monkeypatch.setattr(onnx_session, "_ort_dlls_preloaded", False)
+        onnx_session.preload_ort_dlls(type("Ort", (), {})())
+        assert onnx_session._ort_dlls_preloaded is True

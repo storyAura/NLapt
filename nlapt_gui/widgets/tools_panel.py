@@ -61,6 +61,7 @@ PANEL_TITLE = "修改工具"
 PANEL_SUBTITLE = "对当前文件或批量范围应用修改"
 STATS_PILL = "{n} 张 · 已选 {m}"
 TIP_CLOSE = "收起"
+CLOSE_GLYPH = "×"
 HEADER_H = 44
 CLOSE_PX = 26
 TITLE_FIND_REPLACE = "查找替换"
@@ -403,7 +404,7 @@ class ToolsPanel(QWidget):
         self.stats_pill.setProperty("pill", True)
         self.stats_pill.setProperty("muted", True)
         layout.addWidget(self.stats_pill)
-        self.close_button = QPushButton("×", header)
+        self.close_button = QPushButton(CLOSE_GLYPH, header)
         self.close_button.setFixedSize(CLOSE_PX, CLOSE_PX)
         self.close_button.setToolTip(TIP_CLOSE)
         self.close_button.setCursor(Qt.CursorShape.PointingHandCursor)

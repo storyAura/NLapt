@@ -82,6 +82,18 @@ class TestRoundTrip:
         loaded = load_cha_settings(path)
         assert loaded.card_models == (ModelRef("", "a"), ModelRef(), ModelRef("", "c"))
         assert loaded.batch_model == ModelRef("", "d")
+        assert loaded.card_prompt == ""
+        assert loaded.scene_prompt == ""
+
+    def test_prompt_templates_round_trip(self) -> None:
+        settings = CHASettings(card_prompt="CARD {opening}", scene_prompt="SCENE {ROSTER}")
+        save_cha_settings(settings)
+        loaded = load_cha_settings()
+        assert loaded.card_prompt == "CARD {opening}"
+        assert loaded.scene_prompt == "SCENE {ROSTER}"
+        raw = json.loads(cha_settings_path().read_text(encoding="utf-8"))
+        assert raw["card_prompt"] == "CARD {opening}"
+        assert raw["scene_prompt"] == "SCENE {ROSTER}"
 
     def test_model_ref_from_value(self) -> None:
         assert model_ref_from_value(" x ") == ModelRef("", "x")

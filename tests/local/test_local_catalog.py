@@ -15,6 +15,9 @@ from nlapt.local.catalog import (
     CATALOG_SNAPSHOT_DATE,
     ENGINE_FLORENCE,
     ENGINE_LLAMA,
+    ENGINE_TAGGER,
+    TAGGER_FAMILY,
+    TAGGER_FAMILY_ID,
     all_families,
     all_loras,
     all_series,
@@ -299,3 +302,23 @@ class TestLoras:
             url = lora_download_url(entry, file)
             assert url == entry.base_url + file.filename
             assert url.startswith("https://modelscope.cn/")
+
+
+class TestTaggerFamily:
+    def test_findable_but_hidden_from_local_tree(self) -> None:
+        family = find_family(TAGGER_FAMILY_ID)
+        assert family is TAGGER_FAMILY
+        assert family.engine == ENGINE_TAGGER
+        assert family.gated is True
+        assert family.pinned is False
+        assert family.repo_id == "cella110n/cl_tagger_v2"
+        ids = {item.family_id for item in all_families()}
+        assert TAGGER_FAMILY_ID not in ids
+        assert TAGGER_FAMILY_ID not in {item.family_id for item in ALL_FAMILIES}
+        assert family.series_id not in {series.series_id for series in ALL_SERIES}
+        assert families_for(family.series_id) == ()
+
+    def test_listed_families_stay_ungated_and_pinned(self) -> None:
+        for family in ALL_FAMILIES:
+            assert family.gated is False
+            assert family.pinned is True

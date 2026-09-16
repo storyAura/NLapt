@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 __all__ = ["NLaptApp", "__version__"]
 

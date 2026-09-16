@@ -4,8 +4,8 @@ Spec module 4.2: the fixed accent presets were the only choice before; this
 dialog adds a full custom color picker. It lists the five built-in themes
 (the same swatch rows as the title-bar popup), the accent presets, and a
 自定义色彩 button opening a QColorDialog. Every change applies LIVE through
-:class:`ThemeManager` (which also persists it), so the dialog itself only
-needs a 恢复默认 and a 完成 button.
+:class:`ThemeManager` (which also persists it). 完成 keeps the live values;
+取消 / Esc restores the theme+accent snapshot taken when the dialog opened.
 """
 
 from __future__ import annotations
@@ -37,8 +37,9 @@ SECTION_ACCENT = "主题色"
 BUTTON_CUSTOM = "自定义色彩…"
 BUTTON_RESET = "恢复默认"
 BUTTON_DONE = "完成"
+BUTTON_CANCEL = "取消"
 CUSTOM_PICKER_TITLE = "选择主题色"
-NOTE = "改动会立即生效并自动保存。"
+NOTE = "改动会立即预览；点「完成」保留，「取消」还原到打开时的主题。"
 
 DIALOG_WIDTH = 380
 SWATCH_PX = 13
@@ -122,6 +123,8 @@ class ColorSettingsDialog(CenteredDialog):
     ) -> None:
         super().__init__(parent)
         self._manager = theme_manager
+        self._opened_theme = theme_manager.theme_name
+        self._opened_accent = theme_manager.accent
         self.setWindowTitle(WINDOW_TITLE)
         self.setModal(True)
         self.setMinimumWidth(DIALOG_WIDTH)
@@ -162,11 +165,15 @@ class ColorSettingsDialog(CenteredDialog):
         column.addWidget(note)
         column.addStretch(1)
 
+        self.cancel_button = QPushButton(BUTTON_CANCEL, self)
+        self.cancel_button.setProperty("variant", "outline")
+        self.cancel_button.clicked.connect(self.reject)
         self.done_button = QPushButton(BUTTON_DONE, self)
         self.done_button.setProperty("variant", "accent")
         self.done_button.clicked.connect(self.accept)
         bottom = QHBoxLayout()
         bottom.addStretch(1)
+        bottom.addWidget(self.cancel_button)
         bottom.addWidget(self.done_button)
         column.addLayout(bottom)
 
@@ -230,6 +237,11 @@ class ColorSettingsDialog(CenteredDialog):
         )
         if chosen.isValid():
             self.apply_accent(chosen.name().upper())
+
+    def reject(self) -> None:  # noqa: A003 - Qt override
+        """Restore the theme snapshot taken on open, then close."""
+        self._manager.apply(self._opened_theme, self._opened_accent)
+        super().reject()
 
     def _on_theme_changed(self, _tokens: ThemeTokens) -> None:
         self._rebuild_choices()

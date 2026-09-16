@@ -7,6 +7,7 @@ one hub so a reopened 设置 window can re-attach. One download at a time.
 from __future__ import annotations
 
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass
 from dataclasses import replace as _dc_replace
 from pathlib import Path
@@ -88,11 +89,18 @@ def launch_download_jobs(
     jobs: list[tuple[str, Path, int, str]],
     runtime_asset: RuntimeAsset | None,
     pool: QThreadPool | None = None,
+    headers: Mapping[str, str] | None = None,
 ) -> bool:
-    """Run download jobs on ``pool`` (or the dedicated download pool)."""
-    total_bytes = sum(expected for _url, _dest, expected, _sha in jobs)
+    """Run download jobs on ``pool`` (or the dedicated download pool).
+
+    ``expected == 0`` in a job means "do not verify size" (provisional
+    catalog files). Those bytes are still counted toward progress using
+    the on-disk size after each file finishes.
+    """
+    known = sum(expected for _url, _dest, expected, _sha in jobs if expected > 0)
+    total_bytes: int | None = known if known else None
     if runtime_asset is not None:
-        total_bytes += runtime_asset.size_bytes
+        total_bytes = (total_bytes or 0) + runtime_asset.size_bytes
     cancel = threading.Event()
     global _ACTIVE_TASK
     with _ACTIVE_LOCK:
@@ -138,14 +146,18 @@ def launch_download_jobs(
                 download_file(
                     url,
                     dest,
-                    expected_bytes=expected,
+                    expected_bytes=expected if expected > 0 else None,
                     expected_sha256=sha256 or None,
                     progress=lambda done, _t, *, b=finished_prefix: report(
                         done, None, base=b
                     ),
                     cancel=cancel,
+                    headers=headers,
                 )
-                finished_prefix += expected
+                if expected > 0:
+                    finished_prefix += expected
+                elif dest.is_file():
+                    finished_prefix += dest.stat().st_size
         except DownloadCancelledError:
             return DOWNLOAD_CANCELLED
         return DOWNLOAD_OK

@@ -41,3 +41,8 @@ Thumbs.db
 
 # Design prototype (kept local, not published)
 NLapt-head/
+
+# Developer-only docs (architecture / design / feature sheets).
+# Public: docs/更新日志.md and docs/screenshots/.
+/docs/*.md
+!/docs/更新日志.md

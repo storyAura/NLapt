@@ -42,6 +42,7 @@ LABEL_CUSTOM = "自定义…"
 LABEL_PALETTE = "随机调色板（从这些颜色里为每张图抽色）"
 LABEL_ADD_SWATCH = "添加颜色"
 BUTTON_RUN = "开始替换"
+BUTTON_CANCEL = "取消"
 STATS_SCANNING = "正在统计透明底…"
 STATS_READY = "范围内 {n} 张，其中 {alpha} 张有透明底"
 STATS_EMPTY = "范围内没有图片"
@@ -126,6 +127,10 @@ class FlattenAlphaDialog(CenteredDialog):
         self.progress.setValue(0)
         self.progress.hide()
 
+        self.cancel_button = QPushButton(BUTTON_CANCEL, self)
+        self.cancel_button.setProperty("variant", "outline")
+        self.cancel_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.cancel_button.clicked.connect(self.reject)
         self.run_button = QPushButton(BUTTON_RUN, self)
         self.run_button.setProperty("variant", "accent")
         self.run_button.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -146,7 +151,11 @@ class FlattenAlphaDialog(CenteredDialog):
         layout.addWidget(self.palette_host)
         layout.addWidget(self.stats_label)
         layout.addWidget(self.progress)
-        layout.addWidget(self.run_button, 0, Qt.AlignmentFlag.AlignRight)
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        actions.addWidget(self.cancel_button)
+        actions.addWidget(self.run_button)
+        layout.addLayout(actions)
 
         bridge.progress.connect(self._on_progress)
         bridge.flatten_finished.connect(self._on_finished)

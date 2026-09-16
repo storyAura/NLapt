@@ -44,6 +44,9 @@ from nlapt_gui.cha_config import (
 )
 from nlapt_gui.controller import TOAST_ERR, TOAST_OK, TOAST_WARN
 from nlapt_gui.model_targets import ModelChoice, choice_label
+from nlapt_gui.tagger_bridge import TaggerBridge
+from nlapt_gui.widgets.cha_prompts_dialog import CHAPromptsDialog
+from nlapt_gui.widgets.cha_tagger_section import TaggerSection
 from nlapt_gui.workers import run_async
 
 _LOGGER = get_logger(__name__)
@@ -71,6 +74,10 @@ LABEL_BASE_URL = "Base URL"
 LABEL_API_KEY = "API Key"
 LABEL_CARD_FMT = "候选 {n} 模型"
 LABEL_BATCH_MODEL = "整批画面模型"
+HINT_PROMPTS = (
+    "人物卡 / 画面段提示词可分别自定义，留空即内置默认；随「保存」一起写入。"
+)
+BUTTON_EDIT_PROMPTS = "编辑提示词…"
 PLACEHOLDER_MODEL = "留空沿用视觉模型"
 GROUP_HEADER_FMT = "── {name} ──"
 GROUP_BASE_ENDPOINT = "当前接口"
@@ -103,6 +110,7 @@ class CHATab(QWidget):
         profile_lookup: ProfileLookup | None = None,
         api_types: Sequence[str] = DEFAULT_API_TYPES,
         pool: QThreadPool | None = None,
+        tagger_bridge: TaggerBridge | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -110,8 +118,11 @@ class CHATab(QWidget):
         self._pool_provider = pool_provider
         self._profile_lookup = profile_lookup
         self._pool = pool if pool is not None else QThreadPool.globalInstance()
+        _ = tagger_bridge
         self._groups: tuple[tuple[str, tuple[ModelChoice, ...]], ...] = ()
         self._fetched_models: tuple[str, ...] = ()
+        self._card_prompt = ""
+        self._scene_prompt = ""
 
         hint = QLabel(HINT_CHA, self)
         hint.setProperty("muted", True)
@@ -145,6 +156,16 @@ class CHATab(QWidget):
         model_form.addRow(LABEL_BATCH_MODEL, self.batch_combo)
         self._tune_form(model_form)
 
+        self.prompts_hint = QLabel(HINT_PROMPTS, self)
+        self.prompts_hint.setProperty("muted", True)
+        self.prompts_hint.setWordWrap(True)
+        self.edit_prompts_button = QPushButton(BUTTON_EDIT_PROMPTS, self)
+        self.edit_prompts_button.setProperty("variant", "outline")
+        self.edit_prompts_button.clicked.connect(self._edit_prompts)
+        prompts_row = QHBoxLayout()
+        prompts_row.addWidget(self.prompts_hint, 1)
+        prompts_row.addWidget(self.edit_prompts_button)
+
         self.fetch_models_button = QPushButton(BUTTON_FETCH_MODELS, self)
         self.fetch_models_button.setProperty("variant", "outline")
         self.fetch_models_button.clicked.connect(self.fetch_models)
@@ -162,7 +183,11 @@ class CHATab(QWidget):
         column.addWidget(self.sync_check)
         column.addLayout(api_form)
         column.addLayout(model_form)
+        column.addLayout(prompts_row)
         column.addLayout(probe_row)
+        self.tagger_section = TaggerSection(self)
+        self.tagger_section.toast_requested.connect(self.toast_requested.emit)
+        column.addWidget(self.tagger_section)
         column.addStretch(1)
         self._sync_api_rows()
         self.refresh_pool_models()
@@ -177,7 +202,13 @@ class CHATab(QWidget):
             api_key=self.api_key.text().strip(),
             card_models=tuple(self._combo_ref(combo) for combo in self.card_combos),
             batch_model=self._combo_ref(self.batch_combo),
+            card_prompt=self._card_prompt,
+            scene_prompt=self._scene_prompt,
         )
+
+    def hf_token(self) -> str:
+        """Hugging Face token currently typed in the 角色识别 section."""
+        return self.tagger_section.token()
 
     def prefill(self, settings: CHASettings) -> None:
         """Load persisted values into the form."""
@@ -190,7 +221,18 @@ class CHATab(QWidget):
         for combo, ref in zip(self.card_combos, settings.card_models, strict=True):
             self._set_combo_ref(combo, ref)
         self._set_combo_ref(self.batch_combo, settings.batch_model)
+        self._card_prompt = settings.card_prompt
+        self._scene_prompt = settings.scene_prompt
+        self.tagger_section.prefill_token()
         self._sync_api_rows()
+
+    def _edit_prompts(self) -> None:
+        """Open the two-column CHA prompt editor and keep the result in memory."""
+        dialog = CHAPromptsDialog(
+            self._card_prompt, self._scene_prompt, parent=self.window()
+        )
+        if dialog.exec():
+            self._card_prompt, self._scene_prompt = dialog.result_prompts()
 
     def refresh_pool_models(self) -> None:
         """Re-read the provider-grouped pool and rebuild every picker."""

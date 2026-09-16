@@ -39,6 +39,7 @@ from nlapt.diagnostics import get_logger
 
 from nlapt_gui.prompt_store import (
     DEFAULT_PROMPT_NAME,
+    PROMPTS_FILE_NAME,
     VisionPrompts,
     is_locked_template,
     save_vision_prompts,
@@ -305,7 +306,7 @@ class PromptsTab(QWidget):
             self._toast(TOAST_NOTHING_TO_EXPORT, _KIND_WARN)
             return
         path_str, _filter = QFileDialog.getSaveFileName(
-            self.window(), EXPORT_ALL_CAPTION, "vision_prompts.json", EXPORT_JSON_FILTER
+            self.window(), EXPORT_ALL_CAPTION, PROMPTS_FILE_NAME, EXPORT_JSON_FILTER
         )
         if not path_str:
             return

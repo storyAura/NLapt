@@ -536,6 +536,7 @@ class CaptionBar(QWidget):
             self.window(),
             CONFIRM_DELETE_TITLE,
             CONFIRM_DELETE_TEXT.format(name=name),
+            destructive=True,
         ):
             return
         self.delete_caption(key)

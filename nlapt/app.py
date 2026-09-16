@@ -89,6 +89,8 @@ CAPTION_OPERATION_PREFIX = "caption"
 EMPTY_CAPTION_ERROR = "empty caption from model"
 # Detail strings for batch item results.
 NO_CHANGE_DETAIL = "no change"
+# Item detail when a captioner returns None: deliberately left untouched.
+SKIPPED_DETAIL = "skipped"
 # Max characters of suggestion text quoted in a batch item detail.
 DETAIL_TEXT_LIMIT = 80
 
@@ -588,7 +590,7 @@ class NLaptApp:
     def run_caption_batch(
         self,
         keys: Sequence[str],
-        caption_fn: Callable[[str, Path], str],
+        caption_fn: Callable[[str, Path], str | None],
         *,
         description: str,
         engine: str = "",
@@ -605,7 +607,9 @@ class NLaptApp:
         checkpoint keyed by ``engine`` + keys. ``caption_fn(key, image_path)``
         runs concurrently (the slow LLM round-trips); store/index/disk
         mutations are serialized under the app lock. An empty result marks
-        the item failed and leaves the caption untouched.
+        the item failed and leaves the caption untouched; ``None`` marks it
+        ok with :data:`SKIPPED_DETAIL` and leaves the caption untouched too
+        (the captioner decided the image is out of scope).
         """
         self._require_dataset()
         if not callable(caption_fn):
@@ -623,7 +627,10 @@ class NLaptApp:
         changed: list[str] = []
 
         def worker(key: str) -> BatchItemResult:
-            text = caption_fn(key, self._files[key].image_path).strip()
+            raw = caption_fn(key, self._files[key].image_path)
+            if raw is None:
+                return BatchItemResult(key=key, ok=True, detail=SKIPPED_DETAIL)
+            text = raw.strip()
             if not text:
                 return BatchItemResult(key=key, ok=False, error=EMPTY_CAPTION_ERROR)
             with self._lock:

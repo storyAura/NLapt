@@ -52,7 +52,12 @@ from nlapt.llm.web_translate import (
 )
 from nlapt.local.mt_catalog import DEFAULT_TIER
 
-from nlapt_gui.api_config import load_app_config, save_app_config
+from nlapt_gui.api_config import (
+    HuggingFaceAuth,
+    load_app_config,
+    save_app_config,
+    update_api_config,
+)
 from nlapt_gui.cha_config import API_MODE_OWN, load_cha_settings, save_cha_settings
 from nlapt_gui.compare_config import load_compare_settings, save_compare_settings
 from nlapt_gui.controller import AppController, TOAST_ERR, TOAST_OK, TOAST_WARN
@@ -410,6 +415,11 @@ class SettingsDialog(CenteredDialog):
             save_cha_settings(self.cha_tab.current_settings())
         except NLaptError as exc:
             _LOGGER.exception("could not persist CHA settings")
+            self._toast(str(exc), TOAST_ERR)
+        try:
+            update_api_config(huggingface=HuggingFaceAuth(token=self.cha_tab.hf_token()))
+        except NLaptError as exc:
+            _LOGGER.exception("could not persist Hugging Face token")
             self._toast(str(exc), TOAST_ERR)
         try:
             save_compare_settings(self.compare_tab.current_settings())

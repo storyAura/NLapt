@@ -5,13 +5,20 @@ from __future__ import annotations
 import io
 import threading
 import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from nlapt.core.errors import DownloadCancelledError, DownloadError, ValidationError
-from nlapt.local.download import download_file, part_path
+from nlapt.local.download import (
+    MSG_GATED_DENIED,
+    USER_AGENT,
+    _AuthStrippingRedirectHandler,
+    download_file,
+    part_path,
+)
 
 PAYLOAD = b"hello local world"
 URL = "https://example.test/model.gguf"
@@ -225,3 +232,69 @@ class TestCancel:
             download_file(URL, dest, cancel=cancel, opener=opener)
         assert part_path(dest).exists()
         assert not dest.exists()
+
+
+class TestAuthHeaders:
+    def test_headers_reach_the_opener(self, tmp_path: Path) -> None:
+        dest = tmp_path / "gated.onnx"
+        opener, requests = make_opener(FakeResponse(PAYLOAD))
+        download_file(
+            URL,
+            dest,
+            opener=opener,
+            headers={"Authorization": "Bearer hf_test", "User-Agent": "spoof"},
+        )
+        assert requests[0].get_header("Authorization") == "Bearer hf_test"
+        assert requests[0].get_header("User-agent") == USER_AGENT
+
+    @pytest.mark.parametrize("code", [401, 403])
+    def test_gated_http_error_is_actionable(self, tmp_path: Path, code: int) -> None:
+        error = urllib.error.HTTPError(URL, code, "denied", None, None)  # type: ignore[arg-type]
+        opener, _ = make_opener(error)
+        with pytest.raises(DownloadError, match="受限模型"):
+            download_file(URL, tmp_path / "x.onnx", opener=opener)
+        assert str(code) in MSG_GATED_DENIED.format(code=code)
+
+    @pytest.mark.parametrize("code", [401, 403])
+    def test_gated_status_on_response_is_actionable(
+        self, tmp_path: Path, code: int
+    ) -> None:
+        opener, _ = make_opener(FakeResponse(b"", status=code))
+        with pytest.raises(DownloadError, match="设置▸CHA标注"):
+            download_file(URL, tmp_path / "x.onnx", opener=opener)
+
+
+class TestAuthStrippingRedirect:
+    def test_cross_host_drops_authorization(self) -> None:
+        req = urllib.request.Request(
+            "https://huggingface.co/repo/resolve/main/w.bin",
+            headers={"Authorization": "Bearer hf_secret"},
+        )
+        handler = _AuthStrippingRedirectHandler()
+        redirected = handler.redirect_request(
+            req,
+            None,
+            302,
+            "Found",
+            {},
+            "https://cas-bridge.xethub.hf.co/x/w.bin",
+        )
+        assert redirected is not None
+        assert redirected.get_header("Authorization") is None
+
+    def test_same_host_keeps_authorization(self) -> None:
+        req = urllib.request.Request(
+            "https://huggingface.co/repo/resolve/main/w.bin",
+            headers={"Authorization": "Bearer hf_secret"},
+        )
+        handler = _AuthStrippingRedirectHandler()
+        redirected = handler.redirect_request(
+            req,
+            None,
+            302,
+            "Found",
+            {},
+            "https://huggingface.co/repo/resolve/main/other.bin",
+        )
+        assert redirected is not None
+        assert redirected.get_header("Authorization") == "Bearer hf_secret"

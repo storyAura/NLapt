@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from nlapt.app import BATCH_KIND, EMPTY_CAPTION_ERROR, NLaptApp
+from nlapt.app import BATCH_KIND, EMPTY_CAPTION_ERROR, SKIPPED_DETAIL, NLaptApp
 from nlapt.core.errors import ValidationError
 
 
@@ -67,6 +67,23 @@ class TestRunCaptionBatch:
         assert failed.error == EMPTY_CAPTION_ERROR
         assert app.caption("a.png").text == original
         assert (dataset_root / "a.txt").read_text(encoding="utf-8") == original
+
+    def test_none_result_skips_item_without_failing(self, dataset_root: Path) -> None:
+        app = open_app(dataset_root)
+        original = app.caption("a.png").text
+
+        def caption(key: str, path: Path) -> str | None:
+            return None if key == "a.png" else "fine"
+
+        report = app.run_caption_batch(
+            ("a.png", "b.png"), caption, description="推标"
+        )
+        assert report.succeeded == 2 and report.failed == 0
+        skipped = next(item for item in report.results if item.key == "a.png")
+        assert skipped.ok and skipped.detail == SKIPPED_DETAIL
+        assert app.caption("a.png").text == original
+        assert (dataset_root / "a.txt").read_text(encoding="utf-8") == original
+        assert app.oplog.records()[-1].affected_keys == ("b.txt",)
 
     def test_unchanged_text_is_ok_but_not_logged_as_changed(
         self, dataset_root: Path

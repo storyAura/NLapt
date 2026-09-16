@@ -25,8 +25,7 @@ radii larger than half the widget size).
 
 from __future__ import annotations
 
-from urllib.parse import quote
-
+from nlapt_gui.theme.glyphs import GlyphPaths
 from nlapt_gui.theme.tokens import (
     ACCENT_SOFT_PCT,
     FONT_STACK,
@@ -54,24 +53,17 @@ def _font_family(stack: tuple[str, ...]) -> str:
     return ", ".join(f'"{name}"' for name in stack)
 
 
-def _chevron_data_uri(color: str) -> str:
-    """A themed down-chevron as an inline SVG ``data:`` URI for QComboBox.
+def _image_rule(path: str) -> str:
+    """Quoted ``image: url(...)`` — quotes are required (Windows paths have ``:``)."""
+    return f'    image: url("{path}");\n'
 
-    Qt QSS cannot draw a native arrow that follows arbitrary token colors, so
-    the arrow glyph is generated here (inside ``theme/``) coloured with the
-    given token. Self-contained: no external asset, no bundled image file.
+
+def build_qss(tokens: ThemeTokens, glyphs: GlyphPaths | None = None) -> str:
+    """Build the application-wide stylesheet for one theme.
+
+    ``glyphs`` supplies file paths for combo / checkbox indicators. Qt QSS
+    ``url()`` does not load ``data:`` URIs; omit ``glyphs`` to skip ``image:``.
     """
-    svg = (
-        "<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10' "
-        "viewBox='0 0 10 10'>"
-        f"<path d='M2 3.6 L5 6.6 L8 3.6' fill='none' stroke='{color}' "
-        "stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/></svg>"
-    )
-    return "data:image/svg+xml;utf8," + quote(svg, safe="")
-
-
-def build_qss(tokens: ThemeTokens) -> str:
-    """Build the application-wide stylesheet for one theme."""
     t = tokens
     soft = accent_soft(t)
     danger_soft = mix(t.danger, t.bg, ACCENT_SOFT_PCT)
@@ -84,7 +76,9 @@ def build_qss(tokens: ThemeTokens) -> str:
     surface_pressed = mix(t.surface2, t.text, 90)
     scroll_hover = mix(t.scroll, t.text, 74)
     scroll_pressed = mix(t.accent, t.scroll, 55)
-    arrow_uri = _chevron_data_uri(t.text3)
+    arrow_image = _image_rule(glyphs.chevron) if glyphs is not None else ""
+    check_image = _image_rule(glyphs.check) if glyphs is not None else ""
+    partial_image = _image_rule(glyphs.partial) if glyphs is not None else ""
     ui_font = _font_family(FONT_STACK)
     mono_font = _font_family(MONO_STACK)
     return f"""
@@ -210,11 +204,9 @@ QComboBox::drop-down {{
     margin: 3px 0;
 }}
 QComboBox::down-arrow {{
-    /* Quotes are load-bearing: the URI's ';utf8,' semicolon ends the
-       declaration early when unquoted and Qt silently drops EVERY rule
-       after this point (half the stylesheet, incl. toggleChip). */
-    image: url("{arrow_uri}");
-    width: 10px;
+    /* Quotes are load-bearing: Windows file paths contain ':' and would
+       end the declaration early when unquoted (half the stylesheet dropped). */
+{arrow_image}    width: 10px;
     height: 10px;
 }}
 QComboBox QAbstractItemView {{
@@ -238,16 +230,38 @@ QComboBox QAbstractItemView::item:selected {{
 }}
 QComboBox QAbstractItemView::item:hover {{ background: {t.surface2}; color: {t.text}; }}
 QCheckBox {{ color: {t.text2}; spacing: 6px; }}
-QCheckBox::indicator {{
+QCheckBox::indicator, QAbstractItemView::indicator {{
     width: 15px;
     height: 15px;
     border: 1px solid {t.bd2};
     border-radius: 4px;
     background: {t.surface};
 }}
-QCheckBox::indicator:checked {{
-    background: {t.accent};
+QCheckBox::indicator:checked, QAbstractItemView::indicator:checked {{
+{check_image}    background: {t.accent};
     border-color: {t.accent};
+}}
+QCheckBox::indicator:indeterminate, QAbstractItemView::indicator:indeterminate {{
+{partial_image}    background: {t.accent};
+    border-color: {t.accent};
+}}
+QCheckBox::indicator:disabled, QAbstractItemView::indicator:disabled {{
+    background: {t.surface2};
+    border-color: {t.bd};
+}}
+QCheckBox::indicator:checked:disabled, QAbstractItemView::indicator:checked:disabled,
+QCheckBox::indicator:indeterminate:disabled, QAbstractItemView::indicator:indeterminate:disabled {{
+    background: {t.text3};
+    border-color: {t.text3};
+}}
+QCheckBox:disabled, QRadioButton:disabled {{ color: {t.text3}; }}
+QHeaderView::section {{
+    background: {t.surface2};
+    color: {t.text2};
+    border: none;
+    border-right: 1px solid {t.bd};
+    border-bottom: 1px solid {t.bd};
+    padding: 4px 6px;
 }}
 
 /* ---------- progress bars ---------- */

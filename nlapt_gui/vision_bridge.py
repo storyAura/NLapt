@@ -13,8 +13,10 @@ Single requests (``request``) power the caption workspace buttons; batch
 requests (``request_batch``) power the file panel's 文件夹推标 and run
 through :meth:`AppController.run_caption_batch` (snapshot + oplog +
 checkpoint). ``request_custom`` / ``request_layered_batch`` power the
-分层推标 wizard (caller-supplied prompts; final caption = card + blank +
-scene). For local inference that had to start the server, the model is
+CHA标注 wizard (caller-supplied prompts; final caption = matched card(s) +
+blank + scene, ``CARD: NONE`` skips the image; ``layered_finished`` carries
+the closing :class:`LayeredSummary`). For local inference that had to start
+the server, the model is
 NOT unloaded when the run finishes: an idle timer
 (:class:`nlapt_gui.local_bridge.IdleServerStopper`) stops the server only
 after 30s without a new local request, so repeated runs keep the model
@@ -26,11 +28,13 @@ local engine may carry its own system/user prompts).
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Callable
 
 from PySide6.QtCore import QObject, QThreadPool, Signal
 
+from nlapt.batch.progress import BatchReport
 from nlapt.core.config import LLMProfile
 from nlapt.core.errors import NLaptError
 from nlapt.diagnostics import get_logger
@@ -41,9 +45,10 @@ from nlapt_gui.controller import AppController
 from nlapt_gui.layered_prompts import (
     LAYERED_BATCH_DESCRIPTION_FMT,
     LAYERED_BATCH_HISTORY,
-    CardParts,
-    assemble_layered,
-    parse_scene_reply,
+    CardRoster,
+    LayeredSummary,
+    assemble_roster_caption,
+    parse_layered_reply,
 )
 from nlapt_gui.local_bridge import (
     get_idle_stopper,
@@ -77,6 +82,7 @@ class VisionBridge(QObject):
 
     caption_ready = Signal(str, str, bool)  # key, result_or_error, ok
     custom_ready = Signal(str, str, bool)  # request_id, result_or_error, ok
+    layered_finished = Signal(object)  # LayeredSummary of a CHA标注 batch
 
     def __init__(
         self,
@@ -244,13 +250,12 @@ class VisionBridge(QObject):
         keys: tuple[str, ...],
         engine: str,
         *,
-        card_text: str,
+        roster: CardRoster,
         scene_system: str,
         scene_user: str,
         profile: LLMProfile | None = None,
-        card_parts: CardParts | None = None,
     ) -> bool:
-        """Batch-caption ``keys`` as 人物卡 + blank + 画面段.
+        """Batch-caption ``keys`` as matched 人物卡(s) + blank + 画面段.
 
         Reuses :meth:`AppController.run_caption_batch` so snapshot / progress
         / cancel / history stay on the existing 推标 path. Returns False
@@ -258,10 +263,12 @@ class VisionBridge(QObject):
         already running. ``profile`` overrides the active LLM archive;
         ignored for local.
 
-        Each reply is parsed for the ``OUTFIT:`` header: ``SAME`` (or no
-        header) keeps ``card_text`` verbatim; a rewritten outfit replaces
-        ``card_parts.outfit`` while ``card_parts.appearance`` stays fixed.
-        Without ``card_parts`` the card can never be rewritten.
+        Each reply goes through :func:`parse_layered_reply` /
+        :func:`assemble_roster_caption`: ``CARD: NONE`` returns ``None`` so
+        the core leaves the file untouched; per-card ``OUTFIT n:`` rewrites
+        replace only that card's clothing block. When the batch ends,
+        ``layered_finished`` emits a :class:`LayeredSummary` (per-card match
+        counts, skipped and failed keys) for the closing card dialog.
         """
         captioner, error = self._make_captioner(engine, profile)
         if captioner is None:
@@ -278,22 +285,47 @@ class VisionBridge(QObject):
         if stopper is not None:
             stopper.note_request()
 
-        parts = card_parts if card_parts is not None else CardParts(card_text, "")
+        tally_lock = threading.Lock()
+        counts = [0] * len(roster)
+        none_keys: list[str] = []
+        failed_keys: list[str] = []
 
-        def caption_one(key: str, image_path: Path) -> str:
-            reply = captioner(image_path, scene_system, scene_user)
-            outfit, scene = parse_scene_reply(reply)
-            if outfit is not None and not parts.outfit:
-                _LOGGER.warning(
-                    "layered reply for %s rewrote the outfit but the card has no "
-                    "clothing block; keeping the card verbatim",
-                    key,
-                )
-            return assemble_layered(card_text, parts, outfit, scene)
+        def caption_one(key: str, image_path: Path) -> str | None:
+            try:
+                reply = captioner(image_path, scene_system, scene_user)
+                verdict = parse_layered_reply(reply, len(roster))
+                caption = assemble_roster_caption(roster, verdict)
+            except Exception:
+                with tally_lock:
+                    failed_keys.append(key)
+                raise
+            with tally_lock:
+                if caption is None:
+                    none_keys.append(key)
+                else:
+                    for index in verdict.matched:
+                        counts[index] += 1
+            if caption is None:
+                _LOGGER.info("layered reply for %s matched no card; skipped", key)
+            return caption
 
-        def finished(_report: object) -> None:
+        def finished(report: object) -> None:
             if stopper is not None:
                 stopper.note_finished()
+            failed = set(failed_keys)
+            cancelled = False
+            if isinstance(report, BatchReport):
+                failed.update(report.failed_keys)
+                cancelled = report.status.value == "cancelled"
+            with tally_lock:
+                summary = LayeredSummary(
+                    roster=roster,
+                    matched_counts=tuple(counts),
+                    none_keys=tuple(none_keys),
+                    failed_keys=tuple(sorted(failed)),
+                    cancelled=cancelled,
+                )
+            self.layered_finished.emit(summary)
 
         started = self._controller.run_caption_batch(
             keys,

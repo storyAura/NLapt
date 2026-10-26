@@ -1,6 +1,7 @@
 # NLapt 打包指南 (PyInstaller)
 
-本目录为打包预留:`nlapt.spec`(PyInstaller 规格文件)与 `build.ps1`(Windows 构建脚本)。
+本目录为打包预留:`nlapt.spec`(PyInstaller 规格文件)、`build.ps1`(Windows 构建脚本)与
+`build_appimage.sh`(Linux AppImage 构建脚本)。
 
 ## 最快方式:双击根目录的批处理
 
@@ -37,6 +38,23 @@ powershell -ExecutionPolicy Bypass -File packaging/build.ps1
 python -m PyInstaller packaging/nlapt.spec --noconfirm
 ```
 
+## Linux(AppImage)
+
+`build_appimage.sh` 用同一份 `nlapt.spec` 跑 PyInstaller,再把产出的 onedir 目录包成 AppImage:
+
+```bash
+# 在仓库根目录
+python -m venv .venv && . .venv/bin/activate
+pip install -e .[gui,images,llm,local]
+pip install pyinstaller
+bash packaging/build_appimage.sh
+```
+
+默认用 `python3`,可以指定解释器:`PYTHON=.venv/bin/python bash packaging/build_appimage.sh`。
+
+产物:`dist/NLapt-<版本>-x86_64.AppImage`。`appimagetool` 由脚本自己下到 `dist/cache`
+(只下一次),之后重复构建直接复用;运行 AppImage 需要系统有 FUSE(`/dev/fuse`)。
+
 ## 输出结构
 
 onedir(目录式)+ windowed(无控制台)构建:
@@ -60,6 +78,9 @@ logo 生成),`nlapt.spec` 的 `EXE(icon=...)` 与运行时窗口/任务栏图标
 新的 `.ico` 覆盖 `packaging/icon.ico` 即可,无需改代码;删除该文件则
 回退为主题色矢量 logo。
 
+Linux 的 AppImage 用 `packaging/icon.png`(256×256,从同一份 `.ico` 里取
+256 那一档导出);换图标时两个文件一起换。
+
 ## 版本号
 
 版本号单一来源于 `nlapt.__version__`(`nlapt/__init__.py`):
@@ -75,3 +96,6 @@ logo 生成),`nlapt.spec` 的 `EXE(icon=...)` 与运行时窗口/任务栏图标
   (供运行时窗口图标使用),除此之外无需额外 datas 配置。
 - 首次构建后建议在干净机器(或删除 `%APPDATA%\NLapt` 后)冒烟验证:
   打开文件夹、编辑标注、保存、切换主题。
+- Linux 冒烟验证:运行 `dist/NLapt-<版本>-x86_64.AppImage` 后,除了看窗口本身,
+  还应在 `~/.config/nlapt/logs/nlapt.log` 里看到新的一行
+  `NLapt GUI <版本> starting` —— 只确认进程活着不够。

@@ -6,6 +6,7 @@
 
 面向图像生成与 LoRA 训练的桌面标注编辑器：处理「图片 + 同名 `.txt`」，单张精修，批量可回滚。
 
+![Status](https://img.shields.io/badge/status-unmaintained-lightgrey)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![Version](https://img.shields.io/badge/version-0.2.2-informational)
@@ -13,9 +14,15 @@
 
 </div>
 
+> [!WARNING]
+> **NLapt 已停止维护**,今后不再更新,也不再处理 Issue 和 Pull Request。
+>
+> 请改用重构版 **[NLaptXD](https://github.com/storyAura/NlaptXD)**:用 Flutter 重写的 Windows 桌面应用,功能边界和数据安全规则与 NLapt 一致。
+> 同一份「图片 + 同名 txt」数据集可以直接打开;第一次启动时会自动导入 NLapt 的接口、模型、系统提示词与 HF Token。
+
 界面为中文。Windows 优先，其它平台可用 Python 3.11+ / PySide6。数据格式兼容 kohya 子目录；danbooru 标签与自然语言可混排。标注只在显式保存时写入磁盘。
 
-[更新说明](docs/更新日志.md) · [Releases](https://github.com/storyAura/NLapt/releases) · [Issue](https://github.com/storyAura/NLapt/issues)
+**[NLaptXD(新版)](https://github.com/storyAura/NlaptXD)** · [更新说明](docs/更新日志.md) · [Releases](https://github.com/storyAura/NLapt/releases) · [Issue](https://github.com/storyAura/NLapt/issues)
 
 ## 界面预览
 
@@ -163,6 +170,8 @@ GUI 测试离屏运行，不需要显示器。套件不访问真实网络、不�
 
 ## Contributing
 
+本仓库已停止维护,不再接受 Pull Request。想参与开发请前往 [NLaptXD](https://github.com/storyAura/NlaptXD)。以下为原流程,仅供参考:
+
 1. 在 [Issues](https://github.com/storyAura/NLapt/issues) 说明要改什么
 2. [Fork](https://github.com/storyAura/NLapt/fork) 本仓库
 3. 在自己的 fork 里修改，并补上对应测试
@@ -180,4 +189,4 @@ GUI 测试离屏运行，不需要显示器。套件不访问真实网络、不�
 
 维护者：[storyAura](https://github.com/storyAura)
 
-问题与功能请求请开 [Issue](https://github.com/storyAura/NLapt/issues)。
+本仓库已停止维护。问题与功能请求请到 [NLaptXD 的 Issue](https://github.com/storyAura/NlaptXD/issues)。
